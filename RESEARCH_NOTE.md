@@ -46,10 +46,12 @@ that residual is the raw material for relative-value and quoting signals.
 
 **What we recommend.** Keep IPCA as the systematic fair-value layer. Reposition
 the residual output as a conditional relative-value and mark-correction score
-feeding the quoting engine. Before production, rebuild the pipeline so every
-number is computed strictly with information available at the time, move the
-model into yield space, and extend the history to at least two years. Detail in
-Section 8.
+feeding the quoting engine, and put the factor side of the model to work too:
+rolling stale marks forward by their factor exposure, and measuring the book's
+factor exposures for quote skew. Before production, rebuild the pipeline so
+every number is computed strictly with information available at the time, move
+the model into yield space, and extend the history to at least two years.
+Detail in Sections 4.5 and 8.
 
 ---
 
@@ -160,12 +162,63 @@ three factors on parsimony grounds.
 flowchart LR
     A[ICE evaluated marks<br/>Product reference<br/>Composite ratings] --> B[Daily returns and<br/>characteristic buckets]
     B --> C[IPCA fit<br/>K = 3 factors]
-    C --> D[Factor moves<br/>and Gamma]
-    C --> E[Residual per bond per day]
+    C --> D[Systematic path<br/>Gamma and factor moves]
+    C --> E[Idiosyncratic path<br/>residual per bond per day]
+    D --> D1[Stale-mark roll-forward<br/>beta x factor moves]
+    D --> D2[Inventory factor exposure<br/>and peer comparables]
     E --> F[Relative-value tests<br/>persistence, costs]
     E --> G[MSRB trade validation<br/>Test A, Test B, executable]
-    G --> H[Mark-correction score<br/>for quoting]
+    G --> H[Residual correction score]
+    D1 --> Q[Quote]
+    D2 --> Q
+    H --> Q
 ```
+
+The fit produces two outputs that serve different purposes. The **systematic
+path** (Gamma and the factor moves) is fair value: what a bond with these
+characteristics should have done today. The **idiosyncratic path** (the
+residual) is the distance of the bond's own mark from that fair value. The
+residual cannot contain the systematic move by construction, which is why the
+rich/cheap score is built from the residual alone. The systematic path is not
+idle; Section 4.5 shows where it enters the quote.
+
+### 4.5 How both paths feed a quote
+
+A quote can be written as the evaluated mark plus four adjustments. Two of them
+come from the systematic path, one from the residual path, and one from the
+execution optimiser.
+
+| Component | Source | What it does | Status |
+|---|---|---|---|
+| Evaluated mark | ICE | Starting point | in place |
+| Systematic roll-forward | Gamma, factor moves | If the mark has not updated, move it by the bond's beta times the factor moves since it last did | proposed, testable now on cached MSRB data |
+| Residual correction | residual, one-day persistence model | Lean away from the mark where the residual says it is stale or off | built and validated in this work |
+| Inventory skew | Gamma | Sum beta times position across the book to get the desk's duration, credit and structure exposures; skew quotes to reduce them | proposed |
+| Spread and fill terms | quoting optimiser | Bid-ask, fill probability, adverse selection | outside this research |
+
+Two further uses of the systematic path follow directly:
+
+- **Comparables.** A bond's betas are the model's coordinates for "similar
+  bonds". Nearest neighbours in beta space, weighted by how closely their
+  residuals move together, are the comparables whose recent trade prints
+  should anchor an RFQ price. The notebook's peer analysis (Section 8.4) already
+  shows this grouping is economically sensible.
+- **Uncertainty.** The variance of a bond's expected move splits into a
+  systematic part, from the factor moves, and a residual part. Both are needed
+  for the confidence band the quoting engine should receive.
+
+The roll-forward can be tested immediately with a variant of Test B: does
+"mark plus beta times factor moves" predict the next trade better than the raw
+mark, and does adding the residual correction improve it further? One caveat
+applies today: with bucket-coded characteristics, every bond in a bucket has the
+same beta, so the roll-forward reduces to applying the bucket's average move.
+It becomes materially sharper once characteristics are continuous
+(Section 8.2, item 2).
+
+What the systematic path should **not** be used for on this sample is
+forecasting returns from average factor premia. The predictive R² of 0.03 says
+there is nothing there over five months. Factor timing from macro inputs is a
+separate line of research and a market-direction bet, not relative value.
 
 ---
 
@@ -319,11 +372,12 @@ regression method used is sensitive to the heavy tails in trade data.
 | 1 | Rebuild the pipeline so every model component uses only past data, re-executable end to end | Required for any production claim and for audit |
 | 2 | Move the model to curve-relative yield changes and use continuous characteristics (years to maturity, years to call, coupon, rating score, yield spread) | Aligns units with quoting; follows the published method more closely; sharpens peer definition |
 | 3 | Reposition the output as a mark-correction score with an uncertainty band, and integrate it into the quoting engine as one input alongside inventory and fill probability | Matches what the evidence supports |
-| 4 | Extend the ICE and MSRB history to two or more years | Cover more than one regime before setting factor count and thresholds |
-| 5 | Add dynamic liquidity features: days since last trade, recent trade count, side imbalance, mark age | These explain where the signal works and are the prerequisite for a fair attention-model test |
-| 6 | Revisit the attention challenger and the quote-adjustment model only after 1 to 5 | Avoid spending on complexity before the base is sound |
+| 4 | Use the factor path: test the stale-mark roll-forward against MSRB prints (Test B variant), and compute book-level factor exposures from beta for quote skew | Cheap, uses cached data, and turns the fit into two more quoting inputs (Section 4.5) |
+| 5 | Extend the ICE and MSRB history to two or more years | Cover more than one regime before setting factor count and thresholds |
+| 6 | Add dynamic liquidity features: days since last trade, recent trade count, side imbalance, mark age | These explain where the signal works and are the prerequisite for a fair attention-model test |
+| 7 | Revisit the attention challenger and the quote-adjustment model only after 1 to 6 | Avoid spending on complexity before the base is sound |
 
-Items 1 and 2 are engineering and modelling work of a few weeks each; the
+Items 1, 2 and 4 are engineering and modelling work of a few weeks each; the
 rewrite of the fit exploits the bucket structure and reduces a run from eleven
 minutes to seconds, which makes daily refits practical.
 
@@ -338,7 +392,8 @@ component predicts where evaluated marks are stale, and it predicts where real
 trades print relative to our quotes in exactly those bonds. It does not
 constitute a tradeable arbitrage, and the research says so plainly. The right
 product is a mark-correction and relative-value input to quoting, built on a
-point-in-time version of this model in yield space.
+point-in-time version of this model in yield space, with the factor side of the
+same fit supplying the stale-mark roll-forward and the book's factor exposures.
 
 ---
 

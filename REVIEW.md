@@ -93,6 +93,18 @@ evaluated on 29 dates. This is not the attention-factors model, which needs
 learned embeddings, dynamic features, sparse peers, and a trained objective
 (see Step 8).
 
+**The systematic path stops at diagnostics.** Gamma and the factor moves are
+fitted, plotted, and turned into mimicking portfolios, then never used
+downstream: every production-facing output (the RV score, the calibration, the
+charge model) is built from the residual alone. That is correct for the
+rich/cheap signal, since the residual is by definition the distance from fair
+value, but it leaves three cheap uses of the same fit on the table: rolling
+stale marks forward by beta times the factor moves, aggregating beta over
+positions for book-level factor exposure and quote skew, and using beta space
+as the comparables metric for RFQ pricing (see Step 5b). The attention paper
+does not add a factor bet either; it combines the two paths by mapping residual
+weights through the factor hedge, which Section 8.1 already derives.
+
 ## ML engineering review
 
 **Validation is inconsistent.** Single 70/30 time splits in Sections 9.6, 9.8,
@@ -144,6 +156,7 @@ The steps are ordered by dependency. Steps 0 and 1 unblock everything else.
 | Price-space residual vs yield-space targets | 3 | KPP 2023 (excess returns, duration); bond math | Paper-adapted |
 | K chosen inside fold noise | 4 | KPS 2019 §4 (K sweep), bootstrap tests; Diebold-Mariano 1995 | Paper-adapted |
 | Smoothed marks masquerade as alpha | 5 | Getmansky-Lo-Makarov 2004; Amihud-Mendelson 1987 | Practice |
+| Gamma and factor moves unused downstream | 5b | KPS 2019 §2 (beta = z Gamma); notebook §8.1 residual-maker | Paper-adapted |
 | Charge model loses to zero | 6 | Koenker-Bassett 1978; Huber 1964; LightGBM | Practice |
 | Calibration broken in top decile | 7 | Zadrozny-Elkan 2002; Naeini et al. 2015 | Practice |
 | Attention v0 cannot win | 8 | Epstein-Yu-Pelger 2025; Guijarro-Ordonez-Pelger-Zanotti 2022 | Paper-faithful |
@@ -414,6 +427,57 @@ be neutral elsewhere.
 
 ---
 
+## Step 5b. Put the systematic path to work
+
+**Goal.** Use Gamma and the factor moves for the three things the residual
+cannot do: roll stale marks forward, measure book-level factor exposure, and
+define comparables.
+
+**Reference.** KPS (2019), Section 2: loadings are beta_{i,t} = z_{i,t} Gamma,
+so exposures aggregate linearly over positions. The notebook's own Section 8.1
+derives the residual-maker W^eps = I - B W^F, which is how the attention paper
+maps residual weights to asset weights. **Fidelity.** Paper-adapted.
+
+**Do this.**
+
+1. **Systematic roll-forward of stale marks.** For bond i whose evaluated mark
+   last moved at date s < t, the factor-implied mark is
+
+   ```text
+   P_hat_{i,t} = P_{i,s} * prod_{u=s+1..t} (1 + beta_{i,u-1}' f_u)
+   ```
+
+   in price space, or the additive version in yield space after Step 3. The
+   quote adjustment is `P_hat - P_mark`. Test it as a Test B variant on the
+   cached MSRB panel: regress next trade-from-mark on (a) nothing, (b) the
+   roll-forward gap, (c) the residual correction, (d) both, with bootstrap
+   intervals. Expect (b) to matter most where mark age is largest.
+
+2. **Book-level factor exposure.** `E_t = sum_i w_{i,t} beta_{i,t}` is a
+   K-vector of the desk's duration, long-end credit, and coupon-structure
+   exposures in model coordinates. Publish it daily. Use it in the quoting
+   optimiser as the inventory-skew term: skew bids and offers in proportion to
+   how much a fill would move E_t away from its limit. Hedge ratios against any
+   liquid instrument follow from regressing that instrument's return on f_t.
+
+3. **Comparables in beta space.** For an RFQ on bond i, take the m nearest
+   bonds by Euclidean distance in standardised beta, weight them by residual
+   correlation over the last 60 days, and form a peer-implied yield from their
+   MSRB prints in the last k days. Report it beside the residual score. This
+   formalises Section 8.4.3, which already shows peers are descriptor-coherent.
+
+4. **Uncertainty split.** `Var(r_i) = beta_i' Sigma_f beta_i + sigma_eps_i^2`.
+   Feed both terms to the sigma the production spec asks for.
+
+Note that with one-hot Z, beta is constant within a bucket, so the roll-forward
+is the bucket's cumulative mean move. It sharpens materially after Step 2.
+
+**Validate.** Roll-forward Test B: D10-D1 and incremental R² over the raw mark,
+by mark-age bucket. Exposure: reconcile E_t against the desk's existing
+duration and rating reports on the same day.
+
+---
+
 ## Step 6. Rebuild the charge model as a robust, side-specific GBM
 
 **Goal.** Beat "no adjustment" on held-out MAE and produce a mean and an
@@ -515,6 +579,14 @@ Use sparse top-m attention (m = 200) with no self-attention so peers are real
 comparables, not the market. Add a stability penalty on day-to-day changes in
 a_{k,·,t}.
 
+**How the paper combines factors and residuals.** The trading signal is built
+from residuals only. Asset weights are the residual weights mapped through the
+factor hedge, `w_asset = (I - B (B'B)^-1 B') w_resid`, so the book is
+factor-neutral by construction; there is no directional factor bet. For the
+muni desk the same structure is: residual score sets the quote skew, and
+book-level beta exposure (Step 5b) sets how the resulting inventory is hedged
+or leaned against.
+
 **Objective.**
 `L = λ_fit Σ eps² + λ_rv L_MSRB(g(eps_hat_{t+1|t}), next-trade markout) + λ_stab Σ ||a_t - a_{t-1}||²`.
 Keep the temporal layer fixed as point-in-time AR(1) for the first experiment
@@ -597,6 +669,9 @@ Prado (2014) for the deflated Sharpe ratio. **Fidelity.** Practice.
   bridge; this alone can explain the charge-model failure.
 - The attention v0 experiment cannot win by construction and is not evidence
   against the attention-factor approach.
+- The residual is the right basis for the rich/cheap score, but the same fit's
+  systematic path is unused: stale-mark roll-forward, book factor exposure, and
+  beta-space comparables are cheap additions that reuse Gamma.
 
 ---
 
