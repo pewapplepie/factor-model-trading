@@ -315,18 +315,63 @@ z["const"] = 1.0
 
 Characteristic set for munis, all point-in-time:
 
-| Family | Characteristic | Source |
-|---|---|---|
-| Curve | years to maturity; years to call (or yield-to-worst duration) | Product |
-| Structure | coupon; premium/discount (price - 100) | Product, ICEEval |
-| Credit | numeric rating score (AAA=1 ... CCC=17); NR flag | algo track, PIT |
-| Relative value | evaluated yield minus MMD at matched tenor | ICEEval, MMD |
-| Liquidity | log days since last MSRB print; log 20-day trade count; mark update rate | MSRB, ICEEval |
-| Risk | 20-day evaluated-return volatility | ICEEval |
-| State | CA / NY / TX / IL dummies | Product |
+| Family | Characteristic | Role | Source |
+|---|---|---|---|
+| Curve sensitivity | duration to worst (modified or effective) | loading on the curve factor | ICEEval duration field if present, else bond math |
+| Curve point | years to worst (call date if priced to call, else maturity) | where on the curve the bond sits | Product, ICEEval |
+| Extension | years to maturity minus years to worst, or a priced-to-call flag | risk that the call goes out of the money | Product, ICEEval |
+| Structure | coupon; premium/discount (price - 100) | tax treatment, de minimis, call economics | Product, ICEEval |
+| Credit | numeric rating score (AAA=1 ... CCC=17); NR flag | credit factor loading | algo track, PIT |
+| Relative value | evaluated yield minus MMD at matched tenor | spread level | ICEEval, MMD |
+| Liquidity | log days since last MSRB print; log 20-day trade count; mark update rate | staleness and activity | MSRB, ICEEval |
+| Risk | 20-day evaluated-return volatility | idiosyncratic risk | ICEEval |
+| State | CA / NY / TX / IL dummies | state tax segmentation | Product |
 
 Keep a few dummies; the paper's design allows mixed inputs. Drop the 46 bucket
 dummies.
+
+**Duration versus the two tenors.** Include duration; do not rely on years to
+maturity and years to call alone. Those two are inputs to price sensitivity,
+not the sensitivity itself. For a callable muni the pricing horizon switches
+with moneyness: a premium bond with coupon above yield is priced to the call, a
+discount bond to maturity. Duration to worst encodes that switch, the coupon
+effect, and the yield level in one number, which is the loading you want on the
+curve factor in price space. A linear combination of two tenor ranks cannot
+reproduce the switch. KPP (2023) use duration as a core bond characteristic, so
+this keeps the step paper-faithful.
+
+Keep a horizon variable as well, because duration does not say where on the
+curve a bond sits: a 5-year bullet and a 15-year callable priced to a 2030 call
+can share a duration of 4 while loading on different points of a non-parallel
+MMD move. Years to worst carries the curve point; the extension row carries
+what happens if the call goes out of the money. Years to maturity on its own is
+then largely redundant. Start with it included and let the W_beta test below
+decide.
+
+Two dependencies:
+
+- **Return space (Step 3).** In price space duration is essential, since the
+  rate factor's loading is minus duration by construction. In curve-relative
+  yield space the rate factor is already removed and duration's role shrinks to
+  convexity and extension effects. Include it either way; expect its Gamma
+  weight to fall in yield space and the gap between characteristic sets to
+  narrow.
+- **Collinearity.** Duration, years to worst, and coupon are correlated. Rank
+  normalisation and the intercept cope with moderate collinearity, but Gamma
+  becomes harder to read. Prune with the test, not by judgement.
+
+**Data.** The current pull takes only clean price and yield from the ICE table.
+ICE evaluations normally carry modified or effective duration; check the column
+list first. If absent, compute duration to worst from price, coupon, maturity,
+and next call date with a standard bond-math routine, since all four are already
+in the panel. The same duration field feeds the DV01 bridge in Step 3, the
+inventory exposure in Step 5b, and the charge features in Step 6.
+
+**Decide empirically.** Fit the duration set and the two-tenor set on the same
+point-in-time folds from Step 1 and compare cross-sectional R², Gamma
+stability, and Test B. In price space the duration set should win clearly. If
+it does not, the return space rather than the characteristic set is the binding
+problem.
 
 **Prune with the paper's test.** KPS test each characteristic with a wild
 bootstrap on the residuals (their W_beta statistic): set Gamma's row for
@@ -355,12 +400,13 @@ r ≈ -D Δy + carry is textbook. **Fidelity.** Paper-adapted.
 2. **Curve-hedged excess return.** `r_i,t + D_i,t Δy_MMD(tenor_i, t)`, with
    D from yield-to-worst duration. Use if price space must be kept.
 
-Either way, add duration (or years to maturity and call) as a characteristic per
-KPP so the residual is orthogonal to the term factor by construction.
+Either way, duration to worst is a characteristic (Step 2) per KPP, so the
+residual is orthogonal to the term factor by construction.
 
 **DV01 bridge.** Where a price residual is still needed (Test A/B in Section 13),
-convert with `Δprice ≈ -DV01 Δy`, DV01 from modified duration at the evaluated
-yield. Never compare price residuals to yield errors without this.
+convert with `Δprice ≈ -DV01 Δy`, DV01 from the same duration-to-worst field
+used in Step 2, at the evaluated yield. Never compare price residuals to yield
+errors without this.
 
 **Validate.** Gamma's largest loadings should stop being the tenor row; the
 first-factor share of variance should fall; Test B in bps should remain
@@ -494,8 +540,8 @@ uncertainty per RFQ.
 2. Features, all point-in-time: RV residual in bps (Step 3), Kalman correction
    (Step 5), AR forecast, days since last customer and interdealer print, 20-day
    trade count, mark age, residual volatility, log quantity, MinuteFromSignal,
-   MMD level and 1-day change, rating score, years to maturity and call, side.
-   Drop the duplicate side column.
+   MMD level and 1-day change, rating score, duration to worst, years to worst,
+   side. Drop the duplicate side column.
 3. Fit three quantile models (0.1, 0.5, 0.9) per side (P, S, D):
 
    ```python

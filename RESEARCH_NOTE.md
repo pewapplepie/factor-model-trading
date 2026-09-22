@@ -370,7 +370,7 @@ regression method used is sensitive to the heavy tails in trade data.
 | Priority | Action | Why |
 |---|---|---|
 | 1 | Rebuild the pipeline so every model component uses only past data, re-executable end to end | Required for any production claim and for audit |
-| 2 | Move the model to curve-relative yield changes and use continuous characteristics (years to maturity, years to call, coupon, rating score, yield spread) | Aligns units with quoting; follows the published method more closely; sharpens peer definition |
+| 2 | Move the model to curve-relative yield changes and use continuous characteristics (duration to worst, years to worst, coupon, rating score, yield spread) | Aligns units with quoting; duration is the sensitivity a callable bond actually has, which two tenor variables only approximate; follows the published method more closely; sharpens peer definition |
 | 3 | Reposition the output as a mark-correction score with an uncertainty band, and integrate it into the quoting engine as one input alongside inventory and fill probability | Matches what the evidence supports |
 | 4 | Use the factor path: test the stale-mark roll-forward against MSRB prints (Test B variant), and compute book-level factor exposures from beta for quote skew | Cheap, uses cached data, and turns the fit into two more quoting inputs (Section 4.5) |
 | 5 | Extend the ICE and MSRB history to two or more years | Cover more than one regime before setting factor count and thresholds |
