@@ -114,14 +114,26 @@ collinear characteristics with the W_beta test; run that test.
 | AR(1) out-of-sample R² vs zero | -0.0015 |
 | AR(1) decile response | inverted (D1 +0.11 bp, D10 -0.28 bp) |
 
-Rank and Pearson statistics disagree in sign. The likely cause is that the target is
-quantised to whole basis points: sample target values are 2, -4, 1, 0, 5, 3, -1, and
-the median is exactly 0. With a residual standard deviation of 3.4 bp, rounding noise
-is a large share of the signal, ranks are dominated by ties, and OLS slopes by tails.
+Rank and Pearson statistics disagree in sign. The target is quantised to whole basis
+points (sample values 2, -4, 1, 0, 5, 3, -1; median exactly 0), but rounding itself is
+too small to explain this:
 
-**Fix.** Source yields at more decimal places if OneTick has them. Otherwise model
-the target with rank-based or ordinal methods, and fit the AR layer on ranks. Treat
-the yield-space residual as uninformative for forecasting until this is resolved.
+| Quantity | Value |
+|---|---|
+| Rounding noise sd on a daily change (two levels rounded to 1 bp) | 0.41 bp |
+| Share of residual variance (residual sd 3.42 bp) | 1.4% |
+
+*Correction:* the first version of this review said rounding noise was a large share
+of the signal. It is not. The more likely causes are days on which the mark did not
+change at all, which create rank ties and are evaluator staleness rather than noise,
+and tails that drive the OLS slope while the rank IC reflects the bulk.
+
+**Fix.** On the existing residuals, measure the share of exactly-zero changes, and
+compare the lag-1 Pearson correlation and AR slope before and after winsorising at the
+1st and 99th percentiles. If winsorising reconciles the signs, fit the AR layer on
+winsorised or rank-transformed residuals and carry a "mark unchanged" flag as a state
+variable. Finer source marks or multi-day targets are not the binding fix. Treat the
+yield-space residual as uninformative for forecasting until this is resolved.
 
 ### Issue 4. The covered universe contains almost no stale marks
 
@@ -239,7 +251,7 @@ too few to identify distinct factor structure.
 | 2 | Rewrite the executive summary, Step 5 economic basis, and results table from yield-space outputs; label the -22 bp figure as a prior price-space run | 1 | small |
 | 3 | Fix the registry keys; compute activity buckets from pre-OOS data | 7.2, 7.3 | small |
 | 4 | Drop DV01; add years to worst, extension, rating score, NR flag, state, liquidity; run the W_beta pruning test; refit | 2, 8 | medium |
-| 5 | Resolve target quantisation (more decimals, or rank-based models) | 3 | medium |
+| 5 | Diagnose the AR sign conflict (zero-change share, winsorised vs raw slope); fit a robust or rank-based AR layer | 3 | small |
 | 6 | Rerun MSRB validation on the full universe with a staleness bucket defined by mark age | 4 | medium |
 | 7 | Rebuild peer and roll-forward validations without circularity; retest roll-forward against trade minus stale mark | 5, 6 | medium |
 | 8 | Re-enable Step 1 or remove price-space claims; move shared primitives into the package | 7.4, 7.5 | small |
