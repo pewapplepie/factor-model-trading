@@ -99,6 +99,17 @@ RNG = np.random.default_rng(CFG.seed)
 REGISTRY: dict = {'spec_version': CFG.spec_version, 'config': asdict(CFG), 'run_at': pd.Timestamp.now('UTC').isoformat()}
 
 
+def to_ns(series: pd.Series) -> pd.Series:
+    """Coerce any datetime-like column to tz-naive datetime64[ns] so merge keys always match."""
+    out = pd.to_datetime(series, errors='coerce')
+    try:
+        if getattr(out.dt, 'tz', None) is not None:
+            out = out.dt.tz_convert(None)
+    except (AttributeError, TypeError):
+        pass
+    return out.astype('datetime64[ns]')
+
+
 def savefig(name: str) -> None:
     plt.tight_layout()
     plt.savefig(FIGURES / f'{name}.png', dpi=130)
@@ -134,7 +145,7 @@ step3_path = PIPE.path('research_panel_step3_yield.parquet')
 if not step3_path.exists():
     raise FileNotFoundError(f'{step3_path} missing: run mdp.build(PIPE) in the pipeline kernel first.')
 raw_panel = pd.read_parquet(step3_path)
-raw_panel['date'] = pd.to_datetime(raw_panel['date']).dt.normalize()
+raw_panel['date'] = to_ns(raw_panel['date']).dt.normalize()
 raw_panel['cusip'] = raw_panel['cusip'].astype('string')
 raw_panel = raw_panel[(raw_panel['date'] >= CFG.start_date) & (raw_panel['date'] <= CFG.end_date)].reset_index(drop=True)
 print(f'Step 3 panel: {len(raw_panel):,} rows | {raw_panel["cusip"].nunique():,} CUSIPs | {raw_panel["date"].min().date()} -> {raw_panel["date"].max().date()} | {time.perf_counter()-t0:.1f}s')
@@ -734,8 +745,8 @@ def standardize_trades(tr: pd.DataFrame) -> pd.DataFrame:
     t = tr.copy()
     t.columns = [str(c) for c in t.columns]
     t['cusip'] = t['cusip'].astype('string')
-    t['trade_ts'] = pd.to_datetime(t['msrb_tradetime'], errors='coerce')
-    t['signal_ts'] = pd.to_datetime(t['signal_ts'], errors='coerce') if 'signal_ts' in t else t['trade_ts']
+    t['trade_ts'] = to_ns(t['msrb_tradetime'])
+    t['signal_ts'] = to_ns(t['signal_ts']) if 'signal_ts' in t else t['trade_ts']
     t['trade_date'] = t['trade_ts'].dt.normalize()
     for c in ['msrb_yield', 'algo_signal_yield', 'msrb_quantity', 'MinuteFromSignal', 'MmdYld', 'dMmdSprdSide', 'last_value', 'msrb_price']:
         t[c] = pd.to_numeric(t[c], errors='coerce') if c in t else np.nan
@@ -754,13 +765,18 @@ def standardize_trades(tr: pd.DataFrame) -> pd.DataFrame:
 def join_trades_to_residual(t: pd.DataFrame, res: pd.DataFrame, min_age: int) -> pd.DataFrame:
     score = res[['cusip', 'date', 'pit_residual', 'activity_bucket'] + beta_cols].copy()
     score['pit_rank'] = score.groupby('date', observed=True)['pit_residual'].rank(pct=True)
-    score = score.rename(columns={'date': 'residual_date'}).sort_values('residual_date')
-    tt = t.sort_values('trade_date')
+    score = score.rename(columns={'date': 'residual_date'})
+    score['residual_date'] = to_ns(score['residual_date'])
+    score = score.sort_values('residual_date')
+    tt = t.copy()
+    tt['trade_date'] = to_ns(tt['trade_date'])
+    tt = tt.sort_values('trade_date')
     j = pd.merge_asof(tt, score, left_on='trade_date', right_on='residual_date', by='cusip', direction='backward', allow_exact_matches=(min_age <= 0), tolerance=pd.Timedelta(days=30))
     j = j.dropna(subset=['pit_rank'])
     j['residual_age_days'] = (j['trade_date'] - j['residual_date']).dt.days
     j = j[j['residual_age_days'] >= min_age]
     mark = model[['cusip', 'date', 'closing_yield']].rename(columns={'date': 'residual_date', 'closing_yield': 'y_prior_mark'})
+    mark['residual_date'] = to_ns(mark['residual_date'])
     j = j.merge(mark, on=['cusip', 'residual_date'], how='left')
     j['e_mark_bp'] = 100.0 * (j['msrb_yield'] - j['y_prior_mark'])
     return j.reset_index(drop=True)
@@ -848,6 +864,8 @@ if HAS_TRADES and not tv.empty and tv['MmdYld'].notna().mean() > 0.5:
     lv = tv.copy()
     lv['spread_bp'] = 100.0 * (lv['msrb_yield'] - lv['MmdYld'])
     feat_panel = model[['cusip', 'date', 'rating_score', 'years_to_worst', 'extension', 'cpn', 'modified_duration_lag1', 'closing_yield_lag1'] + [c for c in CHARS if c != 'market_fv']].rename(columns={'date': 'residual_date'})
+    feat_panel['residual_date'] = to_ns(feat_panel['residual_date'])
+    lv['residual_date'] = to_ns(lv['residual_date'])
     lv = lv.merge(feat_panel, on=['cusip', 'residual_date'], how='left')
     lv['recency_days_c'] = lv['recency_days'].clip(upper=60).fillna(60)
     for s in ['D', 'P', 'S']:
