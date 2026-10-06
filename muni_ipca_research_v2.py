@@ -29,6 +29,11 @@
 # 11. Systematic path: factor roll-forward and de-circularised beta-space comparables
 # 12. Results registry and summary
 #
+# v2.2 changes: print features cut at the algo signal time; Procrustes-aligned Gamma versions; joint
+# one-day / trailing-mean regression; MSRB side convention (S = dealer sale to customer, P = dealer purchase
+# from customer, D = inter-dealer); paper portfolio run on every forecaster with walk-forward selection and a
+# fade variant; model-as-mid application with inverse-variance mark weight; market-context, residual-dispersion,
+# decile and calibration exhibits.
 # v2.1 changes: duration enters as the ratio of modified duration to years-to-worst (breaks the 0.98 rank
 # correlation between the two level instruments that produced a single leveraged factor); a trailing-mean
 # residual is tested as the level signal; the transaction section adds the spread reading (absolute gap,
@@ -102,7 +107,8 @@ class RunConfig:
     activity_window: int = 20          # trailing observations for the point-in-time activity bucket
     duration_instrument: str = 'ratio'  # 'ratio': modified duration / years-to-worst (call-structure); 'level': modified duration
     level_signal_window: int = 20      # trailing-mean residual window (the level signal)
-    shrink_lambda_grid: tuple[float, ...] = (0.0, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
+    shrink_lambda_grid: tuple[float, ...] = (0.0, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0)
+    fade_buckets: tuple[str, ...] = ('L4', 'L5')   # activity buckets where the trailing-mean signal is faded
     band_coverage: float = 0.80
     seed: int = 20260921
 
@@ -180,6 +186,15 @@ fig, ax = plt.subplots(1, 2, figsize=(12, 4))
 cov['cusips'].plot.bar(ax=ax[0], color='#4C72B0'); ax[0].set_title('Covered CUSIPs per month'); ax[0].set_xlabel('')
 cov['rows'].plot.bar(ax=ax[1], color='#55A868'); ax[1].set_title('Covered bond-days per month'); ax[1].set_xlabel('')
 savefig('02_coverage_by_month')
+
+# Market context: where yields went over the sample, and how dispersed daily moves were. The factor paths in
+# Section 4 and the regime split in Section 5 read against this.
+_lvl = raw_panel.groupby('date')['closing_yield'].quantile([0.1, 0.5, 0.9]).unstack()
+_mv = raw_panel.groupby('date')['closing_yield_change_bp'].agg(sd='std', med='median')
+fig, ax = plt.subplots(1, 2, figsize=(14, 4))
+ax[0].fill_between(_lvl.index, _lvl[0.1], _lvl[0.9], alpha=0.25, label='10th-90th pct'); ax[0].plot(_lvl.index, _lvl[0.5], color='k', lw=1.2, label='median'); ax[0].set_title('Closing yield across the covered universe (%)'); ax[0].legend()
+ax[1].plot(_mv.index, _mv['sd'], color='#C44E52', lw=1); ax[1].set_title('Cross-sectional sd of the daily yield change (bp)'); ax[1].axvline(pd.Timestamp(CFG.first_oos_date), color='k', ls='--', lw=0.8)
+savefig('02_market_context')
 record('data', panel_rows=len(raw_panel), panel_cusips=raw_panel['cusip'].nunique(), date_min=str(raw_panel['date'].min().date()), date_max=str(raw_panel['date'].max().date()))
 
 # %%
@@ -517,24 +532,37 @@ def make_weekly_folds(dates: pd.DatetimeIndex, train_start: str, first_oos: str,
     return folds
 
 
-def walk_forward_residuals(frame: pd.DataFrame, chars: list[str], folds: list[dict], cfg: RunConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
-    parts, gammas = [], []
+def procrustes_align(G: np.ndarray, G_ref: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Rotate G onto G_ref within its own column span (orthogonal Procrustes). Residuals are unchanged; factor
+    labels, betas and factor realisations become continuous across refits instead of swapping when eigenvalues cross."""
+    U, _, Vt = np.linalg.svd(G.T @ G_ref)
+    R = U @ Vt
+    return G @ R, R
+
+
+def walk_forward_residuals(frame: pd.DataFrame, chars: list[str], folds: list[dict], cfg: RunConfig) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    parts, gammas, gammas_raw = [], [], []
     gamma_init = None
+    G_ref = None
     by_date = {d: g for d, g in frame.groupby('date', sort=True, observed=True)}
     eye = np.eye(cfg.selected_k)
+    fcols = [f'factor{i+1}' for i in range(cfg.selected_k)]
     for fo in folds:
         t0 = time.perf_counter()
         train = frame[frame['date'].isin(fo['train_dates'])]
         mk = MomentIPCA(cfg.selected_k, cfg.max_iter, cfg.tol, cfg.ridge, cfg.seed).fit(precompute_moments(train, chars, TARGET), gamma_init=gamma_init)
         gamma_init = mk.Gamma
         gv = pd.Timestamp(fo['train_end'])
-        gammas.append(pd.DataFrame(mk.Gamma, index=chars, columns=[f'factor{i+1}' for i in range(cfg.selected_k)]).assign(gamma_version=gv, fold=fo['fold']))
+        gammas_raw.append(pd.DataFrame(mk.Gamma, index=chars, columns=fcols).assign(gamma_version=gv, fold=fo['fold']))
+        G_al = mk.Gamma if G_ref is None else procrustes_align(mk.Gamma, G_ref)[0]
+        G_ref = G_al
+        gammas.append(pd.DataFrame(G_al, index=chars, columns=fcols).assign(gamma_version=gv, fold=fo['fold']))
         for d in fo['test_dates']:
             g = by_date.get(d)
             if g is None:
                 continue
             Z = g[chars].to_numpy(float); r = g[TARGET].to_numpy(float)
-            B = Z @ mk.Gamma
+            B = Z @ G_al
             f = np.linalg.solve(B.T @ B + cfg.ridge * eye, B.T @ r)
             out = g[['cusip', 'date']].copy()
             out['gamma_version'] = gv; out['fold'] = fo['fold']; out['target_bp'] = r; out['fitted_bp'] = B @ f; out['pit_residual'] = r - out['fitted_bp']
@@ -542,18 +570,19 @@ def walk_forward_residuals(frame: pd.DataFrame, chars: list[str], folds: list[di
                 out[f'beta{j+1}'] = B[:, j]; out[f'f{j+1}'] = f[j]
             parts.append(out)
         print(f'fold {fo["fold"]:02d} | train ->{fo["train_end"].date()} | test {fo["test_start"].date()}..{fo["test_end"].date()} | {time.perf_counter()-t0:.1f}s')
-    return pd.concat(parts, ignore_index=True), pd.concat(gammas)
+    return pd.concat(parts, ignore_index=True), pd.concat(gammas), pd.concat(gammas_raw)
 
 
 folds = make_weekly_folds(moments['dates'], CFG.train_start, CFG.first_oos_date, CFG.refit_days)
 print(f'{len(folds)} walk-forward folds; first test {folds[0]["test_start"].date()}, last test {folds[-1]["test_end"].date()}')
 t0 = time.perf_counter()
-resid, gamma_versions = walk_forward_residuals(model, CHARS, folds, CFG)
+resid, gamma_versions, gamma_versions_raw = walk_forward_residuals(model, CHARS, folds, CFG)
 print(f'PIT residuals: {len(resid):,} rows | {resid["cusip"].nunique():,} cusips | {resid["date"].nunique()} dates | {resid["gamma_version"].nunique()} gamma versions | {time.perf_counter()-t0:.1f}s')
 oos_var_expl = 1.0 - resid['pit_residual'].var() / resid['target_bp'].var()
 print(f'OOS variance explained {oos_var_expl:.3f} | residual sd {resid["pit_residual"].std():.2f} bp')
 resid.to_parquet(ARTIFACTS / 'pit_ipca_residuals_v2.parquet', index=False)
 gamma_versions.reset_index().rename(columns={'index': 'instrument'}).to_parquet(ARTIFACTS / 'gamma_versions_v2.parquet', index=False)
+gamma_versions_raw.reset_index().rename(columns={'index': 'instrument'}).to_parquet(ARTIFACTS / 'gamma_versions_raw_v2.parquet', index=False)
 record('walk_forward', folds=len(folds), residual_rows=len(resid), cusips=resid['cusip'].nunique(), oos_dates=resid['date'].nunique(), gamma_versions=resid['gamma_version'].nunique(), oos_variance_explained=float(oos_var_expl), residual_sd_bp=float(resid['pit_residual'].std()))
 
 # %%
@@ -566,11 +595,26 @@ rm['oos_var_explained'].plot.bar(ax=ax[0], color='#4C72B0'); ax[0].set_title('OO
 rm[['residual_sd_bp', 'target_sd_bp']].plot(ax=ax[1], marker='o'); ax[1].set_title('Residual vs target sd (bp)'); ax[1].set_xlabel('')
 top = gamma.assign(l2=np.sqrt((gamma ** 2).sum(axis=1))).sort_values('l2', ascending=False).index[:5]
 gv_f1 = gamma_versions.reset_index().rename(columns={'index': 'instrument'}).pivot(index='gamma_version', columns='instrument', values='factor1')[top]
-gv_f1.plot(ax=ax[2], marker='.'); ax[2].set_title('Factor-1 loadings by Gamma version (top instruments)'); ax[2].axhline(0, color='k', lw=0.5)
+gv_f1.plot(ax=ax[2], marker='.'); ax[2].set_title('Factor-1 loadings by Gamma version, Procrustes-aligned'); ax[2].axhline(0, color='k', lw=0.5)
 savefig('05_fit_over_time_and_gamma_stability')
-drift = gamma_versions.reset_index().rename(columns={'index': 'instrument'}).groupby('instrument')[['factor1', 'factor2', 'factor3'][:CFG.selected_k]].std().mean().mean()
-print('mean across-version sd of loadings:', round(float(drift), 4))
-record('walk_forward', gamma_loading_sd_across_versions=float(drift), monthly=rm.round(4).to_dict())
+fcols = [f'factor{i+1}' for i in range(CFG.selected_k)]
+_gv = gamma_versions.reset_index().rename(columns={'index': 'instrument'}); _gr = gamma_versions_raw.reset_index().rename(columns={'index': 'instrument'})
+sd_aligned = _gv.groupby('instrument')[fcols].std().mean(axis=1); sd_raw = _gr.groupby('instrument')[fcols].std().mean(axis=1)
+fig, ax = plt.subplots(1, 2, figsize=(14, 4.5))
+_order = gamma.assign(l2=np.sqrt((gamma ** 2).sum(axis=1))).sort_values('l2', ascending=False).index
+_sdtab = pd.DataFrame({'raw (variance-ordered)': sd_raw, 'Procrustes-aligned': sd_aligned}).reindex(_order); _sdtab.index = [c.replace('z_', '').replace('_lag1', '') for c in _sdtab.index]
+_sdtab.plot.bar(ax=ax[0]); ax[0].set_title('Across-version sd of loadings per instrument'); ax[0].tick_params(axis='x', rotation=60)
+_gr.pivot(index='gamma_version', columns='instrument', values='factor1')[top].plot(ax=ax[1], marker='.', legend=False); ax[1].set_title('Same loadings before alignment: label swaps when eigenvalues cross'); ax[1].axhline(0, color='k', lw=0.5)
+savefig('05_gamma_alignment')
+drift, drift_raw = float(sd_aligned.mean()), float(sd_raw.mean())
+print(f'mean across-version sd of loadings: raw {drift_raw:.4f} -> aligned {drift:.4f}')
+# Daily residual dispersion: the volatility regime the later tests live in
+_disp = resid.groupby('date').agg(resid_sd=('pit_residual', 'std'), target_sd=('target_bp', 'std'), big_share=('pit_residual', lambda s: (s.abs() > 10).mean()), n=('cusip', 'size'))
+fig, ax = plt.subplots(1, 2, figsize=(14, 4))
+_disp[['target_sd', 'resid_sd']].plot(ax=ax[0]); ax[0].set_title('Daily cross-sectional sd: target vs residual (bp)')
+ax[1].plot(_disp.index, _disp['big_share'], color='#C44E52'); ax[1].set_title('Share of bond-days with |residual| > 10 bp'); ax2 = ax[1].twinx(); ax2.plot(_disp.index, _disp['n'], color='grey', lw=0.8, alpha=0.6); ax2.set_ylabel('bonds priced', color='grey')
+savefig('05_residual_dispersion')
+record('walk_forward', gamma_loading_sd_across_versions=drift, gamma_loading_sd_raw=drift_raw, monthly=rm.round(4).to_dict())
 
 # %% [markdown]
 # ## 6. Factor-mimicking weights and the residual-maker
@@ -854,51 +898,84 @@ record('residual_diagnostics', two_regime=two_regime.reset_index().astype({'res_
 # %% [markdown]
 # ## 8. Paper portfolio: is the residual path harvestable?
 #
-# Signal: the best forecaster's prediction of tomorrow's residual. Weights are cross-sectionally demeaned, scaled
-# to unit gross, and projected off the beta span with the day's $B_t$, so the portfolio has zero factor exposure.
+# Every forecaster from Section 7 is run as a signal, plus the trailing mean faded in the active buckets. Weights
+# are cross-sectionally demeaned, scaled to unit gross, and projected off the beta span with the day's $B_t$, so
+# each portfolio has zero factor exposure. A walk-forward selector trades, each month, the signal with the best
+# hedged Sharpe over the prior months, so the headline is not an in-sample pick.
 # P&L is realised on the next day's yield change (bp of yield captured per unit gross). Sharpe is annualised with
 # $\sqrt{252}$. This is the number a stat-arb paper would report; a market maker reads it as "how much skew
 # information is in the residual" rather than as a tradable strategy.
 
 # %%
-best_pred = fc_preds[best].copy()
-pp = best_pred.merge(resid[['cusip', 'date'] + beta_cols], on=['cusip', 'date'], how='left')
-nxt = resid[['cusip', 'date', 'target_bp', 'pit_residual']].rename(columns={'date': 'next_date', 'target_bp': 'next_target_bp', 'pit_residual': 'next_resid_chk'})
-pp = pp.merge(nxt, on=['cusip', 'next_date'], how='left').dropna(subset=['next_target_bp'] + beta_cols)
+nxt = resid[['cusip', 'date', 'target_bp']].rename(columns={'date': 'next_date', 'target_bp': 'next_target_bp'})
 
 
-def portfolio_pnl(frame: pd.DataFrame, hedge: bool) -> pd.Series:
+def prep_portfolio_frame(pred: pd.DataFrame) -> pd.DataFrame:
+    pp = pred.merge(resid[['cusip', 'date'] + beta_cols], on=['cusip', 'date'], how='left')
+    return pp.merge(nxt, on=['cusip', 'next_date'], how='left').dropna(subset=['next_target_bp'] + beta_cols)
+
+
+def portfolio_pnl(frame: pd.DataFrame, hedge: bool = True, signal_col: str = 'yhat') -> pd.Series:
     out = {}
     for d, g in frame.groupby('date', observed=True):
         if len(g) < 50:
             continue
-        s = g['yhat'].to_numpy(float); w = s - s.mean()
+        s_ = g[signal_col].to_numpy(float); w = s_ - s_.mean()
         if hedge:
             B = g[beta_cols].to_numpy(float); w = w - B @ np.linalg.solve(B.T @ B + 1e-8 * np.eye(B.shape[1]), B.T @ w)
         gross = np.abs(w).sum()
         if gross <= 0:
             continue
-        w = w / gross
-        out[d] = float(w @ g['next_target_bp'].to_numpy(float))
+        out[d] = float((w / gross) @ g['next_target_bp'].to_numpy(float))
     return pd.Series(out).sort_index()
 
 
 def sharpe(x: pd.Series) -> float:
-    return float(np.sqrt(252) * x.mean() / x.std()) if x.std() > 0 else np.nan
+    return float(np.sqrt(252) * x.mean() / x.std()) if len(x) > 2 and x.std() > 0 else np.nan
 
 
-pnl_h, pnl_u = portfolio_pnl(pp, True), portfolio_pnl(pp, False)
-pp_rows = [{'universe': 'ALL', 'hedged_sharpe': sharpe(pnl_h), 'unhedged_sharpe': sharpe(pnl_u), 'mean_bp_per_day': pnl_h.mean(), 'days': len(pnl_h)}]
-for b, g in pp.groupby('activity_bucket'):
-    s = portfolio_pnl(g, True)
-    pp_rows.append({'universe': b, 'hedged_sharpe': sharpe(s), 'unhedged_sharpe': sharpe(portfolio_pnl(g, False)), 'mean_bp_per_day': s.mean(), 'days': len(s)})
-paper = pd.DataFrame(pp_rows).set_index('universe')
-display(paper)
-fig, ax = plt.subplots(1, 2, figsize=(13, 4))
-pnl_h.cumsum().plot(ax=ax[0], label=f'hedged, Sharpe {sharpe(pnl_h):.2f}'); pnl_u.cumsum().plot(ax=ax[0], label=f'unhedged, Sharpe {sharpe(pnl_u):.2f}'); ax[0].legend(); ax[0].set_title('Paper portfolio: cumulative bp captured per unit gross'); ax[0].axhline(0, color='k', lw=0.6)
-paper['hedged_sharpe'].drop('ALL').plot.bar(ax=ax[1], color='#4C72B0'); ax[1].axhline(0, color='k', lw=0.6); ax[1].set_title('Hedged Sharpe by activity bucket'); ax[1].set_xlabel('')
+# Candidate signals: every forecaster from Section 7, plus the trailing mean faded in the active buckets
+# (the transaction tests show the accumulated residual reverts, and the reversal is concentrated in active names).
+mean_name = next(k for k in fc_preds if k.startswith('Trailing'))
+signals = {k: prep_portfolio_frame(v) for k, v in fc_preds.items() if not v.empty}
+fade = signals[mean_name].copy(); fade['yhat'] = np.where(fade['activity_bucket'].isin(CFG.fade_buckets), -fade['yhat'], fade['yhat'])
+signals[f'{mean_name}, faded in {"/".join(CFG.fade_buckets)}'] = fade
+
+pnl_by_signal = {k: portfolio_pnl(v) for k, v in signals.items()}
+universes = ['ALL'] + sorted(b for b in resid['activity_bucket'].unique() if b != 'UNKNOWN')
+rows = []
+for k, v in signals.items():
+    row = {'forecaster': k, 'ALL': sharpe(pnl_by_signal[k]), 'ALL unhedged': sharpe(portfolio_pnl(v, hedge=False)), 'mean bp/day': pnl_by_signal[k].mean(), 'days': len(pnl_by_signal[k])}
+    for b in universes[1:]:
+        row[b] = sharpe(portfolio_pnl(v[v['activity_bucket'] == b]))
+    rows.append(row)
+paper = pd.DataFrame(rows).set_index('forecaster')
+print('Hedged Sharpe by forecaster and universe (ALL unhedged shown for reference):'); display(paper.round(2))
+
+# Walk-forward selection: each month, trade the forecaster with the best hedged Sharpe over the prior months.
+pnl_df = pd.DataFrame(pnl_by_signal).dropna(how='all')
+pnl_df['month'] = pnl_df.index.to_period('M')
+sel_parts, choices = [], {}
+for m in sorted(pnl_df['month'].unique())[1:]:
+    prior = pnl_df[pnl_df['month'] < m].drop(columns='month')
+    if len(prior) < 15:
+        continue
+    pick = prior.apply(sharpe).idxmax(); choices[str(m)] = pick
+    sel_parts.append(pnl_df.loc[pnl_df['month'] == m, pick].rename('selected'))
+pnl_selected = pd.concat(sel_parts) if sel_parts else pd.Series(dtype=float)
+print('walk-forward selection by prior-month Sharpe:', choices)
+print(f'selected-signal hedged Sharpe: {sharpe(pnl_selected):.2f} over {len(pnl_selected)} days')
+
+fig, ax = plt.subplots(1, 2, figsize=(15, 4.5))
+for k, v in pnl_by_signal.items():
+    v.cumsum().plot(ax=ax[0], label=f'{k} ({sharpe(v):.2f})', lw=1.2)
+if len(pnl_selected):
+    pnl_selected.cumsum().plot(ax=ax[0], color='k', lw=2, label=f'walk-forward selected ({sharpe(pnl_selected):.2f})')
+ax[0].legend(fontsize=7); ax[0].axhline(0, color='k', lw=0.6); ax[0].set_title('Hedged paper portfolio: cumulative bp captured per unit gross, by signal')
+paper[universes[1:]].T.plot.bar(ax=ax[1]); ax[1].axhline(0, color='k', lw=0.6); ax[1].set_title('Hedged Sharpe by activity bucket and signal'); ax[1].legend(fontsize=7); ax[1].set_xlabel('')
 savefig('08_paper_portfolio')
-record('paper_portfolio', signal=best, **{f'{i}_{k}': (float(v) if pd.notna(v) else None) for i, row in paper.iterrows() for k, v in row.items()})
+best_portfolio = paper['ALL'].idxmax()
+record('paper_portfolio', table=paper.round(4).reset_index().to_dict(orient='records'), walk_forward_choices=choices, selected_sharpe=float(sharpe(pnl_selected)) if len(pnl_selected) else None, best_by_all=best_portfolio)
 
 # %% [markdown]
 # ## 9. Transaction validation (PIT-safe)
@@ -906,7 +983,12 @@ record('paper_portfolio', signal=best, **{f'{i}_{k}': (float(v) if pd.notna(v) e
 # Each matched trade is joined to the latest residual dated **strictly before** the trade date. Targets:
 # `e_mark = 100 (y_trade − y_prior_mark)` where the prior mark is the close on the residual date, and
 # `e_algo = 100 (y_trade − y_algo)`. Inference is Fama-MacBeth over trade dates; pooled OLS is descriptive. We
-# also report the slope after neutralising date × side × size, by trade recency and by side.
+# also report the slope after neutralising date × side × size, by trade recency and by side, a joint regression
+# on the one-day residual rank and the trailing-mean rank, the spread reading, and the evaluator-revision test.
+#
+# **MSRB side convention.** `S` is a dealer **sale** to a customer (the customer buys; dealer offer side, lower
+# yield), `P` is a dealer **purchase** from a customer (the customer sells; dealer bid side, higher yield), `D` is
+# inter-dealer. The dealer round trip is therefore `P yield − S yield` and is positive.
 
 # %%
 def standardize_trades(tr: pd.DataFrame) -> pd.DataFrame:
@@ -936,13 +1018,23 @@ def standardize_trades(tr: pd.DataFrame) -> pd.DataFrame:
         print(f'trades after requiring msrb_tradetime > signal_ts: {len(t):,} (dropped {before - len(t):,})')
     t = t.dropna(subset=['cusip', 'trade_ts', 'msrb_yield']).sort_values(['cusip', 'trade_ts'], kind='stable').reset_index(drop=True)
     prev = t.groupby('cusip', observed=True)['trade_ts'].shift(1)
-    t['recency_days'] = (t['trade_ts'] - prev).dt.total_seconds() / 86400.0
-    # print features (strictly prior prints of the same bond): last print's spread to MMD, its side, prints in the last 20 days
+    t['recency_days'] = (t['trade_ts'] - prev).dt.total_seconds() / 86400.0      # bucket definition: days since the prior print before this trade
+    # Print features for the level model, cut at the ALGO SIGNAL TIME so the model only sees what the algo could see:
+    # the last print strictly before signal_ts (its spread to MMD and side), days since it, and prints in the 20 days before it.
     t['spread_to_mmd_bp'] = 100.0 * (t['msrb_yield'] - t['MmdYld'])
-    t['last_print_spread_bp'] = t.groupby('cusip', observed=True)['spread_to_mmd_bp'].shift(1)
-    t['last_print_side'] = t.groupby('cusip', observed=True)['side'].shift(1).fillna('NONE')
-    cnt = t.set_index('trade_ts').groupby('cusip', observed=True)['msrb_yield'].rolling('20D').count().reset_index(level=0, drop=True)
-    t['prints_20d'] = (cnt.to_numpy() - 1.0).clip(min=0) if len(cnt) == len(t) else np.nan
+    t['_row'] = np.arange(len(t))
+    prints = t[['cusip', 'trade_ts', 'spread_to_mmd_bp', 'side']].rename(columns={'trade_ts': 'print_ts', 'spread_to_mmd_bp': 'last_print_spread_bp', 'side': 'last_print_side'}).sort_values('print_ts')
+    prints['cum_prints'] = prints.groupby('cusip', observed=True).cumcount() + 1.0
+    sig = t[['_row', 'cusip', 'signal_ts']].dropna(subset=['signal_ts']).sort_values('signal_ts')
+    j1 = pd.merge_asof(sig, prints, left_on='signal_ts', right_on='print_ts', by='cusip', direction='backward', allow_exact_matches=False)
+    sig20 = sig.assign(signal_ts=sig['signal_ts'] - pd.Timedelta(days=20)).sort_values('signal_ts')
+    j2 = pd.merge_asof(sig20, prints[['cusip', 'print_ts', 'cum_prints']], left_on='signal_ts', right_on='print_ts', by='cusip', direction='backward', allow_exact_matches=False)
+    j1 = j1.set_index('_row'); j2 = j2.set_index('_row')
+    t = t.set_index('_row')
+    t['last_print_spread_bp'] = j1['last_print_spread_bp']; t['last_print_side'] = j1['last_print_side'].fillna('NONE')
+    t['recency_days_sig'] = (t['signal_ts'] - j1['print_ts']).dt.total_seconds() / 86400.0
+    t['prints_20d'] = (j1['cum_prints'].fillna(0) - j2['cum_prints'].fillna(0)).clip(lower=0)
+    t = t.reset_index(drop=True)
     t['recency_bucket'] = pd.cut(t['recency_days'], bins=[-0.01, 1, 3, 7, 21, np.inf], labels=['<=1d', '1-3d', '3-7d', '7-21d', '>21d']).astype(str).replace('nan', 'first_print')
     return t
 
@@ -995,6 +1087,20 @@ def fm_slope(frame: pd.DataFrame, y: str, x: str, controls: list[str], date_col:
             'fm_beta': slopes.mean() if len(slopes) else np.nan, 'fm_t': np.sqrt(len(slopes)) * slopes.mean() / slopes.std() if len(slopes) > 2 and slopes.std() > 0 else np.nan, 'fm_dates': len(slopes)}
 
 
+def fm_multi(frame: pd.DataFrame, y: str, xs: list[str], controls: list[str], date_col: str = 'trade_date', min_n: int = 30) -> pd.DataFrame:
+    """Fama-MacBeth with several scores entered jointly: one row per score with the FM beta and t."""
+    f = frame.dropna(subset=[y] + xs).copy()
+    ctrl = [c for c in controls if c in f.columns]
+    slopes = []
+    for d, g in f.groupby(date_col, observed=True):
+        if len(g) < min_n or any(g[x].std() == 0 for x in xs):
+            continue
+        Xd = pd.concat([pd.Series(1.0, index=g.index), g[xs], g[ctrl].apply(pd.to_numeric, errors='coerce').fillna(0.0)], axis=1).to_numpy(float)
+        bd, *_ = np.linalg.lstsq(Xd, g[y].to_numpy(float), rcond=None); slopes.append(bd[1:1 + len(xs)])
+    S = np.array(slopes)
+    return pd.DataFrame({'score': xs, 'fm_beta': S.mean(axis=0), 'fm_t': np.sqrt(len(S)) * S.mean(axis=0) / S.std(axis=0), 'fm_dates': len(S), 'n': len(f)})
+
+
 def neutralised_fm(frame: pd.DataFrame, y: str, x: str, cells: list[str], date_col: str = 'trade_date') -> dict:
     f = frame.dropna(subset=[y, x]).copy()
     for c in [y, x]:
@@ -1028,6 +1134,21 @@ if HAS_TRADES:
         rows.append({'target': 'e vs algo quote, score = trailing-mean residual rank', 'bucket': 'ALL', **fm_slope(tv.dropna(subset=['level_rank']), 'e_algo_bp', 'level_rank', CONTROLS)})
     tx = pd.DataFrame(rows)
     display(tx)
+    # Joint regression: are the one-day continuation and the trailing-mean reversal independent?
+    jt = pd.concat([fm_multi(tv, 'e_mark_bp', ['pit_rank', 'level_rank'], CONTROLS).assign(target='e vs prior mark'),
+                    fm_multi(tv, 'e_algo_bp', ['pit_rank', 'level_rank'], CONTROLS).assign(target='e vs algo quote')], ignore_index=True)
+    print('Joint Fama-MacBeth: one-day residual rank and trailing-mean rank entered together'); display(jt.round(4))
+    record('transaction_validation', joint=jt.round(4).to_dict(orient='records'))
+
+    # Decile charts: mean trade-vs-mark by score decile, by MSRB side (S dealer sale / P dealer purchase / D inter-dealer)
+    fig, ax = plt.subplots(1, 2, figsize=(14, 4.5))
+    for a, (col, title) in zip(ax, [('pit_rank', 'one-day residual rank'), ('level_rank', f'trailing-{CFG.level_signal_window} mean residual rank')]):
+        d = tv.dropna(subset=[col]).copy(); d['decile'] = pd.qcut(d[col].rank(method='first'), 10, labels=False) + 1
+        for sd, g in d.groupby('side'):
+            if len(g) > 2000:
+                a.plot(g.groupby('decile')['e_mark_bp'].mean(), marker='o', label={'S': 'S: dealer sale (customer buys)', 'P': 'P: dealer purchase (customer sells)', 'D': 'D: inter-dealer'}.get(sd, sd))
+        a.plot(d.groupby('decile')['e_mark_bp'].mean(), color='k', lw=2, label='all'); a.axhline(0, color='k', lw=0.6); a.set_xlabel('score decile (1 rich -> 10 cheap)'); a.set_ylabel('mean trade - prior mark (bp)'); a.set_title(f'Trade vs prior mark by {title}'); a.legend(fontsize=8)
+    savefig('09_decile_charts')
 
     rec_order = ['<=1d', '1-3d', '3-7d', '7-21d', '>21d']
     # ---- the spread reading: does the residual predict how far from the mark trades print, regardless of direction?
@@ -1035,15 +1156,15 @@ if HAS_TRADES:
                {'test': '|trade - prior mark| on |residual| / vol', 'bucket': 'ALL', **fm_slope(tv, 'abs_e_mark_bp', 'abs_resid_z', CONTROLS)}]
     for b, g in tv.groupby('recency_bucket'):
         sp_rows.append({'test': '|trade - prior mark| on residual rank, by recency', 'bucket': b, **fm_slope(g, 'abs_e_mark_bp', 'pit_rank', CONTROLS)})
-    # dealer-to-customer round trip: same bond, same day, both a customer sell (S) and a customer buy (P)
+    # dealer round trip: same bond, same day, both a dealer purchase (P, customer sells, higher yield) and a dealer sale (S, customer buys, lower yield)
     day = tv[tv['side'].isin(['P', 'S'])].groupby(['cusip', 'trade_date', 'side'], observed=True).agg(y=('msrb_yield', 'mean'), rank=('pit_rank', 'mean'), z=('abs_resid_z', 'mean'), log_size=('log_size', 'mean')).unstack('side')
     if ('y', 'P') in day.columns and ('y', 'S') in day.columns:
-        rt = pd.DataFrame({'round_trip_bp': 100.0 * (day[('y', 'S')] - day[('y', 'P')]), 'pit_rank': day[('rank', 'S')], 'abs_resid_z': day[('z', 'S')], 'log_size': day[('log_size', 'S')]}).dropna().reset_index()
+        rt = pd.DataFrame({'round_trip_bp': 100.0 * (day[('y', 'P')] - day[('y', 'S')]), 'pit_rank': day[('rank', 'P')], 'abs_resid_z': day[('z', 'P')], 'log_size': day[('log_size', 'P')]}).dropna().reset_index()
         rt['side'] = 'RT'
         if len(rt) > 200:
-            sp_rows.append({'test': 'round-trip spread (S yield - P yield, same bond-day) on residual rank', 'bucket': f'{len(rt):,} pairs', **fm_slope(rt, 'round_trip_bp', 'pit_rank', ['log_size'])})
-            sp_rows.append({'test': 'round-trip spread on |residual| / vol', 'bucket': f'{len(rt):,} pairs', **fm_slope(rt, 'round_trip_bp', 'abs_resid_z', ['log_size'])})
-            print(f'round-trip pairs: {len(rt):,} | median round trip {rt["round_trip_bp"].median():.1f} bp')
+            sp_rows.append({'test': 'dealer round trip (P yield - S yield, same bond-day) on residual rank', 'bucket': f'{len(rt):,} pairs', **fm_slope(rt, 'round_trip_bp', 'pit_rank', ['log_size'])})
+            sp_rows.append({'test': 'dealer round trip on |residual| / vol', 'bucket': f'{len(rt):,} pairs', **fm_slope(rt, 'round_trip_bp', 'abs_resid_z', ['log_size'])})
+            print(f'round-trip pairs: {len(rt):,} | median dealer round trip {rt["round_trip_bp"].median():.1f} bp (positive expected under the MSRB convention)')
     spread_tx = pd.DataFrame(sp_rows)
     print('Spread reading (positive = wider around the mark when the residual is large):'); display(spread_tx)
 
@@ -1099,7 +1220,7 @@ if HAS_TRADES and not tv.empty and tv['MmdYld'].notna().mean() > 0.5 and len(tv)
     feat_panel['residual_date'] = to_ns(feat_panel['residual_date'])
     lv['residual_date'] = to_ns(lv['residual_date'])
     lv = lv.merge(feat_panel, on=['cusip', 'residual_date'], how='left')
-    lv['recency_days_c'] = lv['recency_days'].clip(upper=60).fillna(60)
+    lv['recency_days_c'] = lv['recency_days_sig'].clip(upper=60).fillna(60)   # days from the last print to the SIGNAL, not to the trade
     for s in ['D', 'P', 'S']:
         lv[f'side_{s}'] = (lv['side'] == s).astype(float)
         lv[f'last_side_{s}'] = (lv['last_print_side'] == s).astype(float)
@@ -1149,6 +1270,14 @@ if HAS_TRADES and not tv.empty and tv['MmdYld'].notna().mean() > 0.5 and len(tv)
     else:
         ax[1].text(0.1, 0.5, 'feature importance needs LightGBM', fontsize=12); ax[1].axis('off')
     savefig('10_level_model')
+    # Calibration and stability: predicted vs realised spread, and monthly MAE of algo vs model
+    fig, ax = plt.subplots(1, 2, figsize=(14, 4.5))
+    _sp = 100.0 * (lvp['msrb_yield'] - lvp['MmdYld'])
+    lim = [np.nanpercentile(_sp, 1), np.nanpercentile(_sp, 99)]
+    hb = ax[0].hexbin(lvp['spread_hat'].clip(*lim), _sp.clip(*lim), gridsize=50, cmap='viridis', mincnt=1, bins='log'); ax[0].plot(lim, lim, 'k--', lw=1); ax[0].set_xlabel('predicted spread to MMD (bp)'); ax[0].set_ylabel('realised trade spread to MMD (bp)'); ax[0].set_title('Level model calibration on held-out trades'); plt.colorbar(hb, ax=ax[0], fraction=0.046)
+    mm_ = lvp.groupby('month').agg(algo=('e_algo_bp', lambda s: s.abs().mean()), mark=('e_mark_bp', lambda s: s.abs().mean()), model=('e_model_bp', lambda s: s.abs().mean()))
+    mm_.plot(ax=ax[1], marker='o'); ax[1].set_title('Held-out MAE by month (bp): algo quote, prior mark, level model'); ax[1].set_xlabel('')
+    savefig('10_level_model_calibration')
     lvp.to_parquet(ARTIFACTS / 'level_model_predictions_v2.parquet', index=False)
     record('level_model', backend='lightgbm' if HAS_LGB else 'sklearn_histgbm', features=FEATURES, overall=overall.round(4).to_dict(orient='records'), by_recency=by_rec.round(4).reset_index().to_dict(orient='records'), by_side=by_side.round(4).reset_index().to_dict(orient='records'))
 else:
@@ -1157,14 +1286,14 @@ else:
 # %% [markdown]
 # ## 10b. Application: shrinkage mid, residual-driven half-width, concession
 #
-# The findings point to one object with three faces. The **trust weight** on the evaluated mark falls with the
-# size of the residual relative to the bond's own volatility, $w_i = 1/(1+\lambda\,|\hat\varepsilon_i|/\sigma_i)$;
-# the **blended mid** is $w_i\,y^{mark}_i + (1-w_i)\,y^{model}_i$ where the model value is the level model when it
-# ran and a rule-based cohort median (duration x rating x call structure, same date) otherwise; the **half-width**
-# is a base term plus a residual term, scaled on the training months to cover 80% of prints; the **concession**
-# is that half-width applied on the customer's side. Everything is walk-forward by month: $\lambda$ and the band
-# scale are chosen on prior months and applied to the current one. Baselines: mark alone, model alone, and a
-# fixed-width band with the same coverage target.
+# The level model is the **mid**. The evaluated mark enters only through an **inverse-variance weight** estimated
+# on the training months within bins of residual size (|residual| / bond volatility): in each bin the weight on
+# the mark is its error precision against the next print relative to the model's, so the data decides how much
+# mark to keep and the one-parameter curve $1/(1+\lambda z)$ is kept only as a check with a grid up to 64. The
+# **half-width** is fitted around the model mid as a base term plus a residual-size term, scaled on the training
+# months to cover 80% of prints, and compared with a fixed band at the same target. The **concession** is that
+# half-width on the dealer's side: bid (P, we buy from the customer) = mid + h, offer (S, we sell) = mid − h.
+# Everything is walk-forward by month.
 
 # %%
 if HAS_TRADES and not tv.empty:
@@ -1176,84 +1305,101 @@ if HAS_TRADES and not tv.empty:
     cells = ['date', 'dur_cell', 'rat_cell', 'call_structure']
     coh_src['n_cell'] = coh_src.groupby(cells, observed=True)['closing_yield'].transform('size')
     coh_src['y_cohort'] = coh_src.groupby(cells, observed=True)['closing_yield'].transform('median')
-    coh_src['y_cohort_loo'] = np.where(coh_src['n_cell'] > 1, coh_src['y_cohort'], np.nan)   # need at least one peer besides the bond itself
+    coh_src['y_cohort_loo'] = np.where(coh_src['n_cell'] > 1, coh_src['y_cohort'], np.nan)
     coh = coh_src[['cusip', 'date', 'y_cohort_loo']].rename(columns={'date': 'residual_date', 'y_cohort_loo': 'y_cohort'})
-    coh['residual_date'] = to_ns(coh['residual_date'])
-    app['residual_date'] = to_ns(app['residual_date'])
+    coh['residual_date'] = to_ns(coh['residual_date']); app['residual_date'] = to_ns(app['residual_date'])
     app = app.merge(coh, on=['cusip', 'residual_date'], how='left')
     if 'lvp' in globals() and not lvp.empty:
         lm = lvp[['cusip', 'trade_ts', 'spread_hat', 'MmdYld']].copy(); lm['y_model_lm'] = lm['MmdYld'] + lm['spread_hat'] / 100.0
         app = app.merge(lm[['cusip', 'trade_ts', 'y_model_lm']], on=['cusip', 'trade_ts'], how='left')
-        app['y_model'] = app['y_model_lm'].fillna(app['y_cohort']); model_source = 'level model where available, cohort median otherwise'
+        app['y_model'] = app['y_model_lm'].fillna(app['y_cohort']); app['model_src'] = np.where(app['y_model_lm'].notna(), 'level_model', 'cohort'); model_source = 'level model where available, cohort median otherwise'
     else:
-        app['y_model'] = app['y_cohort']; model_source = 'cohort median (level model not run)'
+        app['y_model'] = app['y_cohort']; app['model_src'] = 'cohort'; model_source = 'cohort median (level model not run)'
     app = app.dropna(subset=['y_model']).copy()
     app['z'] = app['abs_resid_z'].clip(0, 10).fillna(1.0)
     app['month'] = app['trade_date'].dt.to_period('M')
-    app['e_model_bp'] = 100.0 * (app['msrb_yield'] - app['y_model'])
+    app['err_mark_bp'] = 100.0 * (app['msrb_yield'] - app['y_prior_mark']); app['err_model_bp'] = 100.0 * (app['msrb_yield'] - app['y_model'])
     print(f'application sample: {len(app):,} trades | model value: {model_source}')
 
-    def blend(frame: pd.DataFrame, lam: float) -> pd.Series:
+    def blend_lambda(frame: pd.DataFrame, lam: float) -> pd.Series:
         w = 1.0 / (1.0 + lam * frame['z'])
         return w * frame['y_prior_mark'] + (1.0 - w) * frame['y_model']
 
-    out_rows, per_trade = [], []
+    out_rows, per_trade, weight_curves = [], [], []
     months = sorted(app['month'].unique())
     for m in months[1:]:
         tr, te = app[app['month'] < m], app[app['month'] == m]
         if len(tr) < 2_000 or te.empty:
             continue
-        # 1. lambda by training MAE of the blended mid
-        lam_mae = {lam: (100.0 * (tr['msrb_yield'] - blend(tr, lam))).abs().mean() for lam in CFG.shrink_lambda_grid}
+        # (a) one-parameter shrinkage as a check (grid now extends to 64)
+        lam_mae = {lam: (100.0 * (tr['msrb_yield'] - blend_lambda(tr, lam))).abs().mean() for lam in CFG.shrink_lambda_grid}
         lam_star = min(lam_mae, key=lam_mae.get)
-        tr_mid, te_mid = blend(tr, lam_star), blend(te, lam_star)
-        tr_err = (100.0 * (tr['msrb_yield'] - tr_mid)).abs(); te_err = (100.0 * (te['msrb_yield'] - te_mid)).abs()
-        # 2. half-width = s * (a + b z): a, b from binned medians of |error| vs z on train; s for target coverage on train
-        zq = pd.qcut(tr['z'].rank(method='first'), 10, labels=False)
-        bins = pd.DataFrame({'z': tr['z'].groupby(zq).median(), 'err': tr_err.groupby(zq).median()})
-        b, a = np.polyfit(bins['z'], bins['err'], 1); a, b = max(a, 0.1), max(b, 0.0)
-        raw_tr = a + b * tr['z']
-        s_scale = np.quantile(tr_err / raw_tr, CFG.band_coverage)
-        half_te = s_scale * (a + b * te['z'])
-        fixed_half = np.quantile(tr_err, CFG.band_coverage)
-        # 3. concession on the customer's side in yield terms: bid (customer sells to us) = mid + h, offer = mid - h
-        rec = te[['cusip', 'trade_date', 'side', 'recency_bucket', 'size_cell', 'msrb_yield', 'y_prior_mark', 'y_model', 'z']].copy()
-        rec['w_mark'] = 1.0 / (1.0 + lam_star * rec['z']); rec['y_blend'] = te_mid; rec['half_width_bp'] = half_te; rec['fixed_half_bp'] = fixed_half
-        rec['err_mark_bp'] = 100.0 * (rec['msrb_yield'] - rec['y_prior_mark']); rec['err_model_bp'] = 100.0 * (rec['msrb_yield'] - rec['y_model']); rec['err_blend_bp'] = 100.0 * (rec['msrb_yield'] - rec['y_blend'])
-        rec['covered'] = (rec['err_blend_bp'].abs() <= rec['half_width_bp']).astype(float); rec['covered_fixed'] = (rec['err_blend_bp'].abs() <= fixed_half).astype(float)
-        rec['bid_yield'] = rec['y_blend'] + rec['half_width_bp'] / 100.0; rec['offer_yield'] = rec['y_blend'] - rec['half_width_bp'] / 100.0
-        rec['month'] = str(m); rec['lambda'] = lam_star
+        # (b) inverse-variance weight on the mark by residual-size bin, and (c) the half-width around the model mid, both
+        # estimated on training rows WITH THE SAME MODEL SOURCE as the test row (level-model months vs cohort-only months
+        # have very different error scales; mixing them inflates the band).
+        w_te = pd.Series(np.nan, index=te.index); half_te = pd.Series(np.nan, index=te.index); fixed_te = pd.Series(np.nan, index=te.index)
+        a = b = s_scale = fixed_half = np.nan
+        for src in te['model_src'].unique():
+            tes_idx = te.index[te['model_src'] == src]
+            if (tr['model_src'] == src).sum() < 500:
+                continue   # no same-source training history yet (e.g. the first level-model month): leave these rows unweighted and unbanded
+            trs = tr[tr['model_src'] == src]
+            edges = np.unique(np.quantile(trs['z'], np.linspace(0, 1, 11))); edges[0], edges[-1] = -np.inf, np.inf
+            tr_bin = pd.cut(trs['z'], edges, labels=False); te_bin = pd.cut(te.loc[tes_idx, 'z'], edges, labels=False)
+            mse_mark = (trs['err_mark_bp'] ** 2).groupby(tr_bin).mean(); mse_model = (trs['err_model_bp'] ** 2).groupby(tr_bin).mean()
+            w_bin = (1.0 / mse_mark) / (1.0 / mse_mark + 1.0 / mse_model)
+            w_te.loc[tes_idx] = te_bin.map(w_bin).astype(float).fillna(float(w_bin.mean())).to_numpy()
+            tr_err = trs['err_model_bp'].abs()
+            bins = pd.DataFrame({'z': trs['z'].groupby(tr_bin).median(), 'err': tr_err.groupby(tr_bin).median()}).dropna()
+            b_, a_ = np.polyfit(bins['z'], bins['err'], 1) if len(bins) > 2 else (0.0, float(tr_err.median())); a_, b_ = max(a_, 0.1), max(b_, 0.0)
+            s_ = np.quantile(tr_err / (a_ + b_ * trs['z']), CFG.band_coverage); f_ = np.quantile(tr_err, CFG.band_coverage)
+            half_te.loc[tes_idx] = (s_ * (a_ + b_ * te.loc[tes_idx, 'z'])).to_numpy(); fixed_te.loc[tes_idx] = f_
+            weight_curves.append(pd.DataFrame({'month': str(m), 'model_src': src, 'z_bin': w_bin.index, 'z_mid': trs['z'].groupby(tr_bin).median().values, 'w_mark': w_bin.values, 'rmse_mark': np.sqrt(mse_mark.values), 'rmse_model': np.sqrt(mse_model.values)}))
+            if src == te['model_src'].mode().iloc[0]:
+                a, b, s_scale, fixed_half = a_, b_, s_, f_
+        y_blend = w_te * te['y_prior_mark'] + (1.0 - w_te) * te['y_model']
+        if w_te.isna().all():
+            print(f'{m}: no same-source training rows yet; month skipped for the blend and band'); continue
+        rec = te[['cusip', 'trade_date', 'side', 'recency_bucket', 'size_cell', 'msrb_yield', 'y_prior_mark', 'y_model', 'z', 'err_mark_bp', 'err_model_bp']].copy()
+        rec['w_mark'] = w_te; rec['y_blend'] = y_blend; rec['err_blend_bp'] = 100.0 * (rec['msrb_yield'] - rec['y_blend'])
+        rec['err_lambda_bp'] = 100.0 * (rec['msrb_yield'] - blend_lambda(te, lam_star)); rec['lambda'] = lam_star
+        rec['half_width_bp'] = half_te; rec['fixed_half_bp'] = fixed_te; rec['model_src'] = te['model_src']
+        rec['covered'] = (rec['err_model_bp'].abs() <= rec['half_width_bp']).astype(float); rec['covered_fixed'] = (rec['err_model_bp'].abs() <= rec['fixed_half_bp']).astype(float)
+        # concession in yield terms around the model mid: dealer bid (P side, we buy) = mid + h, dealer offer (S side, we sell) = mid - h
+        rec['bid_yield'] = rec['y_model'] + rec['half_width_bp'] / 100.0; rec['offer_yield'] = rec['y_model'] - rec['half_width_bp'] / 100.0
+        rec['month'] = str(m)
         per_trade.append(rec)
-        out_rows.append({'month': str(m), 'train_trades': len(tr), 'test_trades': len(te), 'lambda': lam_star, 'band_a_bp': a, 'band_b_bp_per_z': b, 'band_scale': s_scale,
-                         'MAE mark': rec['err_mark_bp'].abs().mean(), 'MAE model': rec['err_model_bp'].abs().mean(), 'MAE blend': rec['err_blend_bp'].abs().mean(),
-                         'coverage resid band': rec['covered'].mean(), 'mean half-width resid (bp)': rec['half_width_bp'].mean(), 'coverage fixed band': rec['covered_fixed'].mean(), 'fixed half-width (bp)': fixed_half})
-    appf = pd.DataFrame(out_rows).set_index('month'); apt = pd.concat(per_trade, ignore_index=True)
+        out_rows.append({'month': str(m), 'train': len(tr), 'test': len(te), 'lambda*': lam_star, 'mean w_mark (ivw)': float(w_te.mean()), 'band a': a, 'band b per z': b, 'band scale': s_scale,
+                         'MAE mark': rec['err_mark_bp'].abs().mean(), 'MAE model': rec['err_model_bp'].abs().mean(), 'MAE blend ivw': rec['err_blend_bp'].abs().mean(), 'MAE blend lambda': rec['err_lambda_bp'].abs().mean(),
+                         'coverage resid band': rec['covered'].mean(), 'half-width resid': rec['half_width_bp'].mean(), 'coverage fixed': rec['covered_fixed'].mean(), 'fixed half-width': rec['fixed_half_bp'].mean(), 'share level-model mid': float((te['model_src'] == 'level_model').mean())})
+    appf = pd.DataFrame(out_rows).set_index('month'); apt = pd.concat(per_trade, ignore_index=True); wcurve = pd.concat(weight_curves, ignore_index=True)
     display(appf.round(3))
 
     def app_table(frame: pd.DataFrame, by: str) -> pd.DataFrame:
         g = frame.groupby(by, observed=True)
-        t = pd.DataFrame({'n': g.size(), 'MAE mark': g['err_mark_bp'].apply(lambda s: s.abs().mean()), 'MAE model': g['err_model_bp'].apply(lambda s: s.abs().mean()), 'MAE blend': g['err_blend_bp'].apply(lambda s: s.abs().mean()),
-                          'mean w_mark': g['w_mark'].mean(), 'coverage resid band': g['covered'].mean(), 'half-width resid (bp)': g['half_width_bp'].mean(), 'coverage fixed band': g['covered_fixed'].mean(), 'fixed half-width (bp)': g['fixed_half_bp'].mean()})
-        d = frame.assign(gain=frame['err_mark_bp'].abs() - frame['err_blend_bp'].abs()).groupby([by, 'trade_date'], observed=True)['gain'].mean().groupby(level=0)
-        t['blend gain vs mark (bp)'] = d.mean(); t['gain t (FM)'] = (np.sqrt(d.count()) * d.mean() / d.std().replace(0, np.nan)).fillna(0.0)
+        t = pd.DataFrame({'n': g.size(), 'MAE mark': g['err_mark_bp'].apply(lambda x: x.abs().mean()), 'MAE model': g['err_model_bp'].apply(lambda x: x.abs().mean()),
+                          'MAE blend ivw': g['err_blend_bp'].apply(lambda x: x.abs().mean()), 'MAE blend lambda': g['err_lambda_bp'].apply(lambda x: x.abs().mean()), 'mean w_mark': g['w_mark'].mean(),
+                          'coverage resid band': g['covered'].mean(), 'half-width resid (bp)': g['half_width_bp'].mean(), 'coverage fixed': g['covered_fixed'].mean(), 'fixed half-width (bp)': g['fixed_half_bp'].mean()})
+        d = frame.assign(gain=frame['err_model_bp'].abs() - frame['err_blend_bp'].abs()).groupby([by, 'trade_date'], observed=True)['gain'].mean().groupby(level=0)
+        t['blend gain vs model (bp)'] = d.mean(); t['gain t (FM)'] = (np.sqrt(d.count()) * d.mean() / d.std().replace(0, np.nan)).fillna(0.0)
         return t
 
-    app_all = app_table(apt.assign(all='ALL'), 'all'); app_rec = app_table(apt, 'recency_bucket').reindex(rec_order + ['first_print']); app_side = app_table(apt, 'side')
-    display(app_all.round(3)); display(app_rec.round(3)); display(app_side.round(3))
+    app_all = app_table(apt.assign(all='ALL'), 'all'); app_rec = app_table(apt, 'recency_bucket').reindex(rec_order + ['first_print']); app_side = app_table(apt, 'side'); app_src = app_table(apt, 'model_src')
+    display(app_all.round(3)); display(app_src.round(3)); display(app_rec.round(3)); display(app_side.round(3))
     fig, ax = plt.subplots(1, 3, figsize=(18, 4.5))
-    app_rec[['MAE mark', 'MAE model', 'MAE blend']].plot.bar(ax=ax[0]); ax[0].set_title('Abs. error vs next print by recency: mark, model, blend (bp)', fontsize=10); ax[0].set_xlabel('')
-    zq_all = pd.qcut(apt['z'].rank(method='first'), 10, labels=False)
-    prof = pd.DataFrame({'z': apt['z'].groupby(zq_all).median(), 'abs err blend': apt['err_blend_bp'].abs().groupby(zq_all).median(), 'half-width': apt['half_width_bp'].groupby(zq_all).median(), 'w_mark': apt['w_mark'].groupby(zq_all).median()})
-    ax[1].plot(prof['z'], prof['abs err blend'], marker='o', label='median |error| of blend'); ax[1].plot(prof['z'], prof['half-width'], marker='s', label='median half-width'); ax[1].set_xlabel('|residual| / bond vol (decile medians)'); ax[1].legend(loc='upper left', fontsize=8); ax[1].set_title('Residual size -> uncertainty of the mid (bp)', fontsize=10)
-    ax2 = ax[1].twinx(); ax2.plot(prof['z'], prof['w_mark'], color='grey', ls='--', label='trust weight on mark'); ax2.set_ylim(0, 1.05); ax2.legend(loc='lower right', fontsize=8)
+    app_rec[['MAE mark', 'MAE model', 'MAE blend ivw']].plot.bar(ax=ax[0]); ax[0].set_title('Abs. error vs next print by recency: mark, model mid, ivw blend (bp)', fontsize=10); ax[0].set_xlabel('')
+    wlast = wcurve[(wcurve['month'] == wcurve['month'].max()) & (wcurve['model_src'] == wcurve.loc[wcurve['month'] == wcurve['month'].max(), 'model_src'].mode().iloc[0])]
+    ax[1].plot(wlast['z_mid'], wlast['rmse_mark'], marker='o', label='RMSE of mark vs print'); ax[1].plot(wlast['z_mid'], wlast['rmse_model'], marker='s', label='RMSE of model mid vs print'); ax[1].set_xlabel('|residual| / bond vol (bin medians, last training set)'); ax[1].set_ylabel('bp'); ax[1].legend(loc='upper left', fontsize=8); ax[1].set_title('Error variances by residual size and the implied trust weight', fontsize=10)
+    ax2 = ax[1].twinx(); ax2.plot(wlast['z_mid'], wlast['w_mark'], color='grey', ls='--', label='inverse-variance weight on mark'); ax2.set_ylim(0, 1.05); ax2.legend(loc='lower right', fontsize=8)
     ax[2].bar(['resid band', 'fixed band'], [apt['covered'].mean(), apt['covered_fixed'].mean()], color=['#4C72B0', '#8C8C8C']); ax[2].axhline(CFG.band_coverage, color='k', ls='--', lw=0.8)
-    ax[2].set_ylim(0.5, 1.0); ax[2].set_title(f"Held-out coverage, target {CFG.band_coverage:.0%}: half-width {apt['half_width_bp'].mean():.1f} vs {apt['fixed_half_bp'].mean():.1f} bp", fontsize=10)
+    ax[2].set_ylim(0.5, 1.0); ax[2].set_title(f"Coverage around the model mid, target {CFG.band_coverage:.0%}: half-width {apt['half_width_bp'].mean():.1f} vs {apt['fixed_half_bp'].mean():.1f} bp", fontsize=10)
     savefig('10b_shrinkage_mid_and_band')
     sample_cols = ['cusip', 'trade_date', 'side', 'recency_bucket', 'y_prior_mark', 'y_model', 'w_mark', 'y_blend', 'half_width_bp', 'bid_yield', 'offer_yield', 'msrb_yield']
-    print('Per-RFQ outputs (sample):'); display(apt.sample(min(8, len(apt)), random_state=CFG.seed)[sample_cols].round(4))
+    print('Per-RFQ outputs (sample; bid = dealer buys from customer, offer = dealer sells to customer):'); display(apt.sample(min(8, len(apt)), random_state=CFG.seed)[sample_cols].round(4))
     apt.to_parquet(ARTIFACTS / 'quote_components_v2.parquet', index=False)
     record('application', model_source=model_source, by_month=appf.round(4).reset_index().to_dict(orient='records'), overall=app_all.round(4).to_dict(orient='records'),
-           by_recency=app_rec.round(4).reset_index().to_dict(orient='records'), by_side=app_side.round(4).reset_index().to_dict(orient='records'), lambda_path=appf['lambda'].tolist())
+           by_recency=app_rec.round(4).reset_index().to_dict(orient='records'), by_side=app_side.round(4).reset_index().to_dict(orient='records'), lambda_path=appf['lambda*'].tolist(),
+           weight_curve_last=wlast.round(4).to_dict(orient='records'))
 else:
     print('Section 10b skipped: needs matched trades.')
 
@@ -1332,7 +1478,7 @@ summary_rows = [
     ('Factor-1 gross leverage', f"{REGISTRY['mimicking_weights'].get('factor1_gross', float('nan')):.2f}"),
     ('Residual ACF lag 1 / 5 (Pearson)', f"{acf.loc[1, 'pearson']:+.3f} / {acf.loc[min(5, L), 'pearson']:+.3f}"),
     ('Best forecaster', f"{best}: rank IC {fc_table.loc[best, 'ic_mean']:+.3f} (t {fc_table.loc[best, 'ic_t']:+.2f})"),
-    ('Paper portfolio hedged Sharpe', f"{paper.loc['ALL', 'hedged_sharpe']:.2f} (ALL); best bucket {paper['hedged_sharpe'].drop('ALL').idxmax()} {paper['hedged_sharpe'].drop('ALL').max():.2f}"),
+    ('Paper portfolio hedged Sharpe (ALL)', '; '.join(f"{k}: {v:.2f}" for k, v in paper['ALL'].items()) + (f"; walk-forward selected {sharpe(pnl_selected):.2f}" if len(pnl_selected) else '')),
 ]
 if HAS_TRADES and not tv.empty:
     tm = tx[(tx['target'] == 'e vs prior mark') & (tx['bucket'] == 'ALL')].iloc[0]; ta = tx[(tx['target'] == 'e vs algo quote')].iloc[0]; tn = tx[tx['target'].str.startswith('e vs prior mark, neutralised')].iloc[0]
@@ -1345,10 +1491,13 @@ if HAS_TRADES and not tv.empty:
     sp = spread_tx.iloc[0]
     summary_rows.append(('Spread reading: |trade - mark| on residual rank', f"FM {sp['fm_beta']:+.2f} bp/rank (t {sp['fm_t']:+.2f})"))
     summary_rows.append(('Evaluator revision toward trade, small vs large |residual|', f"{evt['share_revised_toward_trade'].iloc[0]:.0%} -> {evt['share_revised_toward_trade'].iloc[-1]:.0%}; pass-through {evt['median_pass_through'].iloc[0]:.2f} -> {evt['median_pass_through'].iloc[-1]:.2f}"))
+if HAS_TRADES and not tv.empty:
+    jm = jt[jt['target'] == 'e vs prior mark'].set_index('score')
+    summary_rows.append(('Joint FM on trade vs mark: one-day rank | trailing-mean rank', f"{jm.loc['pit_rank', 'fm_beta']:+.2f} (t {jm.loc['pit_rank', 'fm_t']:+.2f}) | {jm.loc['level_rank', 'fm_beta']:+.2f} (t {jm.loc['level_rank', 'fm_t']:+.2f})"))
 if 'application' in REGISTRY:
     a = REGISTRY['application']['overall'][0]
-    summary_rows.append(('Shrinkage mid vs mark (held out)', f"MAE mark {a['MAE mark']:.2f} | model {a['MAE model']:.2f} | blend {a['MAE blend']:.2f} bp; gain {a['blend gain vs mark (bp)']:+.2f} (t {a['gain t (FM)']:+.2f}); lambda path {REGISTRY['application']['lambda_path']}"))
-    summary_rows.append(('Residual band vs fixed band', f"coverage {a['coverage resid band']:.1%} at half-width {a['half-width resid (bp)']:.1f} bp vs {a['coverage fixed band']:.1%} at {a['fixed half-width (bp)']:.1f} bp"))
+    summary_rows.append(('Mid vs next print (held out)', f"MAE mark {a['MAE mark']:.2f} | model mid {a['MAE model']:.2f} | ivw blend {a['MAE blend ivw']:.2f} | lambda blend {a['MAE blend lambda']:.2f} bp; mean mark weight {a['mean w_mark']:.2f}; blend gain vs model {a['blend gain vs model (bp)']:+.2f} (t {a['gain t (FM)']:+.2f})"))
+    summary_rows.append(('Band around model mid: residual vs fixed', f"coverage {a['coverage resid band']:.1%} at half-width {a['half-width resid (bp)']:.1f} bp vs {a['coverage fixed']:.1%} at {a['fixed half-width (bp)']:.1f} bp"))
 summary = pd.DataFrame(summary_rows, columns=['item', 'result']).set_index('item')
 display(summary)
 print('Artifacts written to', ARTIFACTS)
