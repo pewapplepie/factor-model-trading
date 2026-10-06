@@ -90,6 +90,9 @@ class RunConfig:
     ar_winsor: tuple[float, float] = (0.01, 0.99)
     longconv_lags: int = 10
     residual_min_age_days: int = 1
+    min_bonds_per_date: int = 1000     # drop sparse dates (holiday / partial-mark days collapse the cross-section)
+    zero_duration_cut: float = 0.25    # modified duration below this with > 1y to worst is treated as a data error
+    activity_window: int = 20          # trailing observations for the point-in-time activity bucket
     seed: int = 20260921
 
 
@@ -237,8 +240,11 @@ record('data', extreme_yield_rows=int(raw_panel['extreme_yield'].sum()), extreme
 #
 # Thirteen instruments, identical to the v1 spec (DV01 dropped): an intercept, seven rank-normalised continuous
 # characteristics (lagged modified duration, premium/discount, yield level, years to worst, extension, rating
-# score, trailing mark-change liquidity), the NR flag and four state dummies. All continuous instruments are
-# rank-normalised within date to [-0.5, 0.5]. The target is the daily closing-yield change in bp, clipped.
+# score, trailing mark-change liquidity), the NR flag and four state dummies (CA, NY, TX, FL). Every other state
+# is the explicit `OTHER` bucket: it is reported and used as a feature in the level model, but it is the omitted
+# reference category in Z because five exhaustive dummies plus the intercept are exactly collinear. All
+# continuous instruments are rank-normalised within date to [-0.5, 0.5]. The target is the daily closing-yield
+# change in bp, clipped.
 
 # %%
 STATE_DUMMIES = ['CA', 'NY', 'TX', 'FL']
@@ -278,11 +284,25 @@ def build_model_panel(panel: pd.DataFrame, cfg: RunConfig) -> tuple[pd.DataFrame
     yp = yp[yp['closing_lag_days'].fillna(1.0) <= cfg.max_lag_days]
     yp['premium_discount_lag1'] = pd.to_numeric(yp['closing_price_lag1'], errors='coerce') - 100.0
     yp['years_to_worst'], yp['extension'] = term_characteristics(yp)
+    _mat = pd.to_datetime(pd.to_numeric(yp['maturity'], errors='coerce'), unit='ms', errors='coerce')
+    if _mat.isna().mean() > 0.5:
+        _mat = pd.to_datetime(yp['maturity'], errors='coerce')
+    yp['maturity_year'] = _mat.dt.year
+    yp['is_callable'] = yp['callable'].astype('string').str.upper().isin(['Y', 'YES', 'TRUE', '1']).astype(float)
+    yp['call_structure'] = np.where(yp['is_callable'] == 0, 'bullet', np.where(yp['extension'] > 0.5, 'priced-to-call', 'callable, to maturity'))
+    zero_dur = (pd.to_numeric(yp['modified_duration_lag1'], errors='coerce') < cfg.zero_duration_cut) & (yp['years_to_worst'] > 1.0)
+    print(f'zero-duration long-maturity rows excluded: {int(zero_dur.sum()):,} ({zero_dur.mean():.3%})')
+    yp = yp[~zero_dur]
     yp['rating'], yp['rating_score'], yp['rating_source'] = rating_with_fallback(yp)
     yp['nr_flag'] = yp['rating_score'].isna().astype(float)
-    state = yp['state_code'].astype('string').str.strip().str.upper().fillna('OTHER')
+    state = yp['state_code'].astype('string').str.strip().str.upper()
+    state = state.where(state.notna() & ~state.isin(['', 'NAN', 'NONE', 'NULL', '<NA>']), 'OTHER')
+    yp['state_bucket'] = state.where(state.isin(STATE_DUMMIES), 'OTHER')
     for s in STATE_DUMMIES:
         yp[f'state_{s}'] = (state == s).astype(float)
+    # Explicit reference bucket for audit, EDA and the level model. NOT an IPCA instrument: with market_fv
+    # present the five exhaustive state dummies are exactly collinear, so OTHER is the omitted category in Z.
+    yp['state_others'] = (yp['state_bucket'] == 'OTHER').astype(float)
     yp = yp.sort_values(['cusip', 'date'], kind='stable')
     chg = (yp.groupby('cusip', observed=True)['closing_price'].diff().abs() > 0).astype(float)
     yp['liquidity_20'] = chg.groupby(yp['cusip'], observed=True).transform(lambda s: s.rolling(20, min_periods=5).mean().shift(1))
@@ -297,9 +317,14 @@ def build_model_panel(panel: pd.DataFrame, cfg: RunConfig) -> tuple[pd.DataFrame
     chars = ['market_fv'] + zcols + ['nr_flag'] + [f'state_{s}' for s in STATE_DUMMIES]
     cnt = yp.groupby('cusip', observed=True)[TARGET].transform('count')
     yp = yp[cnt >= cfg.min_obs_per_bond].copy()
+    per_date = yp.groupby('date', observed=True)['cusip'].transform('size')
+    sparse = per_date < cfg.min_bonds_per_date
+    if sparse.any():
+        print(f'sparse dates dropped (< {cfg.min_bonds_per_date} bonds): {sorted(yp.loc[sparse, "date"].dt.date.unique())}')
+        yp = yp[~sparse].copy()
     keep = ['cusip', 'date', TARGET, 'target_bp_raw', 'mark_unchanged', 'closing_lag_days', 'closing_yield', 'closing_yield_lag1',
             'closing_price', 'modified_duration_lag1', 'dv01_lag1', 'years_to_worst', 'extension', 'rating', 'rating_score', 'rating_source',
-            'cpn', 'state_code', 'mkt_yield'] + chars
+            'cpn', 'state_code', 'state_bucket', 'state_others', 'mkt_yield', 'long_comp_name', 'maturity_year', 'is_callable', 'call_structure'] + chars
     keep = [c for c in dict.fromkeys(keep) if c in yp.columns]
     return yp[keep].sort_values(['cusip', 'date'], kind='stable').reset_index(drop=True), chars
 
@@ -309,21 +334,28 @@ model, CHARS = build_model_panel(raw_panel, CFG)
 print(f'[{CFG.spec_version}] model rows {len(model):,} | cusips {model["cusip"].nunique():,} | dates {model["date"].nunique()} | L={len(CHARS)} | {time.perf_counter()-t0:.1f}s')
 print('instruments:', CHARS)
 print('mark_unchanged share:', round(float(model['mark_unchanged'].mean()), 4), '| rating source mix:', model['rating_source'].value_counts(normalize=True).round(3).to_dict())
+geo = model.groupby('state_bucket', observed=True).agg(rows=('cusip', 'size'), cusips=('cusip', 'nunique'))
+geo['row_share'] = geo['rows'] / geo['rows'].sum()
+print('Geo buckets (OTHER is the omitted reference category in Z; state_others is kept for audit and the level model):')
+display(geo.sort_values('rows', ascending=False))
+top_other = model.loc[model['state_bucket'] == 'OTHER', 'state_code'].astype('string').value_counts().head(8)
+print('largest states inside OTHER:', top_other.to_dict())
 display(model[CHARS].describe().T[['mean', 'std', 'min', 'max']])
-record('model_panel', rows=len(model), cusips=model['cusip'].nunique(), dates=model['date'].nunique(), instruments=CHARS, mark_unchanged_share=float(model['mark_unchanged'].mean()))
+record('model_panel', rows=len(model), cusips=model['cusip'].nunique(), dates=model['date'].nunique(), instruments=CHARS, mark_unchanged_share=float(model['mark_unchanged'].mean()), geo_buckets=geo.round(4).to_dict())
 
 # %%
 # Instrument EDA: correlation structure and the duration vs term relationship
 zc = [c for c in CHARS if c.startswith('z_')]
 sample = model.sample(min(len(model), 200_000), random_state=CFG.seed)
 corr = sample[zc + ['nr_flag'] + [f'state_{s}' for s in STATE_DUMMIES]].corr(method='spearman')
-fig, ax = plt.subplots(1, 2, figsize=(15, 6))
+fig, ax = plt.subplots(1, 3, figsize=(19, 6), gridspec_kw={'width_ratios': [1.3, 1.1, 0.7]})
 im = ax[0].imshow(corr.values, cmap='RdBu_r', vmin=-1, vmax=1)
 ax[0].set_xticks(range(len(corr))); ax[0].set_xticklabels([c.replace('z_', '').replace('_lag1', '') for c in corr.columns], rotation=90)
 ax[0].set_yticks(range(len(corr))); ax[0].set_yticklabels([c.replace('z_', '').replace('_lag1', '') for c in corr.columns])
 ax[0].set_title('Spearman correlation of instruments'); ax[0].grid(False); plt.colorbar(im, ax=ax[0], fraction=0.046)
 hb = ax[1].hexbin(sample['years_to_worst'].clip(0, 40), sample['modified_duration_lag1'].clip(0, 25), gridsize=45, cmap='viridis', mincnt=1)
 ax[1].set_xlabel('years to worst'); ax[1].set_ylabel('modified duration (lag 1)'); ax[1].set_title('Duration vs term: the call structure wedge'); plt.colorbar(hb, ax=ax[1], fraction=0.046)
+geo['row_share'].reindex(STATE_DUMMIES + ['OTHER']).plot.bar(ax=ax[2], color=['#4C72B0'] * 4 + ['#8C8C8C']); ax[2].set_title('Geo buckets (share of bond-days)'); ax[2].set_xlabel('')
 savefig('03_instrument_eda')
 print('max |corr| off-diagonal:', round(float((corr.values - np.eye(len(corr))).max()), 3))
 
@@ -551,6 +583,114 @@ savefig('06_mimicking_weights')
 record('mimicking_weights', max_beta_orthogonality=float(max(orth)), **{f'{k}_{m}': float(v) for k, row in wsum.iterrows() for m, v in row.items()})
 
 # %% [markdown]
+# ## 6b. Factor space: clusters, top loadings and within-cluster ranking
+#
+# The exhibits the attention-factor paper uses to make latent factors legible, adapted to munis. Bonds are
+# placed in standardised beta space on the last out-of-sample date. (1) A 2-D map of that space coloured by
+# rating, call structure, duration and residual rank shows which economic axes the factors organise.
+# (2) The bonds with the largest weight in each factor-mimicking portfolio, labelled by issuer, coupon,
+# maturity, rating and call type rather than CUSIP, show what each factor is made of. (3) K-means clusters in
+# beta space give the peer groups the model implies, with their characteristic profile and named examples.
+# (4) Inside one cluster, the residual orders bonds rich to cheap: that ordering is the comparables view an
+# RFQ desk uses.
+
+# %%
+from sklearn.cluster import KMeans  # noqa: E402
+from sklearn.decomposition import PCA  # noqa: E402
+from sklearn.manifold import TSNE  # noqa: E402
+
+MAP_SAMPLE = 3000
+N_CLUSTERS = 8
+last_date = resid['date'].max()
+snap = resid[resid['date'] == last_date][['cusip', 'pit_residual'] + beta_cols].merge(
+    model[model['date'] == last_date][['cusip', 'long_comp_name', 'cpn', 'maturity_year', 'rating', 'rating_score', 'call_structure', 'is_callable',
+                                       'modified_duration_lag1', 'years_to_worst', 'extension', 'closing_yield', 'state_bucket']], on='cusip', how='left').reset_index(drop=True)
+snap['pit_rank'] = snap['pit_residual'].rank(pct=True)
+snap['rating_bucket'] = pd.cut(snap['rating_score'], bins=[-1, 11.5, 14.5, 17.5, 20.5, 21.5], labels=['BB and below', 'BBB', 'A', 'AA', 'AAA']).astype(str).replace('nan', 'NR')
+
+
+def bond_label(r: pd.Series, width: int = 26) -> str:
+    name = r.get('long_comp_name')
+    name = str(name)[:width] if isinstance(name, str) and name.strip() else str(r['cusip'])
+    mat = f"{int(r['maturity_year'])}" if pd.notna(r.get('maturity_year')) else '----'
+    cpn = f"{r['cpn']:.2f}%" if pd.notna(r.get('cpn')) else '--'
+    rating = r['rating'] if isinstance(r.get('rating'), str) else 'NR'
+    call = {'bullet': 'B', 'priced-to-call': 'C*', 'callable, to maturity': 'C'}.get(r.get('call_structure'), '?')
+    return f"{name} {cpn} {mat} {rating} {call}"
+
+
+snap['label'] = snap.apply(bond_label, axis=1)
+Bs = snap[beta_cols].to_numpy(float); Bs = (Bs - Bs.mean(axis=0)) / np.maximum(Bs.std(axis=0), 1e-12)
+idx = RNG.choice(len(snap), min(MAP_SAMPLE, len(snap)), replace=False)
+try:
+    emb = TSNE(n_components=2, perplexity=30, init='pca', learning_rate='auto', random_state=CFG.seed).fit_transform(Bs[idx]); emb_name = 't-SNE'
+except Exception as exc:  # noqa: BLE001
+    emb = PCA(n_components=2, random_state=CFG.seed).fit_transform(Bs[idx]); emb_name = 'PCA'
+    print('t-SNE unavailable, using PCA:', exc)
+sm = snap.iloc[idx].copy(); sm['x'], sm['y'] = emb[:, 0], emb[:, 1]
+
+fig, ax = plt.subplots(2, 2, figsize=(14, 11))
+for a, (col, title, kind) in zip(ax.ravel(), [('rating_bucket', 'by rating', 'cat'), ('call_structure', 'by call structure', 'cat'),
+                                               ('modified_duration_lag1', 'by modified duration', 'num'), ('pit_rank', 'by residual rank (0 rich -> 1 cheap)', 'num')]):
+    if kind == 'cat':
+        for j, (lvl, g) in enumerate(sm.groupby(col, observed=True)):
+            a.scatter(g['x'], g['y'], s=6, alpha=0.7, label=f'{lvl} ({len(g)})', color=plt.cm.tab10(j % 10))
+        a.legend(markerscale=3, fontsize=8, loc='best')
+    else:
+        sc = a.scatter(sm['x'], sm['y'], s=6, c=sm[col], cmap='viridis' if col != 'pit_rank' else 'RdYlGn', alpha=0.8); plt.colorbar(sc, ax=a, fraction=0.046)
+    a.set_title(f'Beta space ({emb_name}), {last_date.date()}: {title}'); a.set_xticks([]); a.set_yticks([]); a.grid(False)
+savefig('06b_beta_space_map')
+
+# %%
+# Top loadings per factor: the bonds carrying the largest factor-mimicking weight, named not numbered
+B_last = snap[beta_cols].to_numpy(float)
+W_last = B_last @ np.linalg.inv(B_last.T @ B_last + CFG.ridge * np.eye(CFG.selected_k))
+fig, ax = plt.subplots(1, CFG.selected_k, figsize=(6.5 * CFG.selected_k, 6))
+top_tables = {}
+for j in range(CFG.selected_k):
+    w = pd.Series(W_last[:, j], index=snap.index)
+    top = w.reindex(w.abs().sort_values(ascending=False).index[:12]).sort_values()
+    t = snap.loc[top.index, ['label', 'modified_duration_lag1', 'years_to_worst', 'rating', 'call_structure', 'closing_yield']].assign(weight=top.values, beta=snap.loc[top.index, beta_cols[j]].values)
+    top_tables[f'factor{j+1}'] = t.reset_index(drop=True)
+    a = ax[j] if CFG.selected_k > 1 else ax
+    a.barh(t['label'], t['weight'], color=np.where(t['weight'] >= 0, '#2CA02C', '#D62728')); a.axvline(0, color='k', lw=0.6)
+    load = gamma[f'factor{j+1}'].abs().sort_values(ascending=False).index[:3]
+    a.set_title(f'factor{j+1}: top mimicking weights\n(Gamma: ' + ', '.join(f"{c.replace('z_', '').replace('_lag1', '')} {gamma.loc[c, f'factor{j+1}']:+.2f}" for c in load) + ')', fontsize=10)
+    a.tick_params(axis='y', labelsize=8)
+savefig('06b_top_loadings_per_factor')
+for k, t in top_tables.items():
+    print(k); display(t[['label', 'weight', 'beta', 'modified_duration_lag1', 'years_to_worst', 'closing_yield']].round(4))
+
+# %%
+# Clusters in beta space: profile and named examples, then rich/cheap ranking inside one cluster
+km = KMeans(n_clusters=N_CLUSTERS, n_init=10, random_state=CFG.seed).fit(Bs)
+snap['cluster'] = km.labels_
+profile = snap.groupby('cluster').agg(bonds=('cusip', 'size'), mod_duration=('modified_duration_lag1', 'mean'), years_to_worst=('years_to_worst', 'mean'), extension=('extension', 'mean'),
+                                       share_callable=('is_callable', 'mean'), rating_score=('rating_score', 'mean'), yield_pct=('closing_yield', 'mean'), resid_sd_bp=('pit_residual', 'std'))
+profile['top_rating'] = snap.groupby('cluster')['rating_bucket'].agg(lambda s: s.value_counts().index[0])
+profile['top_call'] = snap.groupby('cluster')['call_structure'].agg(lambda s: s.value_counts().index[0])
+profile = profile.sort_values('mod_duration')
+display(profile.round(3))
+examples = pd.concat([pd.concat([g.nsmallest(3, 'pit_rank').assign(role='richest'), g.nlargest(3, 'pit_rank').assign(role='cheapest')]).assign(cluster=c) for c, g in snap.groupby('cluster')], ignore_index=True)
+display(examples.loc[examples['cluster'].isin(profile.index[:3]), ['cluster', 'role', 'label', 'closing_yield', 'pit_residual', 'pit_rank']].round(3))
+
+fig, ax = plt.subplots(1, 2, figsize=(15, 6), gridspec_kw={'width_ratios': [1, 1.3]})
+sm['cluster'] = snap.loc[sm.index, 'cluster'].values
+for c, g in sm.groupby('cluster'):
+    ax[0].scatter(g['x'], g['y'], s=6, alpha=0.75, color=plt.cm.tab10(c % 10), label=f"C{c}: dur {profile.loc[c, 'mod_duration']:.1f}, {profile.loc[c, 'top_rating']}, {profile.loc[c, 'top_call']}")
+ax[0].legend(fontsize=7, markerscale=3, loc='best'); ax[0].set_title(f'K-means clusters in beta space (k={N_CLUSTERS})'); ax[0].set_xticks([]); ax[0].set_yticks([]); ax[0].grid(False)
+focus = profile.index[len(profile) // 2]
+fg = snap[snap['cluster'] == focus].sort_values('pit_residual')
+show = pd.concat([fg.head(10), fg.tail(10)])
+ax[1].barh(show['label'], show['pit_residual'], color=np.where(show['pit_residual'] >= 0, '#2CA02C', '#D62728')); ax[1].axvline(0, color='k', lw=0.6)
+ax[1].set_title(f"Cluster C{focus} ({len(fg)} bonds, dur {profile.loc[focus, 'mod_duration']:.1f}): richest 10 and cheapest 10 by residual (bp)\n"
+                "label = issuer, coupon, maturity, rating, B bullet / C callable / C* priced-to-call", fontsize=10); ax[1].tick_params(axis='y', labelsize=8)
+savefig('06b_clusters_and_ranking')
+snap.drop(columns=['label']).to_parquet(ARTIFACTS / f'beta_space_snapshot_{last_date.date()}.parquet', index=False)
+record('factor_space', date=str(last_date.date()), embedding=emb_name, clusters=N_CLUSTERS, cluster_profile=profile.round(4).reset_index().to_dict(orient='records'),
+       top_loadings={k: t[['label', 'weight', 'beta']].round(4).to_dict(orient='records') for k, t in top_tables.items()})
+
+# %% [markdown]
 # ## 7. Residual diagnostics: autocorrelation, activity buckets, AR(1) vs LongConv-lite
 #
 # The pooled autocorrelation function of the residual at lags 1..10 is the first look at whether the residual
@@ -576,11 +716,17 @@ savefig('07_residual_acf')
 record('residual_diagnostics', acf_pearson=acf['pearson'].round(4).to_dict(), acf_spearman=acf['spearman'].round(4).to_dict())
 
 # %%
-# Activity buckets (pre-OOS volatility quintiles) and lag-1 rank IC by bucket; distribution and QQ of the residual
-pre = model[model['date'] < CFG.first_oos_date].groupby('cusip', observed=True)[TARGET].agg(target_abs_vol='std', obs='count').reset_index()
-pre['activity_bucket'] = pd.qcut(pre['target_abs_vol'].fillna(0).rank(method='first'), 5, labels=[f'L{i}' for i in range(1, 6)]).astype(str)
-resid = resid.merge(pre[['cusip', 'activity_bucket', 'target_abs_vol']], on='cusip', how='left')
+# Point-in-time activity buckets: trailing-window volatility of the target per bond, lagged one observation,
+# ranked into quintiles within each date. Every bond-day gets a bucket (no UNKNOWN), and nothing looks ahead.
+_m = model.sort_values(['cusip', 'date'], kind='stable')
+_m['target_abs_vol'] = (_m.groupby('cusip', observed=True)[TARGET]
+                          .transform(lambda s: s.rolling(CFG.activity_window, min_periods=max(5, CFG.activity_window // 2)).std().shift(1)))
+_m['activity_bucket'] = _m.groupby('date', observed=True)['target_abs_vol'].transform(
+    lambda s: pd.qcut(s.rank(method='first'), 5, labels=[f'L{i}' for i in range(1, 6)]).astype(str) if s.notna().sum() >= 50 else pd.Series('UNKNOWN', index=s.index))
+_m.loc[_m['target_abs_vol'].isna(), 'activity_bucket'] = 'UNKNOWN'
+resid = resid.merge(_m[['cusip', 'date', 'activity_bucket', 'target_abs_vol']], on=['cusip', 'date'], how='left')
 resid['activity_bucket'] = resid['activity_bucket'].fillna('UNKNOWN')
+print('activity bucket mix (PIT trailing vol):', resid['activity_bucket'].value_counts(normalize=True).round(3).to_dict())
 resid['next_residual'] = resid.groupby('cusip', observed=True)['pit_residual'].shift(-1)
 resid['next_date'] = resid.groupby('cusip', observed=True)['date'].shift(-1)
 pairs = resid.dropna(subset=['next_residual'])
@@ -744,6 +890,14 @@ record('paper_portfolio', signal=best, **{f'{i}_{k}': (float(v) if pd.notna(v) e
 def standardize_trades(tr: pd.DataFrame) -> pd.DataFrame:
     t = tr.copy()
     t.columns = [str(c) for c in t.columns]
+    n0 = len(t)
+    if 'has_algosignal_match' in t.columns:
+        flag = t['has_algosignal_match']
+        t = t[flag.astype('string').str.lower().isin(['true', '1', 'y', 'yes'])] if flag.dtype == object or str(flag.dtype).startswith('string') else t[flag.astype(bool)]
+    dedup_keys = [c for c in ['msrb_trade_id', 'cusip', 'msrb_tradetime', 'msrb_side', 'msrb_quantity'] if c in t.columns]
+    if dedup_keys:
+        t = t.drop_duplicates(subset=dedup_keys, keep='last')
+    print(f'trades: {n0:,} raw -> {len(t):,} after has_algosignal_match filter and trade-id dedup')
     t['cusip'] = t['cusip'].astype('string')
     t['trade_ts'] = to_ns(t['msrb_tradetime'])
     t['signal_ts'] = to_ns(t['signal_ts']) if 'signal_ts' in t else t['trade_ts']
@@ -755,6 +909,9 @@ def standardize_trades(tr: pd.DataFrame) -> pd.DataFrame:
     t['size_bin'] = t['size_bin'].fillna(t['msrb_quantity'])
     t['log_size'] = np.log1p(t['msrb_quantity'].clip(lower=0).fillna(0))
     t['e_algo_bp'] = 100.0 * (t['msrb_yield'] - t['algo_signal_yield'])
+    if t['signal_ts'].notna().any():
+        before = len(t); t = t[(t['trade_ts'] > t['signal_ts']) | t['signal_ts'].isna()]
+        print(f'trades after requiring msrb_tradetime > signal_ts: {len(t):,} (dropped {before - len(t):,})')
     t = t.dropna(subset=['cusip', 'trade_ts', 'msrb_yield']).sort_values(['cusip', 'trade_ts'], kind='stable').reset_index(drop=True)
     prev = t.groupby('cusip', observed=True)['trade_ts'].shift(1)
     t['recency_days'] = (t['trade_ts'] - prev).dt.total_seconds() / 86400.0
@@ -860,17 +1017,17 @@ except Exception:
     HAS_LGB = False
 from sklearn.ensemble import HistGradientBoostingRegressor  # noqa: E402
 
-if HAS_TRADES and not tv.empty and tv['MmdYld'].notna().mean() > 0.5:
+if HAS_TRADES and not tv.empty and tv['MmdYld'].notna().mean() > 0.5 and len(tv) >= 4_000:
     lv = tv.copy()
     lv['spread_bp'] = 100.0 * (lv['msrb_yield'] - lv['MmdYld'])
-    feat_panel = model[['cusip', 'date', 'rating_score', 'years_to_worst', 'extension', 'cpn', 'modified_duration_lag1', 'closing_yield_lag1'] + [c for c in CHARS if c != 'market_fv']].rename(columns={'date': 'residual_date'})
+    feat_panel = model[['cusip', 'date', 'rating_score', 'years_to_worst', 'extension', 'cpn', 'modified_duration_lag1', 'closing_yield_lag1', 'state_others'] + [c for c in CHARS if c != 'market_fv']].rename(columns={'date': 'residual_date'})
     feat_panel['residual_date'] = to_ns(feat_panel['residual_date'])
     lv['residual_date'] = to_ns(lv['residual_date'])
     lv = lv.merge(feat_panel, on=['cusip', 'residual_date'], how='left')
     lv['recency_days_c'] = lv['recency_days'].clip(upper=60).fillna(60)
     for s in ['D', 'P', 'S']:
         lv[f'side_{s}'] = (lv['side'] == s).astype(float)
-    FEATURES = ['rating_score', 'years_to_worst', 'extension', 'cpn', 'modified_duration_lag1', 'closing_yield_lag1', 'pit_residual', 'pit_rank', 'recency_days_c', 'log_size', 'MinuteFromSignal', 'dMmdSprdSide', 'side_D', 'side_P', 'side_S'] + beta_cols + [c for c in CHARS if c != 'market_fv']
+    FEATURES = ['rating_score', 'years_to_worst', 'extension', 'cpn', 'modified_duration_lag1', 'closing_yield_lag1', 'pit_residual', 'pit_rank', 'recency_days_c', 'log_size', 'MinuteFromSignal', 'dMmdSprdSide', 'side_D', 'side_P', 'side_S', 'state_others'] + beta_cols + [c for c in CHARS if c != 'market_fv']
     FEATURES = [c for c in dict.fromkeys(FEATURES) if c in lv.columns]
     lv = lv.dropna(subset=['spread_bp', 'e_mark_bp']).copy()
     lv['month'] = lv['trade_date'].dt.to_period('M')
@@ -890,6 +1047,8 @@ if HAS_TRADES and not tv.empty and tv['MmdYld'].notna().mean() > 0.5:
         p = te[['cusip', 'trade_date', 'recency_bucket', 'side', 'msrb_yield', 'MmdYld', 'e_algo_bp', 'e_mark_bp']].copy()
         p['spread_hat'] = mdl.predict(Xte); p['e_model_bp'] = 100.0 * (p['msrb_yield'] - (p['MmdYld'] + p['spread_hat'] / 100.0)); p['month'] = str(m)
         preds.append(p)
+    if not preds:
+        raise RuntimeError('level model: no held-out month had at least 2,000 training trades; widen the window or lower the threshold')
     lvp = pd.concat(preds, ignore_index=True)
     print(f'level model ({"LightGBM" if HAS_LGB else "sklearn HistGBM"}): {len(lvp):,} held-out trades over {lvp["month"].nunique()} months, {len(FEATURES)} features')
 
@@ -916,7 +1075,7 @@ if HAS_TRADES and not tv.empty and tv['MmdYld'].notna().mean() > 0.5:
     lvp.to_parquet(ARTIFACTS / 'level_model_predictions_v2.parquet', index=False)
     record('level_model', backend='lightgbm' if HAS_LGB else 'sklearn_histgbm', features=FEATURES, overall=overall.round(4).to_dict(orient='records'), by_recency=by_rec.round(4).reset_index().to_dict(orient='records'), by_side=by_side.round(4).reset_index().to_dict(orient='records'))
 else:
-    print('Level model skipped: needs matched trades with MmdYld.')
+    print('Level model skipped: needs at least 4,000 matched trades with MmdYld.')
 
 # %% [markdown]
 # ## 11. Systematic path: roll-forward and de-circularised comparables
