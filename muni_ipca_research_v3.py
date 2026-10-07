@@ -1,75 +1,61 @@
 # %% [markdown]
-# # Muni IPCA v3 — Factor Model of Record, State-Space Residual Signal, Algo Error Correction
+# # Muni IPCA v4 — From Fair Mid to Markout: the Factor Model as Risk Layer, the Quote Judged in Dollars
 #
-# Clean rebuild after the v5 review. The validated spine is kept (point-in-time IPCA on 13 instruments, aligned
-# Gamma versions, factor-mimicking weights, beta-space exhibits, the state-space description of the residual),
-# the closed experiments are dropped (AR(1) and ARMA signals, mark shrinkage, residual-driven width, quote skew
-# sizing, peer RV as a signal, factor hedging of flow, K sensitivity), and four new blocks carry the programme
-# forward:
+# v4.0 moves the programme past the fair-mid question. Six versions of mid work moved the quote by 1.35 bp on a
+# 13 bp error against the print, and the v51 run closed the last fair-mid idea (the interaction ladder: the
+# persistence of the algo's error does not depend on the factor state). A market maker is not paid for a good mid.
+# It is paid for expected P&L per quote: fill probability times edge, net of adverse selection and inventory cost.
+# This version keeps the factor spine as the risk and marking layer, trims the fair-mid exhibits to what feeds the
+# quote, and judges every quote rule in the currency the desk uses.
 #
-# 1. **Two data rules** that the v5 run showed were missing: a *dispersion-day* rule (evaluator-wide reprices are
-#    days where many bonds move a lot *relative to the day's median move*, not days where the whole curve moves)
-#    and a *partial-mark-day* rule (dates with far fewer bonds than usual are dropped, not just dates under a fixed floor).
-# 2. **Refit cadence and regime-conditional Gamma**: the Gamma swap test said a Gamma frozen two months earlier
-#    beat the weekly refit out of sample. Weekly, monthly, quarterly, frozen and a dispersion-regime-conditional
-#    Gamma are run side by side and the residuals of record come from the pre-registered cadence.
-# 3. **The pooled state-space filter as the residual signal of record**: AR drift plus mark-noise MA, with the
-#    filtered drift as the signal and the filtered mark noise as the mark-quality score (the by-bucket filter was
-#    closed in v31 and the LongConv ridge in v41).
-# 4. **Algo error correction**: the v5 print-to-print panel found the algo's own pricing error persists 58% from
-#    one print to the next. The algo quote is MMD yield + side-specific MMD spread + a last-value adjustment, so
-#    that persistence says the existing adjustment is under-sized. It is turned into point-in-time features (last
-#    matched print's algo error, its age, an exponentially weighted history **on the same side of the market**),
-#    a diagnostic of the algo's own last-value term, the same-side memory (the deployable rule, v41), a per-side
-#    state-space memory as its generalisation, the side-pooled EWMA as the reference, and a level model with and
-#    without the error features. The band around the chosen mid is calibrated by conformal scaling, split by
-#    month and rolling over the last ten trading days, with a lagged market-dispersion feature.
-# 5. **Where the gains live**: every result is cut by the model's own axes (duration, call structure, rating,
-#    state, liquidity, factor-beta terciles, point-in-time beta-space clusters). The aim is not to improve the
-#    whole universe but to find the characteristic cells and factor exposures where the improvement concentrates,
-#    and to ask whether the algo's error loads on the factor betas at all.
+# 1. **Markout framework (Section 11).** For every matched print we know our quote, the print, the side and the
+#    size. A print that crossed our quote is a fill we would have won; marking that fill to the evaluation one,
+#    five and ten business days later gives its P&L, split into the edge at the quote and the mark move after the
+#    trade. Shifting the quote by a concession traces the fill curve and the expected P&L per quote, which is a
+#    one-dimensional version of the optimizer. Every mid from v3 is re-ranked under it, plus the trials v3.6
+#    closed on MAE (side intercept, revised third term, factor-beta correction, age-conditioned last error) and two
+#    new rules built from the v51 finding that the algo does not price size (a side x size intercept on the algo
+#    quote and on the same-side memory).
+# 2. **Quantile grid (Section 12).** The deliverable to the optimizer is a conditional distribution, not a number:
+#    quantiles of the oriented error by side x size x beta-space cluster, shrunk toward the side x size marginal,
+#    estimated on prior months. It encodes the fill curve (one minus the CDF) and the bias (the median) in one object.
+# 3. **Risk model snapshot (Section 8).** Betas, factor covariance, idiosyncratic and mark-noise variance per bond,
+#    exported as the inventory risk input. The factor spine (IPCA, walk-forward residuals, state-space filter) is
+#    unchanged and still cached.
+#
+# Everything is point in time and the leakage boundaries are the v3 ones. The markout uses evaluations after the
+# trade deliberately: it is an evaluation metric, not a feature. Its two caveats are stated where it is built:
+# the fill proxy is optimistic (every print that crossed our quote counts as a fill, with the winner's curse that
+# implies), and marks are evaluations, not executable prices. Both apply equally to every candidate, so the
+# ranking is what to read, not the level.
 #
 # **Inputs** (from `data_pipeline/muni_data_pipeline.py`, under `./data_pipeline/`): `research_panel_step3_yield.parquet`,
-# `data/closing_marks/*.parquet`, `data/algosignal_msrb/*.parquet`. **Outputs** go to `./artifacts_v3/`.
+# `data/closing_marks/*.parquet`, `data/algosignal_msrb/*.parquet`, `data/msrb/*.parquet`, `data/track_static/*.parquet`.
+# **Outputs** go to `./artifacts_v3/`; the stage cache under `artifacts_v3/cache/` is reused across runs.
 #
 # **Sections**
 # 1. Setup and configuration (with the pre-registered choices)
-# 2. Data load and QA; the two data rules
-# 3. Model panel: 13 instruments, rank-normalised per date
+# 2. Data load and QA; the two data rules; trade size and industry characteristics
+# 3. Model panel: instruments, rank-normalised per date
 # 4. IPCA: date-weighted ALS, K sweep, Gamma anatomy
-# 5. Walk-forward residuals: refit cadence study, regime-conditional Gamma, residuals of record
+# 5. Walk-forward residuals: refit cadence, residuals of record
 # 6. Factor-mimicking weights, leverage, beta-space map and clusters
-# 7. Residual dynamics: ACF, activity buckets, the state-space filter (signal of record), two-regime check
-# 8. Hedged paper portfolio (vol-scaled) as the information metric
-# 9. Transaction validation of the signal of record (Fama-MacBeth with block bootstrap); 9b trade size and side
-# 10. Algo error correction: the same-side memory, the interaction ladder (rho conditioned on factor state, cluster, residual drift, age, size, industry) with its pre-registered bar, the direction-aware view, the level model
-# 11. Conformal band around the chosen mid: split (monthly) and rolling (10-day) calibration
-# 12. Where the gains live: breakdown by characteristics, factor betas and beta-space clusters; 12b what they are worth in dollars
-# 13. Systematic path: factor roll-forward of stale marks, by segment
-# 14. Results registry and summary
-# 15. Robustness: dispersion-day exclusions, bootstrap inference, pre-registered choices
+# 7. Residual dynamics and the state-space filter (the mark-noise score)
+# 8. Risk model snapshot: betas, factor covariance, idiosyncratic and mark-noise variance per bond
+# 9. Transaction join (PIT-safe) and mark quality; 9b trade size and side; 9c where prints sit relative to our quote and to the evaluation
+# 10. Quote rules: the same-side memory, the interaction ladder, the re-opened legacy trials, the side x size intercepts, the level model; the direction-aware view
+# 11. Markout: would-have-filled P&L, edge and adverse selection, fill and P&L curves, the re-ranking in dollars, the cell-optimal concession
+# 12. Quantile grid: the conditional distribution of the oriented error for the optimizer, with its calibration
+# 13. Where the gains live: the MAE breakdowns kept for reference (side, size, duration, industry) and the side heatmaps
+# 14. Systematic path: factor roll-forward of stale marks
+# 15. Results registry and summary
+# 16. Robustness
 #
-# **v3.8 housekeeping.** The closed mids are gone (single-print rule, side intercepts, universe and local factor
-# loadings, universe-offset state-space memory, cluster pooling, within-cluster relative value, LongConv ridge,
-# by-bucket filter); their numbers live in the paper's closed-experiments appendix. The expensive stages
-# (walk-forward IPCA, the pooled state-space fit, the standardised print history with its memories, the per-side
-# state-space memory, the level models, the band models) run through `cached(...)`: each result is stored under
-# `artifacts_v3/cache/` with a key hashed from the configuration, the data fingerprints and the source code of
-# the stage, so a re-run with the same inputs and code reuses it automatically and any change to either recomputes it.
-# Nothing is toggled by hand; stale cache files for a stage are removed when a new key is written.
-#
-# **v3.9 additions.** Two characteristics the desk works with and the model had overlooked: *trade size* (decayed
-# mean of MSRB print size and print frequency, strictly before the date, with a no-print flag) and *issuer industry*
-# (from the trade-track static table; dummies for the largest industries). Both enter the IPCA instrument set, the
-# EDA (Section 9b: size x side, with the desk's quantity bins) and the Section 12 breakdowns. The algo correction
-# gets an *interaction ladder*: the same-side memory with its persistence coefficient conditioned on the factor
-# betas, the beta-space cluster, the filtered residual drift, the same-side age, the trade size, side x cluster and
-# industry, judged against a pre-registered bar (>= 0.10 bp over S, bootstrap t > 3, positive in 4 of 5 months), and a
-# *direction-aware* view (signed decomposition, crossing rate by side, pinball loss) beside the absolute gains.
-#
-# Every leakage boundary is explicit: Gamma is refit on past dates only, instruments are lagged and rank-normalised
-# within date, every trade is matched to a residual dated strictly before the trade date, every print-derived
-# feature is cut at the algo signal time, and every calibration uses the month before the test month.
+# **Dropped in v4.0** (fair-mid exhibits that no longer feed the quote): the hedged paper portfolio, the conformal
+# band (replaced by the quantile grid), the achievement map, the MAE-dollar view (replaced by markout dollars), the
+# per-side top-cell charts and the within-cluster signal Sharpe. Their last results are in the v3.8 paper. The
+# stage cache is unchanged: walk-forward IPCA, the pooled state-space fit, the standardised print history, the level
+# models and the per-side state-space memory are reused when their inputs and code are unchanged.
 
 # %%
 from __future__ import annotations
@@ -170,6 +156,13 @@ class RunConfig:
     industry_dummies: int = 5                # largest issuer industries as IPCA dummies; OTHER and UNKNOWN omitted
     interaction_bar_bp: float = 0.10         # a variant replaces S only if it adds this over S with bootstrap t > 3 and gains in >= 4 of 5 months
     asym_tau: float = 0.65                   # weight on the aggressive side of the error in the asymmetric loss (P and S; D symmetric)
+    # v4.0 markout and quantile grid
+    markout_horizons: tuple[int, ...] = (0, 1, 5, 10)   # business days after the trade at which a would-be fill is marked (0 = the trade date's close)
+    markout_record_h: int = 5                            # the marking horizon of record for the re-ranking and the concession choice
+    concession_grid_bp: tuple[float, float, float] = (-10.0, 15.0, 1.0)   # concession grid (start, stop, step) in bp of yield; negative = more aggressive than the mid
+    cell_min_trades: int = 500                           # a side x size cell intercept / concession needs this many training trades, else the side value
+    grid_taus: tuple[float, ...] = (0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95)
+    grid_shrink_k: float = 500.0                         # a cell's quantiles shrink toward the side x size marginal with weight n / (n + k)
     seed: int = 20260921
 
 
@@ -193,6 +186,11 @@ PRE_REGISTERED = {
     'v39_qty_bins': 'desk bins: 0-5K, 5K-10K, 10K-15K, 15K-25K, 25K-50K, 50K-100K, 100K-250K, >250K',
     'v39_interaction_ladder': 'rho of the same-side EWMA conditioned on factor betas, beta-space cluster, |filtered residual drift|, same-side age, trade size, side x cluster, industry; all on prior months',
     'v39_bar': 'a variant replaces S only if gain - gain(S) >= 0.10 bp, bootstrap t of the daily difference > 3, and the difference is positive in >= 4 of 5 held-out months',
+    'v40_markout': 'would-have-filled P&L: a print that crossed the quote is a fill at the quote, marked to the closing evaluation h business days later; P&L = s x (print - mark_h) - oriented distance + concession; record h = 5',
+    'v40_fill_proxy': 'fill iff the oriented distance print - quote (P) or quote - print (S) >= the concession; inter-dealer prints excluded from P&L; optimistic by construction (winner\'s curse)',
+    'v40_rerank_bar': 'a rule replaces S only if its dollars per month at h = 5 exceed S with bootstrap t of the daily difference > 3 and a positive difference in >= 4 of 5 months',
+    'v40_size_intercept': 'side x quantity-bin FM mean of the error on prior months, shrunk to the side mean with weight n / (n + 500); AQ on the algo quote, SQ on the error the same-side memory leaves',
+    'v40_quantile_grid': 'quantiles 5..95 of the oriented error of S by side x quantity bin x beta-space cluster, shrunk to the side x size marginal with weight n / (n + 500), on prior held-out months',
     'v39_direction': 'signed decomposition (toward / crossed by less / crossed by more / away), crossing rate by side, asymmetric pinball loss with tau 0.65 on the aggressive side',
 }
 
@@ -1499,91 +1497,40 @@ savefig('07_two_regime')
 record('residual_diagnostics', two_regime=two_regime.reset_index().astype({'res_bin': str}).round(4).to_dict(orient='records'))
 
 # %% [markdown]
-# ## 8. Paper portfolio: is the residual path harvestable?
+# ## 8. Risk model snapshot: what the inventory charge needs
 #
-# Every forecaster from Section 7 is run as a signal. Forecasts are divided by the bond's trailing vol, cross-sectionally
-# demeaned, scaled to unit gross, and projected off the beta span with the day's $B_t$, so each portfolio has zero
-# factor exposure. A walk-forward selector trades, each month, the signal with the best
-# hedged Sharpe over the prior months, so the headline is not an in-sample pick.
-# P&L is realised on the next day's yield change (bp of yield captured per unit gross). Sharpe is annualised with
-# $\sqrt{252}$. This is the number a stat-arb paper would report; a market maker reads it as "how much skew
-# information is in the residual" rather than as a tradable strategy.
+# The factor model's job in the quote engine is the risk and marking layer, not the alpha. This block packages
+# what an inventory risk charge needs, per bond, on the last residual date: the three point-in-time factor betas,
+# the factor covariance (sample covariance of the realised factors from the full-sample fit, bp$^2$ per day, so an
+# in-sample estimate), the idiosyncratic variance (trailing variance of the residual of record) and the mark-noise
+# scale from the state-space filter. The systematic share of a bond's daily variance is $\beta' \Sigma_f \beta$ over
+# the total; the table shows it by beta-space cluster. The snapshot is written to `artifacts_v3/` for the optimizer.
 
 # %%
-nxt = resid[['cusip', 'date', 'target_bp']].rename(columns={'date': 'next_date', 'target_bp': 'next_target_bp'})
-
-
-def prep_portfolio_frame(pred: pd.DataFrame) -> pd.DataFrame:
-    pp = pred.merge(resid[['cusip', 'date', 'target_abs_vol'] + beta_cols], on=['cusip', 'date'], how='left')
-    return pp.merge(nxt, on=['cusip', 'next_date'], how='left').dropna(subset=['next_target_bp'] + beta_cols)
-
-
-def portfolio_pnl(frame: pd.DataFrame, hedge: bool = True, signal_col: str = 'yhat', scaling: str | None = None) -> pd.Series:
-    """scaling: 'raw' uses the forecast in bp as the weight (concentrates gross in volatile names and takes cross-bucket
-    bets); 'vol' divides by the bond's trailing vol (a z-score); 'rank' uses the within-date rank. Default from config."""
-    scaling = CFG.portfolio_scaling if scaling is None else scaling
-    out = {}
-    for d, g in frame.groupby('date', observed=True):
-        if len(g) < 50:
-            continue
-        s_ = g[signal_col].to_numpy(float)
-        if scaling == 'vol':
-            v = g['target_abs_vol'].to_numpy(float); v = np.where(np.isfinite(v), v, np.nanmedian(v) if np.isfinite(v).any() else 1.0); s_ = s_ / np.maximum(v, 0.5)
-        elif scaling == 'rank':
-            s_ = pd.Series(s_).rank(pct=True).to_numpy() - 0.5
-        w = s_ - s_.mean()
-        if hedge:
-            B = g[beta_cols].to_numpy(float); w = w - B @ np.linalg.solve(B.T @ B + 1e-8 * np.eye(B.shape[1]), B.T @ w)
-        gross = np.abs(w).sum()
-        if gross <= 0:
-            continue
-        out[d] = float((w / gross) @ g['next_target_bp'].to_numpy(float))
-    return pd.Series(out).sort_index()
-
-
-def sharpe(x: pd.Series) -> float:
-    return float(np.sqrt(252) * x.mean() / x.std()) if len(x) > 2 and x.std() > 0 else np.nan
-
-
-# Candidate signals: every forecaster from Section 7 (the trailing mean and the pooled state-space filter)
-signals = {k: prep_portfolio_frame(v) for k, v in fc_preds.items() if not v.empty}
-
-pnl_by_signal = {k: portfolio_pnl(v) for k, v in signals.items()}
-universes = ['ALL'] + sorted(b for b in resid['activity_bucket'].unique() if b != 'UNKNOWN')
-rows = []
-for k, v in signals.items():
-    row = {'forecaster': k, 'ALL': sharpe(pnl_by_signal[k]), 'ALL unhedged': sharpe(portfolio_pnl(v, hedge=False)), 'mean bp/day': pnl_by_signal[k].mean(), 'days': len(pnl_by_signal[k]),
-           'ALL ex-UNKNOWN': sharpe(portfolio_pnl(v[v['activity_bucket'] != 'UNKNOWN'])), 'ALL raw-scaled': sharpe(portfolio_pnl(v, scaling='raw')), 'ALL rank-scaled': sharpe(portfolio_pnl(v, scaling='rank'))}
-    for b in universes[1:]:
-        row[b] = sharpe(portfolio_pnl(v[v['activity_bucket'] == b]))
-    rows.append(row)
-paper = pd.DataFrame(rows).set_index('forecaster')
-print(f'Hedged Sharpe by forecaster and universe (weights {CFG.portfolio_scaling}-scaled; raw and rank scalings and the ex-UNKNOWN universe shown for the ALL column):'); display(paper.round(2))
-
-# Walk-forward selection: each month, trade the forecaster with the best hedged Sharpe over the prior months.
-pnl_df = pd.DataFrame(pnl_by_signal).dropna(how='all')
-pnl_df['month'] = pnl_df.index.to_period('M')
-sel_parts, choices = [], {}
-for m in sorted(pnl_df['month'].unique())[1:]:
-    prior = pnl_df[pnl_df['month'] < m].drop(columns='month')
-    if len(prior) < 15:
-        continue
-    pick = prior.apply(sharpe).idxmax(); choices[str(m)] = pick
-    sel_parts.append(pnl_df.loc[pnl_df['month'] == m, pick].rename('selected'))
-pnl_selected = pd.concat(sel_parts) if sel_parts else pd.Series(dtype=float)
-print('walk-forward selection by prior-month Sharpe:', choices)
-print(f'selected-signal hedged Sharpe: {sharpe(pnl_selected):.2f} over {len(pnl_selected)} days')
-
-fig, ax = plt.subplots(1, 2, figsize=(15, 4.5))
-for k, v in pnl_by_signal.items():
-    v.cumsum().plot(ax=ax[0], label=f'{k} ({sharpe(v):.2f})', lw=1.2)
-if len(pnl_selected):
-    pnl_selected.cumsum().plot(ax=ax[0], color='k', lw=2, label=f'walk-forward selected ({sharpe(pnl_selected):.2f})')
-ax[0].legend(fontsize=7); ax[0].axhline(0, color='k', lw=0.6); ax[0].set_title('Hedged paper portfolio: cumulative bp captured per unit gross, by signal')
-paper[universes[1:]].T.plot.bar(ax=ax[1]); ax[1].axhline(0, color='k', lw=0.6); ax[1].set_title('Hedged Sharpe by activity bucket and signal'); ax[1].legend(fontsize=7); ax[1].set_xlabel('')
-savefig('08_paper_portfolio')
-best_portfolio = paper['ALL'].idxmax()
-record('paper_portfolio', table=paper.round(4).reset_index().to_dict(orient='records'), walk_forward_choices=choices, selected_sharpe=float(sharpe(pnl_selected)) if len(pnl_selected) else None, best_by_all=best_portfolio)
+last_date = resid['date'].max()
+_rs = resid.sort_values(['cusip', 'date'], kind='stable')
+_rs = _rs.reset_index(drop=True)
+_rs['idio_var_bp2'] = _rs.groupby('cusip', observed=True)['pit_residual'].rolling(CFG.activity_window, min_periods=5).var().reset_index(level=0, drop=True).reindex(_rs.index)
+_mn_col = 'ssm_mark_noise' if 'ssm_mark_noise' in _rs.columns else None
+if _mn_col:
+    _rs['mark_noise_sd_bp'] = _rs[_mn_col].abs().groupby(_rs['cusip'], observed=True).rolling(CFG.activity_window, min_periods=5).mean().reset_index(level=0, drop=True).reindex(_rs.index)
+fcov = factors.cov()                                                    # bp^2 per day, factors of the full-sample fit
+risk_snap = _rs[_rs['date'] == last_date][['cusip', 'date'] + beta_cols + ['idio_var_bp2'] + (['mark_noise_sd_bp'] if _mn_col else []) + (['beta_cluster'] if 'beta_cluster' in _rs.columns else [])].copy()
+_B = risk_snap[beta_cols].fillna(0.0).to_numpy(float)
+risk_snap['sys_var_bp2'] = np.einsum('ij,jk,ik->i', _B, fcov.to_numpy(float), _B)
+risk_snap['total_var_bp2'] = risk_snap['sys_var_bp2'] + risk_snap['idio_var_bp2'].fillna(risk_snap['idio_var_bp2'].median())
+risk_snap['systematic_share'] = risk_snap['sys_var_bp2'] / risk_snap['total_var_bp2'].replace(0, np.nan)
+risk_snap['cluster'] = risk_snap['beta_cluster'].map(CLUSTER_LABEL) if 'beta_cluster' in risk_snap.columns else 'ALL'
+risk_tab = risk_snap.groupby('cluster', observed=True).agg(bonds=('cusip', 'size'), systematic_sd_bp=('sys_var_bp2', lambda x: float(np.sqrt(x.median()))), idio_sd_bp=('idio_var_bp2', lambda x: float(np.sqrt(x.median()))),
+                                                           systematic_share=('systematic_share', 'median'), **({'mark_noise_sd_bp': ('mark_noise_sd_bp', 'median')} if _mn_col else {}))
+print(f'Risk model snapshot on {last_date.date()}: {len(risk_snap):,} bonds. Factor covariance (bp^2 / day):'); display(fcov.round(3))
+print('Daily risk by beta-space cluster (medians; systematic = beta\' Sigma beta, idiosyncratic = trailing residual variance):'); display(risk_tab.round(3))
+fig, ax = plt.subplots(1, 2, figsize=(15, 4.6))
+risk_tab[['systematic_sd_bp', 'idio_sd_bp']].plot.barh(ax=ax[0], color=['#4C72B0', '#DD8452']); ax[0].set_title('Daily yield risk per bond by cluster (bp, medians)', fontsize=10); ax[0].set_ylabel(''); ax[0].legend(['systematic (factor)', 'idiosyncratic (residual)'], fontsize=8); ax[0].tick_params(axis='y', labelsize=8)
+ax[1].hist(risk_snap['systematic_share'].clip(0, 1).dropna(), bins=40, color='#55A868'); ax[1].set_title('Share of a bond\'s daily variance that is systematic', fontsize=10); ax[1].set_xlabel('systematic share'); ax[1].set_ylabel('bonds')
+savefig('08_risk_model_snapshot')
+risk_snap.to_parquet(ARTIFACTS / f'risk_model_snapshot_{last_date.date()}.parquet', index=False)
+record('risk_model', date=str(last_date.date()), factor_covariance=fcov.round(5).to_dict(), by_cluster=risk_tab.round(4).reset_index().to_dict(orient='records'), bonds=int(len(risk_snap)))
 
 # %% [markdown]
 # ## 9. Transaction validation (PIT-safe)
@@ -1806,17 +1753,6 @@ if HAS_TRADES:
             print(f'median dealer round trip {rt["round_trip_bp"].median():.1f} bp')
     spread_tx = pd.DataFrame(sp_rows)
     print('Mark-quality reading:'); display(spread_tx)
-    fig, ax = plt.subplots(1, 3, figsize=(19, 4.4))
-    for a, (col, title) in zip(ax[:2], [('ssm_rank', 'state-space signal rank'), ('level_rank', f'trailing-{CFG.level_signal_window} mean rank')]):
-        dd = tv.dropna(subset=[col]).copy(); dd['decile'] = pd.qcut(dd[col].rank(method='first'), 10, labels=False) + 1
-        for sd, g in dd.groupby('side'):
-            if len(g) > 2000:
-                a.plot(g.groupby('decile')['e_mark_bp'].mean(), marker='o', label={'S': 'S: dealer sale (customer buys)', 'P': 'P: dealer purchase (customer sells)', 'D': 'D: inter-dealer'}.get(sd, sd))
-        a.plot(dd.groupby('decile')['e_mark_bp'].mean(), color='k', lw=2, label='all'); a.axhline(0, color='k', lw=0.6); a.set_xlabel('score decile (1 = forecast cheapening low -> 10 high)'); a.set_ylabel('mean trade - prior mark (bp)'); a.set_title(f'Trade vs prior mark by {title}', fontsize=10); a.legend(fontsize=7)
-    rec_order = ['<=1d', '1-3d', '3-7d', '7-21d', '>21d']
-    rec = tx[tx['target'] == 'trade - prior mark, by recency'].set_index('bucket').reindex(rec_order)
-    ax[2].bar(rec.index, rec['fm_beta'], yerr=1.96 * (rec['fm_beta'] / rec['fm_t']).abs(), capsize=4, color='#4C72B0'); ax[2].axhline(0, color='k', lw=0.6); ax[2].set_title('FM beta of trade - mark on the record signal, by recency (bp/rank)', fontsize=10)
-    savefig('09_transaction_validation')
     record('transaction_validation', table=tx.round(4).to_dict(orient='records'), joint=jt.round(4).to_dict(orient='records'), mark_quality=spread_tx.round(4).to_dict(orient='records'), trades=len(tv), trade_dates=int(tv['trade_date'].nunique()))
 else:
     tv = pd.DataFrame()
@@ -1882,7 +1818,49 @@ else:
     print('Section 9b skipped: needs matched trades.')
 
 # %% [markdown]
-# ## 10. Algo error correction
+# ### 9c. Where prints sit relative to our quote and to the evaluation
+#
+# Two distances per print, both oriented so that positive is good for the dealer. *Print minus quote*, oriented
+# by side: positive means the print landed on the aggressive side of our quote (the customer sold below our bid
+# price or bought above our offer price), so we would have won that trade at our quote. *Print minus same-day
+# evaluation*, oriented: positive is the edge over the closing evaluation the dealer who did the trade earned.
+# The first distance is the fill proxy Section 11 is built on; the second is the market's realised half-spread
+# against the evaluation, by side and size. Read the two panels together: how often prints cross our quote, and
+# how far from the evaluation the market actually trades.
+
+# %%
+if HAS_TRADES and not tv.empty and 'y_close_trade_date' in tv.columns:
+    ps = tv[tv['side'].isin(['P', 'S'])].copy(); ps['s'] = np.where(ps['side'] == 'P', 1.0, -1.0)
+    ps['o_quote'] = ps['s'] * ps['e_algo_bp']                                            # + = print on the aggressive side of our quote: we would have filled
+    ps['o_eval'] = ps['s'] * 100.0 * (ps['msrb_yield'] - ps['y_close_trade_date'])       # + = the dealer's edge over the same-day evaluation on the actual print
+
+    def where_table(frame: pd.DataFrame, by: str) -> pd.DataFrame:
+        g = frame.groupby([by, 'side'], observed=True)
+        out = pd.DataFrame({'prints': g.size(), 'print - quote, oriented median (bp)': g['o_quote'].median(), 'share crossing our quote': g['o_quote'].apply(lambda x: float((x >= 0).mean())),
+                            'dealer edge vs evaluation, median (bp)': g['o_eval'].median(), 'share of prints beyond the evaluation': g['o_eval'].apply(lambda x: float((x >= 0).mean()))})
+        return out.unstack('side')
+
+    wt_all = where_table(ps.assign(all='ALL'), 'all'); wt_size = where_table(ps, 'qty_group').reindex(QTY_LABELS)
+    print('Where prints sit (P = dealer buys at our bid, S = dealer sells at our offer):'); display(wt_all.round(3))
+    print('By desk quantity bin:'); display(wt_size.round(2))
+    fig, ax = plt.subplots(2, 2, figsize=(15, 8))
+    for i, sd_ in enumerate(['P', 'S']):
+        g = ps[ps['side'] == sd_]; lab = {'P': 'P dealer buys (our bid)', 'S': 'S dealer sells (our offer)'}[sd_]
+        a = ax[i, 0]; x = g['o_quote'].clip(-40, 40).dropna()
+        a.hist(x, bins=120, color='#4C72B0', alpha=0.85); a.axvline(0, color='k', lw=0.8); a.axvspan(0, 40, color='#2E8B57', alpha=0.08)
+        a.set_title(f'{lab}: print minus our quote, oriented (bp)', fontsize=10); a.set_xlabel('bp (positive = print crossed our quote, we would have filled)')
+        a.text(0.98, 0.92, f'would have filled {float((g["o_quote"] >= 0).mean()):.0%} of prints\nmedian {g["o_quote"].median():+.1f} bp', transform=a.transAxes, ha='right', va='top', fontsize=9, bbox={'facecolor': 'white', 'alpha': 0.8, 'edgecolor': 'none'})
+        a = ax[i, 1]; x = g['o_eval'].clip(-60, 60).dropna()
+        a.hist(x, bins=120, color='#DD8452', alpha=0.85); a.axvline(0, color='k', lw=0.8); a.axvline(g['o_eval'].median(), color='#C44E52', lw=1.2, ls='--')
+        a.set_title(f'{lab}: the dealer\'s edge over the same-day evaluation on the print (bp)', fontsize=10); a.set_xlabel('bp (positive = the dealer traded on the good side of the evaluation)')
+        a.text(0.98, 0.92, f'median {g["o_eval"].median():+.1f} bp\n{float((g["o_eval"] >= 0).mean()):.0%} of prints beyond the evaluation', transform=a.transAxes, ha='right', va='top', fontsize=9, bbox={'facecolor': 'white', 'alpha': 0.8, 'edgecolor': 'none'})
+    fig.suptitle('Where prints land: relative to our quote (left, the fill proxy) and relative to the evaluation (right, the market\'s realised half-spread)', fontsize=11); plt.tight_layout(); savefig('09c_prints_vs_quote_and_eval')
+    record('prints_vs_quote_eval', overall=flat_records(wt_all), by_size=flat_records(wt_size))
+else:
+    print('Section 9c skipped: needs matched trades with the trade-date close.')
+
+# %% [markdown]
+# ## 10. Quote rules: the same-side memory, the ladder, the re-opened trials, the side x size intercepts, the level model
 #
 # The v5 print-to-print panel found that the algo's pricing error on a bond persists from one print to the next
 # (coefficient 0.58), a larger lever than anything the factor residual offered against the algo quote. The v41 run
@@ -1909,6 +1887,15 @@ else:
 # (D$^-$) the same without the error features. Scored against the print by error age, side and duration band with
 # Fama-MacBeth and block-bootstrap t. The level models and the state-space memory are cached on the trade and
 # residual keys.
+#
+# **v4.0 additions.** Four trials that v3.6 closed on MAE are re-opened because Section 11 re-ranks every rule in
+# dollars and a rule that loses on MAE can win on P&L: (B) the last error scaled by an age-dependent persistence,
+# (E) a per-side intercept, (F) the side intercept plus rho x the side-pooled EWMA (the "revised third term"), and
+# (G) the direct factor-beta correction. Two rules are new, built from the v51 finding that the algo's error has a
+# strong slope in trade size on every side: (AQ) the algo quote plus a side x quantity-bin intercept, and (SQ) the
+# same-side memory plus that intercept estimated on the error S leaves. Intercepts are Fama-MacBeth daily means on
+# prior months, shrunk to the side mean where a cell is thin. The MAE tables are kept to one scoreboard and one
+# by-side table; the full breakdowns live in the registry.
 
 # %%
 try:
@@ -2081,7 +2068,7 @@ if HAS_TRADES and not tv.empty and 'cum_fitted_bp' in tv.columns:
     KF_BY_MONTH = {m: g.set_index('_id') for m, g in KFM.groupby('month')} if len(KFM) else {}
 
     # ---- the fold loop: S and K coefficients on prior months, every mid on the test month
-    parts, rho_rows = [], []
+    parts, rho_rows = [], []; BIAS_PATH = {}
     for m in MONTHS_EC[1:]:
         tr, te = ec[ec['month'] < m], ec[ec['month'] == m].copy()
         if len(tr) < 5_000 or te.empty:
@@ -2145,6 +2132,39 @@ if HAS_TRADES and not tv.empty and 'cum_fitted_bp' in tv.columns:
             row.update({'rho_K': rho_k, 'kf_phi_daily': float(kf['phi_daily'].iloc[0]), 'kf_half_life_days': float(np.log(0.5) / np.log(kf['phi_daily'].iloc[0])) if kf['phi_daily'].iloc[0] < 1 else np.inf, 'kf_q': float(kf['q'].iloc[0]), 'kf_r': float(kf['r'].iloc[0])})
         else:
             te['e_K_bp'] = te['e_S_bp']
+        # ---- v4.0: legacy trials re-opened for the markout re-ranking (closed on MAE in v3.6)
+        rho_age = {b: fm_slope(g, 'e_algo_bp', 'last_algo_err_bp', ['log_size'])['fm_beta'] for b, g in trh.groupby('age_bucket') if len(g) >= 500}
+        te['e_B_bp'] = te['e_algo_bp'] - (te['age_bucket'].map(rho_age).astype(float) * te['last_algo_err_bp']).fillna(0.0)
+        side_med = tr.groupby('side')['e_algo_bp'].median(); te['side_bias'] = te['side'].map(side_med).fillna(0.0)
+        te['e_E_bp'] = te['e_algo_bp'] - te['side_bias']
+        trs2 = trh.assign(e_sd=trh['e_algo_bp'] - trh['side'].map(side_med).fillna(0.0)).dropna(subset=['ewm_algo_err_bp'])
+        rho_F = fm_slope(trs2, 'e_sd', 'ewm_algo_err_bp', ['log_size'])['fm_beta'] if len(trs2) >= 2_000 else rho_ewm
+        te['e_F_bp'] = te['e_E_bp'] - (rho_F * te['ewm_algo_err_bp']).fillna(0.0)
+        trb = tr.dropna(subset=beta_cols)
+        bG = fm_multi(trb, 'e_algo_bp', beta_cols, ['log_size']).set_index('score')['fm_beta'].reindex(beta_cols).fillna(0.0)
+        aG = float((trb['e_algo_bp'] - trb[beta_cols].to_numpy(float) @ bG.to_numpy(float)).mean())
+        te['e_G_bp'] = te['e_algo_bp'] - (aG + te[beta_cols].fillna(0.0).to_numpy(float) @ bG.to_numpy(float))
+        row.update({'rho_F': rho_F, 'side_bias_P': float(side_med.get('P', np.nan)), 'side_bias_S': float(side_med.get('S', np.nan)), 'side_bias_D': float(side_med.get('D', np.nan))})
+
+        # ---- v4.0: side x size intercepts. The v51 EDA found the algo's error falls monotonically with trade size on the
+        #      bid (+8 bp on odd lots to -2 bp on blocks): a level effect per side and size that no persistence rule can
+        #      carry. The intercept is the Fama-MacBeth daily mean of the error by (side, quantity bin) on prior months,
+        #      shrunk to the side mean with weight n / (n + cell_min_trades). AQ puts it on the algo quote; SQ puts it on
+        #      the same-side memory, estimated on the error S leaves on the training months.
+        def cell_intercept(frame: pd.DataFrame, col: str) -> pd.Series:
+            daily = frame.groupby(['side', 'qty_group', 'trade_date'], observed=True)[col].mean()
+            cell = daily.groupby(level=[0, 1]).mean(); n_cell = frame.groupby(['side', 'qty_group'], observed=True).size().reindex(cell.index).fillna(0.0)
+            side_m = frame.groupby(['side', 'trade_date'], observed=True)[col].mean().groupby(level=0).mean()
+            w = n_cell / (n_cell + CFG.cell_min_trades)
+            return (w * cell + (1.0 - w) * pd.Series(cell.index.get_level_values(0).map(side_m).to_numpy(), index=cell.index)).rename('bias')
+
+        _key_te = pd.MultiIndex.from_arrays([te['side'].astype(str).to_numpy(), te['qty_group'].astype(str).to_numpy()])
+        bias_A = cell_intercept(tr, 'e_algo_bp')
+        te['e_AQ_bp'] = te['e_algo_bp'] - pd.Series(bias_A.reindex(_key_te).to_numpy(), index=te.index).fillna(te['side_bias'])
+        tr_S = tr.assign(e_S_tr=tr['e_algo_bp'] - np.where(tr['ewm_side_err_bp'].notna(), rho_s * tr['ewm_side_err_bp'].fillna(0.0), rho_ewm * tr['ewm_algo_err_bp'].fillna(0.0)))
+        bias_S = cell_intercept(tr_S, 'e_S_tr')
+        te['e_SQ_bp'] = te['e_S_bp'] - pd.Series(bias_S.reindex(_key_te).to_numpy(), index=te.index).fillna(0.0)
+        BIAS_PATH[str(m)] = {'A': bias_A, 'S': bias_S}
         lp = lvl_pred.reindex(te['_id'])
         te['e_D_bp'] = te['spread_bp'] - lp['yD'].to_numpy(); te['e_Dminus_bp'] = te['spread_bp'] - lp['yDm'].to_numpy(); te['y_mid_D'] = te['MmdYld'] + lp['yD'].to_numpy() / 100.0
         rho_rows.append(row); parts.append(te)
@@ -2154,10 +2174,20 @@ if HAS_TRADES and not tv.empty and 'cum_fitted_bp' in tv.columns:
         ecp[c] = ecp[c].fillna(ecp['e_algo_bp'])
     print('Error-correction coefficients and state-space parameters by month (estimated on prior months):'); display(rho_path.round(3))
     PREDS = {'A algo quote': 'e_algo_bp', 'C side-pooled EWMA (reference)': 'e_C_bp', 'S same-side EWMA': 'e_S_bp',
+             'SQ same-side EWMA + side x size intercept': 'e_SQ_bp', 'AQ algo + side x size intercept': 'e_AQ_bp',
+             'E algo + side intercept': 'e_E_bp', 'F side intercept + rho x own EWMA': 'e_F_bp', 'B algo + rho(age) x last error': 'e_B_bp', 'G algo + factor-beta correction': 'e_G_bp',
              'Sb same-side EWMA, rho by factor betas': 'e_Sb_bp', 'Sc same-side EWMA, rho by beta-space cluster': 'e_Sc_bp', 'Sm same-side EWMA, rho by |residual drift|': 'e_Sm_bp',
              'Sa same-side EWMA, rho by same-side age': 'e_Sa_bp', 'Sq same-side EWMA, rho by trade size': 'e_Sq_bp', 'Ssc same-side EWMA, rho by side x cluster': 'e_Ssc_bp', 'Si same-side EWMA, rho by industry': 'e_Si_bp',
              'K per-side state-space memory': 'e_K_bp', 'D level model with error features': 'e_D_bp', 'D- level model without error features': 'e_Dminus_bp'}
     PREDS = {k: v for k, v in PREDS.items() if v in ecp.columns}
+    MID_LETTER = {k: k.split()[0] for k in PREDS}
+    KEY_MIDS = [k for k in PREDS if MID_LETTER[k] in ('A', 'C', 'S', 'SQ', 'AQ', 'K', 'D')]
+    # the side x size intercept of the last fold, the bias curve in one table (bp; positive = the print sits above the quote in yield)
+    _lastm = sorted(BIAS_PATH)[-1]
+    bias_tab = pd.DataFrame({'on the algo quote (AQ)': BIAS_PATH[_lastm]['A'], 'on the error S leaves (SQ)': BIAS_PATH[_lastm]['S']}).unstack(0)
+    bias_tab = bias_tab.reindex([q for q in QTY_LABELS if q in bias_tab.index])
+    print(f'Side x quantity-bin intercepts estimated for {_lastm} on the prior months (bp of yield; shrunk to the side mean where a cell has < {CFG.cell_min_trades} trades):'); display(bias_tab.round(2))
+    record('error_correction', size_intercepts={m_: {k_: flat_records(v_.unstack(0)) for k_, v_ in d_.items()} for m_, d_ in BIAS_PATH.items()})
 
     def ec_table(frame: pd.DataFrame, by: str) -> pd.DataFrame:
         g = frame.groupby(by, observed=True); out = pd.DataFrame({'n': g.size()})
@@ -2169,9 +2199,15 @@ if HAS_TRADES and not tv.empty and 'cum_fitted_bp' in tv.columns:
         return out
 
     ec_all = ec_table(ecp.assign(all='ALL'), 'all'); ec_age = ec_table(ecp, 'age_bucket').reindex(['<=1d', '1-3d', '3-7d', '7-21d', '>21d', 'no prior print']).dropna(how='all'); ec_side = ec_table(ecp, 'side'); ec_month = ec_table(ecp, 'month'); ec_band = ec_table(ecp, 'dur_band')
-    print('Held-out MAE against the print (bp) and daily-FM gain over the algo quote:'); display(ec_all.T.round(3)); display(ec_age.round(3)); display(ec_side.round(3)); display(ec_band.round(3))
     _gd = {k_: ecp.assign(gain=ecp['e_algo_bp'].abs() - ecp[c].abs()).groupby('trade_date')['gain'].mean().to_numpy() for k_, c in list(PREDS.items())[1:]}
-    boot_gain = pd.Series({k_: block_bootstrap_t(v, CFG.block_days, CFG.n_boot, CFG.seed) for k_, v in _gd.items()}, name='bootstrap t of the daily gain'); display(boot_gain.round(2).to_frame())
+    boot_gain = pd.Series({k_: block_bootstrap_t(v, CFG.block_days, CFG.n_boot, CFG.seed) for k_, v in _gd.items()}, name='bootstrap t of the daily gain')
+    _o = ec_all.iloc[0]
+    scoreboard = pd.DataFrame({'MAE vs print (bp)': {k_: _o[f'MAE {MID_LETTER[k_]}'] for k_ in PREDS}, 'gain over algo (bp)': {k_: _o.get(f'gain {MID_LETTER[k_]} (bp)', 0.0) for k_ in PREDS},
+                               'FM t': {k_: _o.get(f't {MID_LETTER[k_]}', np.nan) for k_ in PREDS}, 'bootstrap t': {k_: boot_gain.get(k_, np.nan) for k_ in PREDS}}).sort_values('gain over algo (bp)', ascending=False)
+    scoreboard['MAE rank'] = np.arange(1, len(scoreboard) + 1)
+    print(f'MAE scoreboard on {len(ecp):,} held-out trades (the accuracy view; Section 11 re-ranks the same rules in dollars):'); display(scoreboard.round(3))
+    side_gain = pd.DataFrame({sd_: {k_: ec_side.loc[sd_, f'gain {MID_LETTER[k_]} (bp)'] for k_ in list(PREDS)[1:]} for sd_ in ec_side.index}).rename(columns={'P': 'P dealer buys (bid)', 'S': 'S dealer sells (offer)', 'D': 'D inter-dealer'})
+    print('Gain over the algo by MSRB side (bp of MAE):'); display(side_gain.round(3))
     # ---- the pre-registered bar: does a conditioned variant replace S?
     _gS = _gd['S same-side EWMA']; _mS = ecp.assign(gain=ecp['e_algo_bp'].abs() - ecp['e_S_bp'].abs()).groupby('trade_date')['gain'].mean()
     bar_rows = []
@@ -2218,7 +2254,7 @@ if HAS_TRADES and not tv.empty and 'cum_fitted_bp' in tv.columns:
     print('Crossing: share of trades where the mid sits on the aggressive side of the print, by customer side (P = our bid above the print, S = our offer below it):'); display(crossing.round(3))
     fig, ax = plt.subplots(1, 3, figsize=(20, 5.2))
     _sh = direction[[f'share {cc}' for cc in ['toward', 'crossed, closer', 'crossed, further', 'away']]].drop(index='A algo quote', errors='ignore'); _sh.columns = ['toward', 'crossed, closer', 'crossed, further', 'away']
-    _sh.plot.barh(ax=ax[0], stacked=True, color=['#2E8B57', '#9ACD32', '#E9967A', '#C44E52']); ax[0].set_title('Where the mid moves relative to the print (share of trades)', fontsize=10); ax[0].legend(fontsize=7, loc='lower right'); ax[0].tick_params(axis='y', labelsize=7); ax[0].invert_yaxis()
+    _sh.plot.barh(ax=ax[0], stacked=True, color=['#2E8B57', '#9ACD32', '#E9967A', '#C44E52']); ax[0].set_title('Where the mid moves relative to the print (share of trades)', fontsize=10); ax[0].legend(fontsize=7, loc='lower right'); ax[0].tick_params(axis='y', labelsize=6); ax[0].invert_yaxis()
     _cr = crossing['aggressive share']; _cr.plot.barh(ax=ax[1]); ax[1].set_title('Share of trades on the aggressive side of the print, by side', fontsize=10); ax[1].tick_params(axis='y', labelsize=7); ax[1].legend(['P dealer buys', 'S dealer sells'], fontsize=8); ax[1].invert_yaxis()
     _mae_gain = pd.Series({k_: _gd[k_].mean() for k_ in _gd}); _asym = direction['asym loss gain (bp)'].reindex(_mae_gain.index)
     ax[2].scatter(_mae_gain, _asym, color='#4C72B0')
@@ -2229,7 +2265,7 @@ if HAS_TRADES and not tv.empty and 'cum_fitted_bp' in tv.columns:
     savefig('10_direction_aware')
     record('error_correction', interaction_bar=bar.round(4).reset_index().to_dict(orient='records'), direction=direction.round(4).reset_index().to_dict(orient='records'), crossing=flat_records(crossing))
     fig, ax = plt.subplots(1, 3, figsize=(19, 4.5))
-    ec_age[[f'MAE {k_.split()[0]}' for k_ in PREDS]].plot.bar(ax=ax[0]); ax[0].set_title('MAE vs the print by age of the last algo error (bp)', fontsize=10); ax[0].set_xlabel(''); ax[0].legend([k_ for k_ in PREDS], fontsize=7)
+    ec_age[[f'MAE {MID_LETTER[k_]}' for k_ in KEY_MIDS]].plot.bar(ax=ax[0]); ax[0].set_title('MAE vs the print by age of the last algo error (bp)', fontsize=10); ax[0].set_xlabel(''); ax[0].legend([k_ for k_ in KEY_MIDS], fontsize=7)
     dd = ecp[ecp['has_side_err']].copy(); dd['decile'] = pd.qcut(dd['ewm_side_err_bp'].rank(method='first'), 10, labels=False) + 1
     for sd, g in dd.groupby('side'):
         ax[1].plot(g.groupby('decile')['e_algo_bp'].mean(), marker='o', label={'S': 'S', 'P': 'P', 'D': 'D'}.get(sd, sd))
@@ -2237,7 +2273,7 @@ if HAS_TRADES and not tv.empty and 'cum_fitted_bp' in tv.columns:
     rho_path[[c for c in ['rho_pooled', 'rho_same_side', 'rho_K'] if c in rho_path.columns]].plot(ax=ax[2], marker='o'); ax[2].axhline(0, color='k', lw=0.6); ax[2].set_title('Error-correction coefficients by month (estimated on prior months)', fontsize=10); ax[2].set_xlabel(''); ax[2].legend(fontsize=8)
     savefig('10_algo_error_correction')
     fig, ax = plt.subplots(1, 2, figsize=(15, 4.3))
-    ec_month[[f'MAE {k_.split()[0]}' for k_ in PREDS]].plot(ax=ax[0], marker='o'); ax[0].set_title('Held-out MAE by month (bp)', fontsize=10); ax[0].legend([k_ for k_ in PREDS], fontsize=7); ax[0].set_xlabel('')
+    ec_month[[f'MAE {MID_LETTER[k_]}' for k_ in KEY_MIDS]].plot(ax=ax[0], marker='o'); ax[0].set_title('Held-out MAE by month (bp)', fontsize=10); ax[0].legend([k_ for k_ in KEY_MIDS], fontsize=7); ax[0].set_xlabel('')
     if len(imp_mean):
         imp_mean.sort_values().tail(15).plot.barh(ax=ax[1], color='#4C72B0'); ax[1].set_title('Level model D: mean feature importance (error features in the list)', fontsize=10)
     else:
@@ -2246,7 +2282,7 @@ if HAS_TRADES and not tv.empty and 'cum_fitted_bp' in tv.columns:
     # side x duration: does the same-side memory repair the short end on every side?
     _dur_order = ['<1', '1-2.5', '2.5-4', '4-6', '6-8', '8-11', '>11']
     ecp['dur_bucket'] = pd.cut(ecp['modified_duration_lag1'], bins=[-1, 1, 2.5, 4, 6, 8, 11, 100], labels=_dur_order).astype(str)
-    show_mids = [k_ for k_ in PREDS if k_.split()[0] in ('C', 'S', 'K', 'D')]
+    show_mids = [k_ for k_ in PREDS if MID_LETTER[k_] in ('C', 'S', 'SQ', 'D')]
     fig, axs = plt.subplots(1, len(show_mids), figsize=(4.8 * len(show_mids), 5.2), squeeze=False); axs = axs.ravel(); hms = {}
     for a, k_ in zip(axs, show_mids):
         c = PREDS[k_]
@@ -2267,127 +2303,340 @@ else:
     print('Section 10 skipped: needs matched trades joined to residuals.')
 
 # %% [markdown]
-# ## 11. Conformal band around the chosen mid: split and rolling calibration
+# ## 11. Markout: the quote judged in dollars
 #
-# v2.3 fitted a quantile model of |print − mid| and got 71% coverage at an 80% target: the quantile model is
-# mis-calibrated under the month-to-month shift in error scale. **Split conformal** fixes this without changing
-# the model. For test month $m$, the quantile model is trained on months before $m-1$, the calibration month
-# $m-1$ gives the scaling constant $s$ = the target quantile of the normalised score $|e| / \hat q$, and the band
-# in month $m$ is $s\,\hat q$. Coverage is then guaranteed on average under exchangeability, and the width still
-# adapts to the trade. Three bands at the same target: fixed (calibration-month quantile of $|e|$), raw quantile
-# model, and conformalised quantile model, each around three mids: the algo quote, the same-side memory S and
-# the level model D. The v31 run showed the monthly split-conformal scale cannot follow a regime shift inside the
-# test month (September covered 64%), so a **rolling** variant is added: the scale for each test date is the target
-# quantile of the normalised scores over the previous ten trading days, and the quantile model gets the lagged
-# cross-sectional dispersion of the market as a feature. The fair benchmark for any conditional band is a fixed
-# width rescaled on the same window ("rolling fixed"); the efficiency table reports half-width per point of coverage.
-# The quantile models are cached on the error-correction key.
+# **The objective.** A market maker's expected P&L per quote is fill probability times edge, net of what the market
+# does after the fill. MAE against the print measures none of those three. This section builds the one-dimensional
+# version of the optimizer from data we already have. For every matched print we know our quote, the print, the
+# side and the size. Orient everything so that positive is good for the dealer: with $s = +1$ for a dealer buy
+# (our bid) and $s = -1$ for a dealer sale (our offer), the *oriented distance* of a mid $m$ is
+#
+# $$o_m = s \cdot 100\,(y_{\text{print}} - y_m)$$
+#
+# and a print with $o_m \ge \delta$ is a fill we would have won at the quote $y_m + s\,\delta/100$, where $\delta$
+# is a concession in bp (negative = more aggressive than the mid). Marked to the closing evaluation $h$ business
+# days after the trade, the fill's P&L in bp of yield is
+#
+# $$\text{P\&L}_m(h, \delta) = s \cdot 100\,(y_{\text{print}} - y_{\text{mark},h}) - o_m + \delta
+#   = \underbrace{s \cdot 100\,(y_{\text{quote}} - y_{\text{mark},0})}_{\text{edge at the quote}} + \underbrace{s \cdot 100\,(y_{\text{mark},0} - y_{\text{mark},h})}_{\text{mark move after the trade}}$$
+#
+# so the first term is the half-spread we earned against the same-day evaluation and the second is adverse
+# selection (negative when the mark moves against the position). Dollars are bp x par x price / 100 x modified
+# duration x 0.0001, the Section 12b convention. Expected P&L per print is the mean of fill x P&L over *all*
+# prints, which is what a quote earns per opportunity; fill share and P&L per fill are shown beside it.
+#
+# **What is tested.** (1) The adverse-selection picture: the mark move after the print for the prints we would have
+# won against the ones we would have missed. (2) The re-ranking: every quote rule of Section 10 at $\delta = 0$ and
+# the record horizon, in P&L per print and dollars per month, next to its MAE rank, with a bootstrap t of the daily
+# difference against the algo quote and against S, and the pre-registered bar (dollars above S, bootstrap t > 3,
+# positive in 4 of 5 months). (3) Fill and P&L curves against the concession, by side, for the algo quote, S and
+# SQ. (4) The cell-optimal concession: $\delta^*$ per side x quantity bin chosen on prior months and applied
+# forward, the first output the optimizer would actually consume.
+#
+# **Two caveats, stated once.** The fill proxy is optimistic: every print that crossed our quote counts as a fill,
+# which ignores that the customer may have traded elsewhere and carries the winner's curse. Marks are evaluations,
+# not executable prices. Both biases apply identically to every rule, so the ranking and the shape of the curves
+# are the result; the dollar level is an upper bound.
 
 # %%
 if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
-    ecp['market_disp_lag'] = ecp['trade_date'].map(DATE_DISP_LAG)          # cross-sectional sd of the target on the previous panel date: known at the open
-    ecp['market_disp_lag'] = ecp['market_disp_lag'].fillna(ecp['market_disp_lag'].median())
-    BAND_FEATURES = [c for c in ['log_size', 'side_D', 'side_P', 'side_S', 'recency_days_c', 'prints_20d', 'MinuteFromSignal', 'last_print_spread_bp', 'last_algo_err_bp', 'ewm_algo_err_bp', 'abs_resid_z', 'eta_abs', 'modified_duration_lag1', 'rating_score', 'target_abs_vol', 'dMmdSprdSide', 'market_disp_lag'] if c in ecp.columns]
-    BAND_FEATURES = BAND_FEATURES + [c for c in ['ewm_side_err_bp', 'n_side_prints'] if c in ecp.columns and c not in BAND_FEATURES]
-    months_b = sorted(ecp['month'].unique())
+    mo = ecp[ecp['side'].isin(['P', 'S'])].copy(); mo['s'] = np.where(mo['side'] == 'P', 1.0, -1.0)
+    _q = pd.to_numeric(mo['msrb_quantity'], errors='coerce').replace([np.inf, -np.inf], np.nan)
+    _keep = _q.notna() & (_q > 0) & (_q <= 1e8)
+    print(f'markout universe: {len(mo):,} customer-side prints (inter-dealer excluded from P&L); {int((~_keep).sum()):,} dropped for non-finite, non-positive or > $100mm par')
+    mo = mo[_keep].copy(); mo['par'] = _q[_keep].astype(float)
+    _px = pd.to_numeric(mo['msrb_price'], errors='coerce').replace([np.inf, -np.inf], np.nan).clip(1, 300).fillna(100.0)
+    mo['dollar_per_bp'] = mo['par'] * _px / 100.0 * mo['modified_duration_lag1'].clip(lower=0).fillna(0) * 1e-4
+    mo['cusip'] = mo['cusip'].astype('string'); mo['trade_date'] = to_ns(mo['trade_date'])
+    # the closing evaluation h business days after the trade date (first available within 7 calendar days)
+    marks = raw_panel[['cusip', 'date', 'closing_yield']].dropna().copy(); marks['cusip'] = marks['cusip'].astype('string'); marks['date'] = to_ns(marks['date']); marks = marks.sort_values('date')
+    for h in CFG.markout_horizons:
+        tgt = mo[['_id', 'cusip', 'trade_date']].copy(); tgt['target'] = tgt['trade_date'] + pd.offsets.BDay(h) if h > 0 else tgt['trade_date']; tgt = tgt.sort_values('target')
+        j = pd.merge_asof(tgt, marks.rename(columns={'date': 'mark_date'}), left_on='target', right_on='mark_date', by='cusip', direction='forward', tolerance=pd.Timedelta(days=7)).set_index('_id')
+        mo[f'y_mark_{h}'] = j['closing_yield'].reindex(mo['_id']).to_numpy()
+        mo[f'pm_{h}'] = 100.0 * (mo['msrb_yield'] - mo[f'y_mark_{h}'])          # print minus mark (bp), mid-independent
+    H0, HR = CFG.markout_horizons[0], CFG.markout_record_h
+    print('mark coverage by horizon:', {f'h={h}': f'{mo[f"y_mark_{h}"].notna().mean():.1%}' for h in CFG.markout_horizons})
+    months_mo = int(mo['month'].nunique()); DELTAS = np.arange(*CFG.concession_grid_bp)
+    S_ARR = mo['s'].to_numpy(float); PM = {h: mo[f'pm_{h}'].to_numpy(float) for h in CFG.markout_horizons}; DPB = mo['dollar_per_bp'].to_numpy(float)
 
-    def _band_models() -> pd.DataFrame:
-        bands, bimp = [], []
-        for mid_name, err_col in [('algo quote', 'e_algo_bp'), ('same-side memory S', 'e_S_bp'), ('level model D', 'e_D_bp')]:
-            for i in range(2, len(months_b)):
-                m, cal_m = months_b[i], months_b[i - CFG.conformal_calibration_months]
-                tr = ecp[ecp['month'] < cal_m]; cal = ecp[ecp['month'] == cal_m]; te = ecp[ecp['month'] == m].copy()
-                if len(tr) < 5_000 or cal.empty or te.empty:
-                    continue
-                feats = usable_features(tr, BAND_FEATURES); med = tr[feats].median()
-                ytr = tr[err_col].abs()
-                if HAS_LGB:
-                    qm = lgb.LGBMRegressor(objective='quantile', alpha=CFG.band_coverage, n_estimators=300, learning_rate=0.05, num_leaves=31, min_child_samples=200, subsample=0.8, subsample_freq=1, random_state=CFG.seed, verbose=-1).fit(tr[feats].astype(float).fillna(med), ytr)
-                    bimp.append(pd.Series(qm.feature_importances_, index=feats))
-                else:
-                    qm = HistGradientBoostingRegressor(loss='quantile', quantile=CFG.band_coverage, max_iter=200, learning_rate=0.05, max_leaf_nodes=31, min_samples_leaf=200, random_state=CFG.seed).fit(tr[feats].astype(float).fillna(med), ytr)
-                q_cal = np.maximum(qm.predict(cal[feats].astype(float).fillna(med)), 0.5); q_te = np.maximum(qm.predict(te[feats].astype(float).fillna(med)), 0.5)
-                s = float(np.quantile(cal[err_col].abs().to_numpy() / q_cal, CFG.band_coverage))
-                fixed = float(np.quantile(cal[err_col].abs(), CFG.band_coverage))
-                te['mid'] = mid_name; te['abs_err'] = te[err_col].abs(); te['hw_fixed'] = fixed; te['hw_quantile'] = q_te; te['hw_conformal'] = s * q_te; te['s_conformal'] = s
-                # rolling conformal: for each test date, the scale is the target quantile of the normalised scores over the previous
-                # conformal_window_days trading days (calibration month + earlier test days), so a regime shift re-scales within days
-                hist_dates = pd.concat([cal.assign(_q=q_cal), te.assign(_q=q_te)])[['trade_date', err_col, '_q']].assign(score=lambda d: d[err_col].abs() / d['_q'])
-                daily_scores = {d: g['score'].to_numpy() for d, g in hist_dates.groupby('trade_date')}
-                all_days = sorted(daily_scores); s_roll = {}
-                for d in sorted(te['trade_date'].unique()):
-                    prev = [x for x in all_days if x < d][-CFG.conformal_window_days:]
-                    pool = np.concatenate([daily_scores[x] for x in prev]) if prev else np.array([s])
-                    s_roll[d] = float(np.quantile(pool, CFG.band_coverage)) if len(pool) > 50 else s
-                te['s_rolling'] = te['trade_date'].map(s_roll); te['hw_rolling'] = te['s_rolling'] * q_te
-                # the fair benchmark for the conditional band: a FIXED width rescaled on the same rolling window (the target quantile of
-                # |error| over the previous conformal_window_days trading days)
-                daily_abs = {d: g[err_col].abs().to_numpy() for d, g in hist_dates.groupby('trade_date')}
-                hw_rf = {}
-                for d in sorted(te['trade_date'].unique()):
-                    prev = [x for x in all_days if x < d][-CFG.conformal_window_days:]
-                    pool = np.concatenate([daily_abs[x] for x in prev]) if prev else np.array([fixed])
-                    hw_rf[d] = float(np.quantile(pool, CFG.band_coverage)) if len(pool) > 50 else fixed
-                te['hw_rolling_fixed'] = te['trade_date'].map(hw_rf)
-                bands.append(te[['cusip', 'trade_date', 'side', 'age_bucket', 'recency_bucket', 'month', 'mid', 'abs_err', 'hw_fixed', 'hw_rolling_fixed', 'hw_quantile', 'hw_conformal', 'hw_rolling', 's_conformal', 's_rolling']])
-        _bd = pd.concat(bands, ignore_index=True) if bands else pd.DataFrame()
-        if bimp:
-            _imp = pd.concat(bimp, axis=1).mean(axis=1); _bd = pd.concat([_bd, pd.DataFrame({'mid': '__importance__', 'cusip': _imp.index, 'abs_err': _imp.to_numpy()})], ignore_index=True)
-        return _bd
+    def markout_eval(err: np.ndarray, h: int, delta: float = 0.0):
+        """fill flag, P&L (bp) and edge at the quote (bp) for the quote implied by an error column, shifted by a concession."""
+        o = S_ARR * err; fill = o >= delta
+        pnl = S_ARR * PM[h] - o + delta; edge = S_ARR * PM[H0] - o + delta
+        return fill, pnl, edge
 
-    BD_ALL = cached('band_models', _band_models, deps=[EC_FP, STAGE_KEYS.get('level_models'), BAND_FEATURES])
-    bands = [BD_ALL[BD_ALL['mid'] != '__importance__']] if len(BD_ALL) else []
-    if bands:
-        bd = pd.concat(bands, ignore_index=True); bd['month'] = bd['month'].astype(str)
-        BANDS = ['fixed', 'rolling_fixed', 'quantile', 'conformal', 'rolling']
-        for k in BANDS:
-            bd[f'cov_{k}'] = (bd['abs_err'] <= bd[f'hw_{k}']).astype(float)
+    def rerank(mask: np.ndarray, h: int, delta: float = 0.0) -> tuple[pd.DataFrame, dict]:
+        rows, daily = [], {}
+        td = mo['trade_date'].to_numpy()
+        for k_, c in PREDS.items():
+            fill, pnl, edge = markout_eval(mo[c].to_numpy(float), h, delta)
+            ok = mask & np.isfinite(pnl) & np.isfinite(edge); f_ok = fill & ok
+            v = np.where(f_ok, pnl, 0.0)
+            d_ = pd.Series(v[ok]).groupby(td[ok]).mean(); daily[k_] = d_
+            rows.append({'mid': k_, 'fill share': f_ok.sum() / max(ok.sum(), 1), 'edge at quote | fill (bp)': edge[f_ok].mean() if f_ok.any() else np.nan,
+                         'mark move after | fill (bp)': (pnl - edge)[f_ok].mean() if f_ok.any() else np.nan, 'P&L | fill (bp)': pnl[f_ok].mean() if f_ok.any() else np.nan,
+                         'P&L per print (bp)': float(d_.mean()), '$ per month ($k)': float((pnl[f_ok] * DPB[f_ok]).sum() / 1e3 / months_mo)})
+        return pd.DataFrame(rows).set_index('mid'), daily
 
-        def band_table(frame: pd.DataFrame, by: str) -> pd.DataFrame:
-            g = frame.groupby(by, observed=True)
-            return pd.DataFrame({'n': g.size(), **{f'coverage {k}': g[f'cov_{k}'].mean() for k in BANDS}, **{f'half-width {k} (bp)': g[f'hw_{k}'].mean() for k in BANDS}})
+    ALL = np.ones(len(mo), bool); IS_P = (mo['side'] == 'P').to_numpy(); IS_S = (mo['side'] == 'S').to_numpy()
 
-        for mid_name, g in bd.groupby('mid'):
-            print(f'Band around the {mid_name}, target {CFG.band_coverage:.0%} (held-out months; conformal scale s by month: {g.groupby("month")["s_conformal"].first().round(2).to_dict()})')
-            display(band_table(g.assign(all='ALL'), 'all').round(3)); display(band_table(g, 'month').round(3)); display(band_table(g, 'side').round(3))
-        gD = bd[bd['mid'] == 'level model D'].copy(); gD['width_decile'] = pd.qcut(gD['hw_rolling'].rank(method='first'), 10, labels=False) + 1
-        dec = band_table(gD, 'width_decile')
-        print('Calibration by rolling-conformal width decile, level model D mid (flat at the target = calibrated):'); display(dec[['n', 'coverage fixed', 'coverage rolling_fixed', 'coverage quantile', 'coverage conformal', 'coverage rolling', 'half-width rolling_fixed (bp)', 'half-width rolling (bp)']].round(3))
-        _eff = bd.groupby('mid')[[f'cov_{k}' for k in BANDS] + [f'hw_{k}' for k in BANDS]].mean()
-        eff = pd.DataFrame({k: {'coverage': _eff[f'cov_{k}'], 'half-width (bp)': _eff[f'hw_{k}']} for k in BANDS}).T if False else pd.concat({k: pd.DataFrame({'coverage': _eff[f'cov_{k}'], 'half-width (bp)': _eff[f'hw_{k}']}) for k in BANDS}, names=['band', 'mid'])
-        eff['width per point of coverage'] = eff['half-width (bp)'] / (100 * eff['coverage'])
-        print('Band efficiency by mid: half-width per point of coverage (lower is better; the rolling fixed band is the fair benchmark for the conditional bands)'); display(eff.round(3))
-        s_path = bd[bd['mid'] == 'level model D'].groupby('trade_date')[['s_conformal', 's_rolling']].first()
-        fig, ax = plt.subplots(1, 3, figsize=(19, 4.3))
-        for k, st in [('fixed', 's--'), ('rolling_fixed', 'x--'), ('quantile', '^-.'), ('conformal', 'o-'), ('rolling', 'D-')]:
-            ax[0].plot(dec.index, dec[f'coverage {k}'], st, label=k.replace('_', ' '))
-        ax[0].axhline(CFG.band_coverage, color='k', ls='--', lw=0.8); ax[0].set_ylim(0.4, 1.0); ax[0].set_xlabel('rolling-conformal half-width decile'); ax[0].legend(fontsize=8); ax[0].set_title('Coverage by predicted-width decile (level model D mid)', fontsize=10)
-        dcov = bd[bd['mid'] == 'level model D'].groupby('trade_date')[['cov_fixed', 'cov_rolling_fixed', 'cov_conformal', 'cov_rolling']].mean().rolling(5).mean()
-        for k, c in [('fixed', 'grey'), ('rolling_fixed', 'k'), ('conformal', '#4C72B0'), ('rolling', '#C44E52')]:
-            ax[1].plot(dcov.index, dcov[f'cov_{k}'], color=c, lw=1.2, label=k.replace('_', ' '))
-        ax[1].axhline(CFG.band_coverage, color='k', ls='--', lw=0.8); ax[1].legend(fontsize=8); ax[1].set_title('Daily coverage (5-day mean), level model D mid: monthly vs rolling calibration', fontsize=10)
-        ax2 = ax[1].twinx(); ax2.plot(s_path.index, s_path['s_rolling'], color='#C44E52', ls=':', lw=0.8); ax2.set_ylabel('rolling scale s', color='#C44E52')
-        bw = bd.groupby(['mid', 'side'])[['hw_rolling_fixed', 'hw_rolling']].mean()
-        bw.plot.bar(ax=ax[2]); ax[2].set_title('Mean half-width by mid and side (bp): rolling fixed vs rolling conformal', fontsize=10); ax[2].set_xlabel(''); ax[2].legend(['rolling fixed', 'rolling conformal'], fontsize=8); ax[2].tick_params(axis='x', labelsize=7)
-        savefig('11_conformal_band')
-        bd.to_parquet(ARTIFACTS / 'conformal_band_v3.parquet', index=False)
-        record('conformal_band', features=BAND_FEATURES, by_mid={mid_name: band_table(g.assign(all='ALL'), 'all').round(4).to_dict(orient='records')[0] for mid_name, g in bd.groupby('mid')}, by_width_decile=dec.round(4).reset_index().to_dict(orient='records'), efficiency=eff.round(4).reset_index().to_dict(orient='records'))
-    else:
-        print('Section 11: not enough months for train / calibration / test.')
+    # ---- (1) adverse selection: the mark move after the print, fills vs misses, under the algo quote
+    fillA, pnlA, edgeA = markout_eval(mo['e_algo_bp'].to_numpy(float), HR)
+    as_rows = []
+    for sd_, msk in [('P dealer buys (bid)', IS_P), ('S dealer sells (offer)', IS_S)]:
+        for lab, f_ in [('would have filled', fillA), ('would have missed', ~fillA)]:
+            r_ = {'side': sd_, 'prints': lab, 'share': float((msk & f_).sum() / msk.sum())}
+            r_['edge at our quote (bp)'] = float(edgeA[msk & f_ & np.isfinite(edgeA)].mean())
+            for h in CFG.markout_horizons[1:]:
+                mv = S_ARR * (PM[h] - PM[H0]); ok = msk & f_ & np.isfinite(mv)
+                r_[f'mark move after, h={h} (bp)'] = float(mv[ok].mean())
+            as_rows.append(r_)
+    adverse = pd.DataFrame(as_rows).set_index(['side', 'prints'])
+    print('Adverse selection under the algo quote: the oriented mark move after the print (negative = against the position we would hold), fills vs misses:'); display(adverse.round(2))
+
+    # ---- (2) the re-ranking at delta = 0, record horizon, with the MAE rank beside it
+    rr_all, daily_all = rerank(ALL, HR); rr_P, _ = rerank(IS_P, HR); rr_S, _ = rerank(IS_S, HR)
+    rr_h1, _ = rerank(ALL, CFG.markout_horizons[1]); rr_h10, _ = rerank(ALL, CFG.markout_horizons[-1])
+    _dA = daily_all['A algo quote']; _dS = daily_all['S same-side EWMA']
+    for k_ in rr_all.index:
+        dvA = (daily_all[k_] - _dA).dropna(); dvS = (daily_all[k_] - _dS).dropna(); dm = dvS.groupby(pd.DatetimeIndex(dvS.index).to_period('M')).mean()
+        rr_all.loc[k_, 'boot t vs algo'] = block_bootstrap_t(dvA.to_numpy(), CFG.block_days, CFG.n_boot, CFG.seed) if k_ != 'A algo quote' else np.nan
+        rr_all.loc[k_, 'boot t vs S'] = block_bootstrap_t(dvS.to_numpy(), CFG.block_days, CFG.n_boot, CFG.seed) if k_ != 'S same-side EWMA' else np.nan
+        rr_all.loc[k_, 'months above S'] = int((dm > 0).sum()) if k_ != 'S same-side EWMA' else np.nan
+    rr_all['$ vs S per month ($k)'] = rr_all['$ per month ($k)'] - rr_all.loc['S same-side EWMA', '$ per month ($k)']
+    rr_all['beats S (bar)'] = (rr_all['$ vs S per month ($k)'] > 0) & (rr_all['boot t vs S'] > 3) & (rr_all['months above S'] >= min(4, months_mo))
+    rr_all['MAE rank'] = scoreboard['MAE rank'].reindex(rr_all.index); rr_all['$ rank'] = rr_all['$ per month ($k)'].rank(ascending=False).astype(int)
+    rr_all[f'P&L per print h={CFG.markout_horizons[1]} (bp)'] = rr_h1['P&L per print (bp)']; rr_all[f'P&L per print h={CFG.markout_horizons[-1]} (bp)'] = rr_h10['P&L per print (bp)']
+    rr_all = rr_all.sort_values('$ per month ($k)', ascending=False)
+    print(f'Markout re-ranking at delta = 0, marked {HR} business days after the trade ({months_mo} held-out months, {len(mo):,} customer prints). Dollars are per month; the bar is dollars above S, bootstrap t > 3, positive in >= 4 months:'); display(rr_all.round(3))
+    print('By side (record horizon):'); display(pd.concat({'P dealer buys (bid)': rr_P[['fill share', 'edge at quote | fill (bp)', 'mark move after | fill (bp)', 'P&L per print (bp)', '$ per month ($k)']],
+                                                           'S dealer sells (offer)': rr_S[['fill share', 'edge at quote | fill (bp)', 'mark move after | fill (bp)', 'P&L per print (bp)', '$ per month ($k)']]}, axis=1).reindex(rr_all.index).round(3))
+
+    # ---- (3) fill and P&L curves against the concession, by side, for the algo quote, S and SQ
+    CURVE_MIDS = [k_ for k_ in PREDS if MID_LETTER[k_] in ('A', 'S', 'SQ', 'D')]
+    curve_rows = []
+    for k_ in CURVE_MIDS:
+        err = mo[PREDS[k_]].to_numpy(float)
+        for sd_, msk in [('P', IS_P), ('S', IS_S)]:
+            for dlt in DELTAS:
+                fill, pnl, edge = markout_eval(err, HR, float(dlt)); ok = msk & np.isfinite(pnl); f_ok = fill & ok
+                curve_rows.append({'mid': k_, 'side': sd_, 'delta (bp)': float(dlt), 'fill share': f_ok.sum() / max(ok.sum(), 1), 'P&L | fill (bp)': pnl[f_ok].mean() if f_ok.any() else np.nan,
+                                   'P&L per print (bp)': float(np.where(f_ok, pnl, 0.0)[ok].mean()), '$ per month ($k)': float((pnl[f_ok] * DPB[f_ok]).sum() / 1e3 / months_mo)})
+    curves = pd.DataFrame(curve_rows)
+    _cv = curves.dropna(subset=['P&L per print (bp)'])
+    best_delta = _cv.loc[_cv.groupby(['mid', 'side'])['P&L per print (bp)'].idxmax()].set_index(['mid', 'side'])[['delta (bp)', 'fill share', 'P&L per print (bp)', '$ per month ($k)']]
+    print('Concession that maximises P&L per print on the full held-out window (in-sample on the curve; the walk-forward version is below):'); display(best_delta.round(3))
+
+    # ---- (4) the cell-optimal concession, walk-forward: delta* per side x quantity bin on prior months, applied to the test month, on the S quote
+    def best_delta_for(frame_mask: np.ndarray, err: np.ndarray) -> float:
+        """The concession that maximises mean fill x P&L on the masked rows (P&L at the record horizon)."""
+        o = S_ARR[frame_mask] * err[frame_mask]; base = S_ARR[frame_mask] * PM[HR][frame_mask] - o; ok = np.isfinite(base) & np.isfinite(o)
+        if not ok.any():
+            return 0.0
+        o, base = o[ok], base[ok]
+        vals = [float(np.where(o >= dlt, base + dlt, 0.0).mean()) for dlt in DELTAS]
+        return float(DELTAS[int(np.argmax(vals))])
+
+    MONTH_ARR = mo['month'].to_numpy(); QTY_ARR = mo['qty_group'].astype(str).to_numpy(); SIDE_ARR = mo['side'].astype(str).to_numpy()
+    errS = mo['e_S_bp'].to_numpy(float); errA = mo['e_algo_bp'].to_numpy(float); errSQ = mo['e_SQ_bp'].to_numpy(float)
+    delta_cell = np.zeros(len(mo)); delta_side = np.zeros(len(mo)); dstar_rows = []
+    for m in sorted(mo['month'].unique())[1:]:
+        trm = MONTH_ARR < m; tem = MONTH_ARR == m
+        for sd_ in ['P', 'S']:
+            d_side = best_delta_for(trm & (SIDE_ARR == sd_), errS); delta_side[tem & (SIDE_ARR == sd_)] = d_side
+            for q_ in QTY_LABELS:
+                cm = trm & (SIDE_ARR == sd_) & (QTY_ARR == q_)
+                d_cell = best_delta_for(cm, errS) if cm.sum() >= CFG.cell_min_trades else d_side
+                delta_cell[tem & (SIDE_ARR == sd_) & (QTY_ARR == q_)] = d_cell
+                dstar_rows.append({'month': str(m), 'side': sd_, 'qty_group': q_, 'delta* (bp)': d_cell, 'training trades': int(cm.sum())})
+    dstar = pd.DataFrame(dstar_rows)
+    tested = MONTH_ARR > sorted(mo['month'].unique())[0]
+    def pnl_with(err: np.ndarray, dlt: np.ndarray | float, mask: np.ndarray) -> dict:
+        o = S_ARR * err; fill = o >= dlt; pnl = S_ARR * PM[HR] - o + dlt; ok = mask & np.isfinite(pnl); f_ok = fill & ok
+        d_ = pd.Series(np.where(f_ok, pnl, 0.0)[ok]).groupby(mo['trade_date'].to_numpy()[ok]).mean()
+        return {'fill share': f_ok.sum() / max(ok.sum(), 1), 'P&L | fill (bp)': pnl[f_ok].mean() if f_ok.any() else np.nan, 'P&L per print (bp)': float(d_.mean()), '$ per month ($k)': float((pnl[f_ok] * DPB[f_ok]).sum() / 1e3 / max(int(pd.Series(MONTH_ARR[ok]).nunique()), 1)), '_daily': d_}
+    conc_rows = {'A algo quote, delta 0': pnl_with(errA, 0.0, tested), 'S same-side EWMA, delta 0': pnl_with(errS, 0.0, tested), 'SQ same-side EWMA + size intercept, delta 0': pnl_with(errSQ, 0.0, tested),
+                 'S + delta* per side (walk-forward)': pnl_with(errS, delta_side, tested), 'S + delta* per side x size cell (walk-forward)': pnl_with(errS, delta_cell, tested)}
+    conc_daily = {k_: v.pop('_daily') for k_, v in conc_rows.items()}
+    concession = pd.DataFrame(conc_rows).T
+    _base = conc_daily['S same-side EWMA, delta 0']
+    concession['boot t vs S at delta 0'] = [block_bootstrap_t((conc_daily[k_] - _base).dropna().to_numpy(), CFG.block_days, CFG.n_boot, CFG.seed) if k_ != 'S same-side EWMA, delta 0' else np.nan for k_ in concession.index]
+    print(f'The cell-optimal concession, walk-forward (delta* chosen on prior months, applied to the next; months after the first held-out month, h = {HR}):'); display(concession.round(3))
+    dstar_last = dstar[dstar['month'] == dstar['month'].max()].pivot(index='qty_group', columns='side', values='delta* (bp)').reindex(QTY_LABELS)
+    print(f'delta* by side x quantity bin for {dstar["month"].max()} (bp; positive = quote less aggressive than S by that much):'); display(dstar_last.round(1))
+
+    # ---- (5) size x side markout for S and the algo quote at delta 0
+    def cell_markout(err: np.ndarray) -> tuple[pd.DataFrame, pd.DataFrame]:
+        fill, pnl, _ = markout_eval(err, HR); ok = np.isfinite(pnl); f_ok = fill & ok
+        fr = pd.DataFrame({'side': SIDE_ARR, 'qty_group': QTY_ARR, 'v': np.where(f_ok, pnl, 0.0), 'f': f_ok.astype(float), 'ok': ok})
+        fr = fr[fr['ok']]; g = fr.groupby(['qty_group', 'side'], observed=True)
+        return g['v'].mean().unstack('side').reindex(QTY_LABELS), g['f'].mean().unstack('side').reindex(QTY_LABELS)
+    cmS, cfS = cell_markout(errS); cmA, cfA = cell_markout(errA)
+    print('P&L per print (bp) by quantity bin and side at delta 0, S same-side EWMA (fill share in brackets):'); display(pd.DataFrame({c_: [f'{v:+.2f}  ({f_:.0%} filled)' if np.isfinite(v) else '' for v, f_ in zip(cmS[c_], cfS[c_])] for c_ in cmS.columns}, index=cmS.index))
+
+    # ---- figures
+    fig, ax = plt.subplots(1, 2, figsize=(15, 4.8))
+    for a, sd_ in zip(ax, ['P dealer buys (bid)', 'S dealer sells (offer)']):
+        t_ = adverse.loc[sd_]; cols = ['edge at our quote (bp)'] + [f'mark move after, h={h} (bp)' for h in CFG.markout_horizons[1:]]
+        x = np.arange(len(cols)); w = 0.38
+        a.bar(x - w / 2, t_.loc['would have filled', cols], w, color='#2E8B57', label=f'would have filled ({t_.loc["would have filled", "share"]:.0%} of prints)')
+        a.bar(x + w / 2, t_.loc['would have missed', cols], w, color='#C44E52', label=f'would have missed ({t_.loc["would have missed", "share"]:.0%})')
+        a.axhline(0, color='k', lw=0.6); a.set_xticks(x); a.set_xticklabels(['edge at quote\n(vs same-day eval)'] + [f'mark move\nafter {h}d' for h in CFG.markout_horizons[1:]], fontsize=8)
+        a.set_title(f'{sd_}: what the fills earn at the quote, and what the mark does next (bp)', fontsize=10); a.legend(fontsize=8); a.set_ylabel('bp, oriented (+ = good for the dealer)')
+    fig.suptitle('Adverse selection under the algo quote: the prints we would have won versus the ones we would have missed', fontsize=11); plt.tight_layout(); savefig('11_markout_adverse_selection')
+
+    fig, ax = plt.subplots(1, 2, figsize=(17, 6.2))
+    rr_plot = rr_all.sort_values('$ per month ($k)')
+    cols_ = ['#2E8B57' if v >= rr_all.loc['S same-side EWMA', '$ per month ($k)'] else '#8C8C8C' for v in rr_plot['$ per month ($k)']]
+    ax[0].barh(np.arange(len(rr_plot)), rr_plot['$ per month ($k)'], color=cols_); ax[0].set_yticks(np.arange(len(rr_plot))); ax[0].set_yticklabels([f'{i}   [MAE rank {int(r)}]' for i, r in zip(rr_plot.index, rr_plot['MAE rank'])], fontsize=7)
+    ax[0].axvline(rr_all.loc['A algo quote', '$ per month ($k)'], color='k', ls='--', lw=0.8, label='algo quote'); ax[0].axvline(rr_all.loc['S same-side EWMA', '$ per month ($k)'], color='#4C72B0', ls=':', lw=1.0, label='S same-side EWMA')
+    ax[0].set_title(f'Would-have-filled P&L per month ($k), marked {HR} days after the trade; green = at or above S', fontsize=10); ax[0].set_xlabel('$k per month'); ax[0].legend(fontsize=8, loc='lower right')
+    comp = pd.DataFrame({'edge at quote x fill share': rr_plot['edge at quote | fill (bp)'] * rr_plot['fill share'], 'mark move after x fill share': rr_plot['mark move after | fill (bp)'] * rr_plot['fill share']})
+    comp.plot.barh(ax=ax[1], stacked=True, color=['#4C72B0', '#DD8452']); ax[1].plot(rr_plot['P&L per print (bp)'], np.arange(len(rr_plot)), 'kD', ms=4, label='P&L per print')
+    ax[1].axvline(0, color='k', lw=0.6); ax[1].set_yticklabels([]); ax[1].set_title('P&L per print (bp) = edge earned at the quote + mark move after the trade, both times the fill share', fontsize=10); ax[1].legend(fontsize=8)
+    plt.tight_layout(); savefig('11_markout_rerank')
+
+    fig, ax = plt.subplots(2, 3, figsize=(19, 8.6))
+    for i, sd_ in enumerate(['P', 'S']):
+        for j, (col, ttl) in enumerate([('fill share', 'fill share'), ('P&L | fill (bp)', 'P&L per fill (bp)'), ('P&L per print (bp)', 'P&L per print (bp) = the objective')]):
+            a = ax[i, j]
+            for k_, col_ in zip(CURVE_MIDS, ['#4C72B0', '#2E8B57', '#DD8452', '#C44E52', '#8172B2', '#937860']):
+                c_ = curves[(curves['mid'] == k_) & (curves['side'] == sd_)]
+                a.plot(c_['delta (bp)'], c_[col], marker='.', color=col_, label=k_)
+                if j == 2 and c_[col].notna().any():
+                    bd_ = c_.loc[c_[col].idxmax()]; a.plot(bd_['delta (bp)'], bd_[col], 'o', ms=9, mfc='none', mec=col_, mew=1.5)
+            a.axvline(0, color='k', lw=0.6); a.axhline(0, color='k', lw=0.4); a.set_title(f'{ {"P": "P dealer buys (bid)", "S": "S dealer sells (offer)"}[sd_] }: {ttl}', fontsize=10); a.set_xlabel('concession delta (bp; negative = more aggressive than the mid)')
+            if i == 0 and j == 0:
+                a.legend(fontsize=7)
+    fig.suptitle(f'Fill curve and expected P&L against the concession, marked {HR} days after the trade (circle = best delta on the full window)', fontsize=11); plt.tight_layout(); savefig('11_markout_curves')
+
+    fig, ax = plt.subplots(1, 3, figsize=(19, 5.2))
+    for a, (tab, ftab, ttl) in zip(ax[:2], [(cmA, cfA, 'A algo quote'), (cmS, cfS, 'S same-side EWMA')]):
+        v = np.nanmax(np.abs(tab.to_numpy(float))) or 1.0
+        im = a.imshow(tab.to_numpy(float), cmap='RdYlGn', aspect='auto', vmin=-v, vmax=v); a.set_xticks(range(tab.shape[1])); a.set_xticklabels([{'P': 'P bid', 'S': 'S offer'}.get(c_, c_) for c_ in tab.columns]); a.set_yticks(range(len(tab))); a.set_yticklabels(tab.index, fontsize=8); a.grid(False)
+        for r_ in range(tab.shape[0]):
+            for c_ in range(tab.shape[1]):
+                x = tab.iloc[r_, c_]; f_ = ftab.iloc[r_, c_]
+                if np.isfinite(x):
+                    a.text(c_, r_, f'{x:+.1f}\n({f_:.0%} filled)', ha='center', va='center', fontsize=8)
+        a.set_title(f'{ttl}: P&L per print (bp) by quantity bin and side', fontsize=10)
+    plt.colorbar(im, ax=ax[1], fraction=0.046)
+    dstar_last.plot.bar(ax=ax[2], color=['#4C72B0', '#DD8452']); ax[2].axhline(0, color='k', lw=0.6); ax[2].set_title(f'delta* per side x quantity bin, {dstar["month"].max()} (bp)', fontsize=10); ax[2].set_xlabel(''); ax[2].legend(['P bid', 'S offer'], fontsize=8); ax[2].tick_params(axis='x', rotation=30, labelsize=8)
+    plt.tight_layout(); savefig('11_markout_size_side')
+
+    mo[['_id', 'cusip', 'trade_date', 'side', 'qty_group', 'par', 'dollar_per_bp'] + [f'pm_{h}' for h in CFG.markout_horizons] + [f'y_mark_{h}' for h in CFG.markout_horizons] + list(PREDS.values())].to_parquet(ARTIFACTS / 'markout_v4.parquet', index=False)
+    record('markout', horizons=list(CFG.markout_horizons), record_h=HR, months=months_mo, prints=int(len(mo)), adverse_selection=flat_records(adverse.reset_index()), rerank=rr_all.round(4).reset_index().to_dict(orient='records'),
+           rerank_by_side={'P': rr_P.round(4).reset_index().to_dict(orient='records'), 'S': rr_S.round(4).reset_index().to_dict(orient='records')}, curves=curves.round(4).to_dict(orient='records'),
+           best_delta_full_window=best_delta.round(4).reset_index().to_dict(orient='records'), concession=concession.round(4).reset_index().to_dict(orient='records'), delta_star=dstar.round(4).to_dict(orient='records'),
+           size_side={'S': flat_records(cmS.reset_index()), 'A': flat_records(cmA.reset_index()), 'fill_S': flat_records(cfS.reset_index())})
 else:
     print('Section 11 skipped: needs Section 10.')
 
 # %% [markdown]
-# ## 12. Where the gains live: breakdown by characteristics, factor betas and beta-space clusters
+# ## 12. Quantile grid: the conditional distribution the optimizer consumes
 #
-# The research question is not whether the whole universe improves but *where* the improvement concentrates, in
-# the model's own coordinates. Every bond-day carries its characteristics, its three factor betas and a
-# point-in-time beta-space cluster; every trade inherits them from its residual date. Four views, all on the same
-# segmentation: (1) the error-correction gain of the same-side memory (S) and the level model (D) over the algo
-# by segment, with a duration-by-call heatmap and the top characteristic cells; (2) whether the algo's error
-# loads on the factor betas at all, before and after correction, which is the direct tie between the pricing
-# layer and the factor model; (3) the record residual signal within each cluster (hedged Sharpe, IC, trade test);
-# (4) the factor roll-forward by segment, in Section 13.
+# The optimizer needs more than a point mid: for each quote it needs the distribution of where the print will land
+# relative to the quote, because the fill probability at a concession $\delta$ is one minus that distribution's
+# CDF at $\delta$, and the bias is its median. This section estimates that distribution as a **grid of quantiles of
+# the oriented error of S** by side x desk quantity bin x beta-space cluster, on prior held-out months, shrunk
+# toward the side x size marginal with weight $n / (n + k)$ where a cell is thin. It is evaluated the only way a
+# quantile should be: by the realised share of test prints below each predicted quantile (calibration), by side.
+# A well-calibrated grid is the fill curve of Section 11 in closed form. The final grid, estimated on every
+# held-out month, is written to `artifacts_v3/quote_quantile_grid.parquet` with its cell sizes and shrinkage
+# weights, together with the marginal side x size grid as the fallback.
+
+# %%
+if HAS_TRADES and 'mo' in globals() and not mo.empty:
+    TAUS = list(CFG.grid_taus)
+    mo['cluster_id'] = mo['beta_cluster'].astype('Int64').astype(str).replace('<NA>', 'NA') if 'beta_cluster' in mo.columns else 'NA'
+    mo['o_S'] = mo['s'] * mo['e_S_bp']; mo['o_A'] = mo['s'] * mo['e_algo_bp']
+    CELL = ['side', 'qty_group', 'cluster_id']
+
+    def build_grid(train: pd.DataFrame, ocol: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+        cell = train.groupby(CELL, observed=True)[ocol].quantile(TAUS).unstack(); cell.columns = TAUS
+        n = train.groupby(CELL, observed=True).size().reindex(cell.index).fillna(0.0)
+        marg = train.groupby(['side', 'qty_group'], observed=True)[ocol].quantile(TAUS).unstack(); marg.columns = TAUS
+        w = n / (n + CFG.grid_shrink_k)
+        m2 = marg.reindex(pd.MultiIndex.from_arrays([cell.index.get_level_values(0), cell.index.get_level_values(1)])); m2.index = cell.index
+        g = cell.mul(w, axis=0) + m2.mul(1.0 - w, axis=0)
+        g['n'] = n; g['shrink_w'] = w
+        return g, marg
+
+    def lookup(g: pd.DataFrame, marg: pd.DataFrame, te: pd.DataFrame) -> np.ndarray:
+        key = pd.MultiIndex.from_arrays([te['side'].astype(str).to_numpy(), te['qty_group'].astype(str).to_numpy(), te['cluster_id'].astype(str).to_numpy()])
+        q = g.reindex(key)[TAUS].to_numpy(float)
+        qm = marg.reindex(pd.MultiIndex.from_arrays([te['side'].astype(str).to_numpy(), te['qty_group'].astype(str).to_numpy()]))[TAUS].to_numpy(float)
+        miss = ~np.isfinite(q[:, 0])
+        q[miss] = qm[miss]
+        return q
+
+    cal_rows, fill_rows = [], []
+    months_g = sorted(mo['month'].unique())
+    for m in months_g[1:]:
+        tr, te = mo[mo['month'] < m], mo[mo['month'] == m]
+        if len(tr) < 5_000 or te.empty:
+            continue
+        g, marg = build_grid(tr, 'o_S'); q = lookup(g, marg, te); o = te['o_S'].to_numpy(float)
+        for j, tau in enumerate(TAUS):
+            for sd_ in ['P', 'S']:
+                msk = (te['side'] == sd_).to_numpy() & np.isfinite(q[:, j]) & np.isfinite(o)
+                if msk.sum() >= 200:
+                    cal_rows.append({'month': str(m), 'side': sd_, 'tau': tau, 'realised share below q_tau': float((o[msk] <= q[msk, j]).mean()), 'n': int(msk.sum())})
+    calib = pd.DataFrame(cal_rows)
+    if len(calib):
+        cal_tab = calib.groupby(['side', 'tau'])['realised share below q_tau'].mean().unstack('tau'); cal_tab.columns = [f'tau {t:.2f}' for t in cal_tab.columns]
+        cal_month = calib.pivot_table(index='month', columns='side', values='realised share below q_tau', aggfunc=lambda x: float(np.mean(np.abs(x - calib.loc[x.index, 'tau']))))
+        print('Calibration of the quantile grid on the next month (realised share of prints below the predicted quantile; a calibrated grid reads the column header):'); display(cal_tab.round(3))
+        print('Mean absolute calibration error by month and side:'); display(cal_month.round(3))
+    # the final grid on every held-out month, the deliverable
+    g_final, marg_final = build_grid(mo, 'o_S'); g_A, marg_A = build_grid(mo, 'o_A')
+    grid_long = g_final.reset_index().melt(id_vars=CELL + ['n', 'shrink_w'], value_vars=TAUS, var_name='tau', value_name='q_bp').assign(quote='S same-side EWMA')
+    grid_long_A = g_A.reset_index().melt(id_vars=CELL + ['n', 'shrink_w'], value_vars=TAUS, var_name='tau', value_name='q_bp').assign(quote='A algo quote')
+    pd.concat([grid_long, grid_long_A], ignore_index=True).to_parquet(ARTIFACTS / 'quote_quantile_grid.parquet', index=False)
+    marg_out = pd.concat({'S same-side EWMA': marg_final, 'A algo quote': marg_A}, names=['quote']).reset_index()
+    marg_out.to_parquet(ARTIFACTS / 'quote_quantile_grid_marginal.parquet', index=False)
+    med = marg_final[0.5].unstack('side').reindex(QTY_LABELS); iqr = (marg_final[0.75] - marg_final[0.25]).unstack('side').reindex(QTY_LABELS)
+    print('The marginal grid for S by side x quantity bin: median oriented error (bp; positive = the print lands on the aggressive side of the quote, i.e. the quote is too generous) and the interquartile width:')
+    display(pd.concat({'median (bp)': med, 'IQR width (bp)': iqr}, axis=1).round(2))
+    fig, ax = plt.subplots(1, 3, figsize=(19, 5))
+    if len(calib):
+        for sd_, c_ in [('P', '#4C72B0'), ('S', '#DD8452')]:
+            t_ = calib[calib['side'] == sd_].groupby('tau')['realised share below q_tau'].mean()
+            ax[0].plot(t_.index, t_.values, marker='o', color=c_, label={'P': 'P dealer buys (bid)', 'S': 'S dealer sells (offer)'}[sd_])
+        ax[0].plot([0, 1], [0, 1], 'k--', lw=0.8); ax[0].set_xlabel('nominal quantile tau'); ax[0].set_ylabel('realised share of next-month prints below q_tau'); ax[0].set_title('Calibration of the grid out of sample (on the diagonal = calibrated)', fontsize=10); ax[0].legend(fontsize=8)
+    else:
+        ax[0].text(0.5, 0.5, 'calibration needs at least two held-out months\nbefore the test month', ha='center', va='center', fontsize=10, transform=ax[0].transAxes); ax[0].set_axis_off()
+    x = np.arange(len(med))
+    for sd_, c_ in [('P', '#4C72B0'), ('S', '#DD8452')]:
+        if sd_ in med.columns:
+            q25 = marg_final[0.25].unstack('side').reindex(QTY_LABELS)[sd_]; q75 = marg_final[0.75].unstack('side').reindex(QTY_LABELS)[sd_]
+            ax[1].fill_between(x, q25, q75, color=c_, alpha=0.15); ax[1].plot(x, med[sd_], marker='o', color=c_, lw=1.8, label={'P': 'P bid: median (line), 25th to 75th (band)', 'S': 'S offer: median (line), 25th to 75th (band)'}[sd_])
+    ax[1].axhline(0, color='k', lw=0.6); ax[1].set_xticks(x); ax[1].set_xticklabels(med.index, rotation=30, fontsize=8); ax[1].set_title('Oriented error of S by quantity bin and side: where the print lands relative to the quote', fontsize=10); ax[1].set_ylabel('bp (positive = print on the aggressive side of the quote)'); ax[1].legend(fontsize=8)
+    _ex = g_final.reset_index(); _ex = _ex[_ex['side'] == 'P']
+    _piv = _ex.pivot_table(index='qty_group', columns='cluster_id', values=0.5).reindex(QTY_LABELS)
+    im = ax[2].imshow(_piv.to_numpy(float), cmap='RdYlGn_r', aspect='auto'); ax[2].set_xticks(range(_piv.shape[1])); ax[2].set_xticklabels([f'C{c_}' for c_ in _piv.columns], fontsize=8); ax[2].set_yticks(range(len(_piv))); ax[2].set_yticklabels(_piv.index, fontsize=8); ax[2].grid(False)
+    for r_ in range(_piv.shape[0]):
+        for c_ in range(_piv.shape[1]):
+            v = _piv.iloc[r_, c_]
+            if np.isfinite(v):
+                ax[2].text(c_, r_, f'{v:+.1f}', ha='center', va='center', fontsize=7)
+    ax[2].set_title('Median oriented error of S on the bid, by quantity bin x beta-space cluster (bp, shrunk grid)', fontsize=10); plt.colorbar(im, ax=ax[2], fraction=0.046)
+    plt.tight_layout(); savefig('12_quantile_grid')
+    record('quantile_grid', taus=TAUS, cells=int(len(g_final)), calibration=cal_tab.round(4).reset_index().to_dict(orient='records') if len(calib) else [], calibration_error_by_month=cal_month.round(4).reset_index().to_dict(orient='records') if len(calib) else [],
+           marginal_median=flat_records(med.reset_index()), marginal_iqr=flat_records(iqr.reset_index()))
+else:
+    print('Section 12 skipped: needs Section 11.')
+
+# %% [markdown]
+# ## 13. Where the gains live: the MAE breakdowns, kept for reference
+#
+# The accuracy view by segment, kept because the desk gates rules by segment and because Section 11 shows where
+# the MAE gain and the dollar gain disagree. Every trade inherits its characteristics, its three factor betas
+# and a point-in-time beta-space cluster from its residual date. Two views: (1) the MAE gain of the same-side
+# memory S, the size-intercept rule SQ and the level model D over the algo by segment, with a duration-by-call
+# heatmap and the top characteristic cells; (2) whether the algo's error loads on the factor betas before and
+# after correction. The factor roll-forward by segment is in Section 14.
 
 # %%
 if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
@@ -2399,7 +2648,7 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
         bk[f'beta{j+1}_tercile'] = bk.groupby('trade_date', observed=True)[f'beta{j+1}'].transform(lambda s: pd.qcut(s.rank(method='first'), 3, labels=['low', 'mid', 'high']).astype(str) if s.notna().sum() > 30 else 'NA')
     bk['cluster'] = bk['beta_cluster'].map(CLUSTER_LABEL).fillna('NA')
     bk['side_label'] = bk['side'].map({'P': 'P dealer buys (bid)', 'S': 'S dealer sells (offer)', 'D': 'D inter-dealer'}).fillna(bk['side'].astype(str))
-    MIDS_BK = {'A algo quote': 'e_algo_bp', 'C side-pooled EWMA': 'e_C_bp', 'S same-side memory': 'e_S_bp', 'K per-side state-space memory': 'e_K_bp', 'D level model': 'e_D_bp'}
+    MIDS_BK = {'A algo quote': 'e_algo_bp', 'C side-pooled EWMA': 'e_C_bp', 'S same-side memory': 'e_S_bp', 'SQ same-side memory + size intercept': 'e_SQ_bp', 'K per-side state-space memory': 'e_K_bp', 'D level model': 'e_D_bp'}
 
     def gain_table(frame: pd.DataFrame, by: str, n_min: int) -> pd.DataFrame:
         g = frame.groupby(by, observed=True); out = pd.DataFrame({'n': g.size()})
@@ -2443,134 +2692,22 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
         cl[['gain S (bp)', 'gain D (bp)']].plot.barh(ax=ax[1]); ax[1].axvline(0, color='k', lw=0.6); ax[1].set_title('Gain over the algo by beta-space cluster (bp)', fontsize=10); ax[1].set_ylabel(''); ax[1].legend(['S same-side memory', 'D level model'], fontsize=8); ax[1].tick_params(axis='y', labelsize=8)
     bl = beta_loading[beta_loading['mid'].isin(['A algo quote', 'S same-side memory', 'D level model'])].pivot(index='score', columns='mid', values='fm_beta').reindex(beta_cols)
     bl.plot.bar(ax=ax[2]); ax[2].axhline(0, color='k', lw=0.6); ax[2].set_title('FM loading of the pricing error on each factor beta (bp per unit beta)', fontsize=10); ax[2].set_xlabel(''); ax[2].legend(fontsize=8)
-    savefig('12_where_the_gains_live')
-    # (3) the record residual signal within each cluster
-    rec_name = next(k for k in signals if (k.startswith('State-space') and ('pooled' in k) == (CFG.record_signal == 'pooled')))
-    sig = signals[rec_name].merge(resid[['cusip', 'date', 'beta_cluster']], on=['cusip', 'date'], how='left')
-    sig['cluster'] = sig['beta_cluster'].map(CLUSTER_LABEL)
-    sig_rows = []
-    for c, g in sig.groupby('cluster'):
-        if len(g) < CFG.n_min_cell:
-            continue
-        ic = ic_summary(daily_rank_ic(g, 'yhat', 'next_residual'))
-        sig_rows.append({'cluster': c, 'bond_days': len(g), 'rank IC': ic['ic_mean'], 'IC t': ic['ic_t'], 'hedged Sharpe (within cluster)': sharpe(portfolio_pnl(g))})
-    sig_cluster = pd.DataFrame(sig_rows, columns=['cluster', 'bond_days', 'rank IC', 'IC t', 'hedged Sharpe (within cluster)']).set_index('cluster')
-    if 'ssm_rank' in tv.columns and len(sig_cluster):
-        tvc = tv.copy(); tvc['cluster'] = tvc['beta_cluster'].map(CLUSTER_LABEL)   # beta_cluster already rides on the trade frame from the residual join
-        fmc = {c: fm_slope(g, 'e_mark_bp', 'ssm_rank', CONTROLS) for c, g in tvc.dropna(subset=['ssm_rank']).groupby('cluster') if len(g) >= CFG.n_min_cell}
-        sig_cluster['trade - mark on signal (FM bp/rank)'] = pd.Series({c: v['fm_beta'] for c, v in fmc.items()}); sig_cluster['FM t'] = pd.Series({c: v['fm_t'] for c, v in fmc.items()})
-    print(f'Record residual signal ({rec_name}) within beta-space clusters:'); display(sig_cluster.round(3))
-    fig, ax = plt.subplots(1, 2, figsize=(15, 4.6))
-    if len(sig_cluster):
-        sig_cluster['hedged Sharpe (within cluster)'].plot.barh(ax=ax[0], color='#4C72B0'); ax[0].axvline(0, color='k', lw=0.6); ax[0].set_title('Record signal: hedged Sharpe within each beta-space cluster', fontsize=10); ax[0].set_ylabel(''); ax[0].tick_params(axis='y', labelsize=8)
-        sig_cluster['rank IC'].plot.barh(ax=ax[1], color='#55A868')
-    ax[1].axvline(0, color='k', lw=0.6); ax[1].set_title('Record signal: next-day rank IC within each cluster', fontsize=10); ax[1].set_ylabel(''); ax[1].tick_params(axis='y', labelsize=8)
-    savefig('12_signal_by_cluster')
-    record('breakdown', segments={k: v.round(4).reset_index().to_dict(orient='records') for k, v in seg_tables.items()}, top_cells=cells.head(10).round(4).reset_index().to_dict(orient='records'), beta_loading=beta_loading.round(4).to_dict(orient='records'), signal_by_cluster=sig_cluster.round(4).reset_index().to_dict(orient='records'))
+    savefig('13_where_the_gains_live')
+    record('breakdown', segments={k: v.round(4).reset_index().to_dict(orient='records') for k, v in seg_tables.items()}, top_cells=cells.head(10).round(4).reset_index().to_dict(orient='records'), beta_loading=beta_loading.round(4).to_dict(orient='records'))
 else:
-    print('Section 12 skipped: needs Section 10.')
-
-# %% [markdown]
-# ### 12a. The achievement map: top gains by characteristic, factor and cluster
-#
-# The tables above carry every column; this block is the view for a slide. Bars are the gain of the revised third
-# term F over the algo quote (bp of MAE against the print, daily Fama-MacBeth mean) with a 95% band from the FM t;
-# the diamond is the level model D, the ceiling. Labels carry the share of held-out trades. Three views: the ten
-# best segments across every axis next to the ten best and five worst characteristic cells; one panel per
-# characteristic axis; and the gains in the model's own coordinates, the factor-beta terciles. The scorecard at
-# the end is the one-table version: best and worst segment on each axis.
-
-# %%
-if HAS_TRADES and 'seg_tables' in globals() and seg_tables:
-    GREEN, RED, INK = '#2E8B57', '#C44E52', '#222222'
-
-    def _se(tab: pd.DataFrame, col: str = 'S') -> pd.Series:
-        t = tab[f't {col}'].replace(0, np.nan)
-        return (tab[f'gain {col} (bp)'] / t).abs().fillna(0.0)
-
-    def gain_bars(ax, tab: pd.DataFrame, title: str, order: list | None = None, show_d: bool = True, label_share: bool = True) -> pd.DataFrame:
-        t = tab.reindex(order) if order is not None else tab.sort_values('gain S (bp)')
-        t = t.dropna(subset=['gain S (bp)'])
-        y = np.arange(len(t)); g = t['gain S (bp)'].to_numpy(float); se = _se(t).to_numpy(float)
-        ax.barh(y, g, color=[GREEN if v >= 0 else RED for v in g], xerr=1.96 * se, error_kw={'ecolor': INK, 'lw': 0.8, 'capsize': 2}, alpha=0.9, label='S same-side memory (95% band)')
-        if show_d and 'gain D (bp)' in t.columns:
-            ax.plot(t['gain D (bp)'].to_numpy(float), y, 'D', color=INK, ms=4, label='D level model (ceiling)')
-        ax.axvline(0, color=INK, lw=0.6); ax.set_yticks(y)
-        ax.set_yticklabels([f'{i}  ({s:.0%})' if label_share else str(i) for i, s in zip(t.index, t['share of trades'])], fontsize=8)
-        ax.set_title(title, fontsize=10); ax.set_xlabel('gain over the algo quote, bp of MAE against the print', fontsize=8); ax.grid(axis='x', alpha=0.3)
-        span = max(np.nanmax(np.abs(g) + 1.96 * se), 1e-9)
-        for yi, v, s in zip(y, g, se):
-            ax.text(v + (1.96 * s + 0.03 * span) * (1 if v >= 0 else -1), yi, f'{v:+.2f}', va='center', ha='left' if v >= 0 else 'right', fontsize=7)
-        return t
-
-    # (1) the ten best segments across every axis, and the ten best / five worst characteristic cells
-    AX_LABEL = {'duration bucket': 'dur', 'call structure': 'call', 'rating bucket': 'rating', 'state bucket': 'state', 'liquidity quintile': 'liq', 'beta-space cluster': 'cluster', 'beta1 tercile': 'beta1', 'beta2 tercile': 'beta2', 'beta3 tercile': 'beta3', 'MSRB side': 'side'}
-    allseg = pd.concat([v.set_index(v.index.map(lambda i, k=k: f'{AX_LABEL.get(k, k)}: {i}')) for k, v in seg_tables.items() if len(v)])
-    top_seg = allseg.sort_values('gain S (bp)', ascending=False).head(10)
-    cells_show = pd.concat([cells.head(10), cells.tail(5)])
-    cells_show.index = [f'{i}   [MAE {a:.1f} -> {f:.1f}]' for i, a, f in zip(cells_show.index, cells_show['MAE A'], cells_show['MAE S'])]
-    fig, ax = plt.subplots(1, 2, figsize=(19, 6.4))
-    gain_bars(ax[0], top_seg, 'Ten best segments across every axis'); ax[0].legend(fontsize=8, loc='lower right')
-    gain_bars(ax[1], cells_show, f'Ten best and five worst duration x call x rating cells (>= {CFG.n_min_cell:,} trades)', order=list(cells_show.index[::-1]))
-    ax[1].axhline(4.5, color='#888888', lw=0.8, ls='--')
-    fig.suptitle('Where the error-correction gains live (share of held-out trades in brackets)', fontsize=12); plt.tight_layout(); savefig('12a_top_gains')
-
-    # (2) one panel per characteristic axis
-    axes_show = [k for k in ['duration bucket', 'call structure', 'rating bucket', 'MSRB side', 'trade size', 'industry', 'state bucket', 'liquidity quintile', 'beta-space cluster'] if k in seg_tables and len(seg_tables[k])]
-    ORDERS = {'duration bucket': ['<1', '1-2.5', '2.5-4', '4-6', '6-8', '8-11', '>11'], 'liquidity quintile': ['Q1 illiquid', 'Q2', 'Q3', 'Q4', 'Q5 liquid'], 'MSRB side': ['P dealer buys (bid)', 'S dealer sells (offer)', 'D inter-dealer'], 'trade size': QTY_LABELS}
-    _nr = max(1, int(np.ceil(len(axes_show) / 3)))
-    fig, axs = plt.subplots(_nr, 3, figsize=(20, 5 * _nr), squeeze=False); axs = axs.ravel()
-    for a, k in zip(axs, axes_show):
-        order = [o for o in ORDERS.get(k, []) if o in seg_tables[k].index]
-        gain_bars(a, seg_tables[k], f'By {k}', order=order[::-1] if order else None)
-    for a in axs[len(axes_show):]:
-        a.set_visible(False)
-    if axes_show:
-        axs[0].legend(fontsize=8, loc='lower right')
-    fig.suptitle('Gain of the same-side memory over the algo quote by characteristic (bars, 95% band) and the level model (diamond)', fontsize=12); plt.tight_layout(); savefig('12a_gain_by_characteristic')
-
-    # (3) the model's own coordinates: factor-beta terciles
-    terc = [k for k in ['beta1 tercile', 'beta2 tercile', 'beta3 tercile'] if k in seg_tables and len(seg_tables[k])]
-    if terc:
-        FACTOR_NAME = {'beta1 tercile': 'Level beta (beta1) tercile', 'beta2 tercile': 'Slope beta (beta2) tercile', 'beta3 tercile': 'Yield-tilt beta (beta3) tercile'}
-        fig, axs = plt.subplots(1, len(terc), figsize=(6.4 * len(terc), 4.6), squeeze=False); axs = axs.ravel()
-        for a, k in zip(axs, terc):
-            tab = seg_tables[k].reindex([o for o in ['low', 'mid', 'high'] if o in seg_tables[k].index])
-            x = np.arange(len(tab)); w = 0.36
-            a.bar(x - w / 2, tab['gain S (bp)'], w, yerr=1.96 * _se(tab), color=[GREEN if v >= 0 else RED for v in tab['gain S (bp)']], capsize=3, label='S same-side memory')
-            a.bar(x + w / 2, tab['gain D (bp)'], w, color='#8C8C8C', label='D level model')
-            a.axhline(0, color=INK, lw=0.6); a.set_xticks(x); a.set_xticklabels([f'{i}\n(algo MAE {m:.1f} bp, {s:.0%})' for i, m, s in zip(tab.index, tab['MAE A'], tab['share of trades'])], fontsize=8)
-            a.set_title(FACTOR_NAME.get(k, k), fontsize=10); a.set_ylabel('gain over the algo (bp)', fontsize=8); a.grid(axis='y', alpha=0.3)
-            for xi, v in zip(x, tab['gain S (bp)']):
-                a.text(xi - w / 2, v, f'{v:+.2f}', ha='center', va='bottom' if v >= 0 else 'top', fontsize=8)
-        axs[0].legend(fontsize=8)
-        fig.suptitle('Gains in factor coordinates: factor-beta terciles, point-in-time within each trade date', fontsize=11); plt.tight_layout(); savefig('12a_gain_by_factor')
-
-    # scorecard: best and worst segment on each axis, the one-table version for a slide
-    rows = []
-    for k, v in seg_tables.items():
-        if v.empty or v['gain S (bp)'].isna().all():
-            continue
-        b, w = v['gain S (bp)'].idxmax(), v['gain S (bp)'].idxmin()
-        rows.append({'axis': k, 'best segment': b, 'gain S (bp)': v.loc[b, 'gain S (bp)'], 't': v.loc[b, 't S'], 'share': v.loc[b, 'share of trades'], 'algo MAE': v.loc[b, 'MAE A'], 'gain D (bp)': v.loc[b, 'gain D (bp)'],
-                     'worst segment': w, 'worst gain S (bp)': v.loc[w, 'gain S (bp)'], 'worst t': v.loc[w, 't S'], 'worst share': v.loc[w, 'share of trades']})
-    scorecard = pd.DataFrame(rows).set_index('axis')
-    print('Scorecard: best and worst segment on each axis by the gain of the same-side memory (the slide table):'); display(scorecard.round(2))
-    record('achievement_map', top_segments=top_seg.round(4).reset_index().to_dict(orient='records'), scorecard=scorecard.round(4).reset_index().to_dict(orient='records'))
-else:
-    print('Section 12a skipped: needs Section 12.')
+    print('Section 13 skipped: needs Section 10.')
 
 # %% [markdown]
 # #### By MSRB side: bid, offer and inter-dealer
 #
-# The same gains split by the side of the print: P is a dealer purchase from a customer (our bid), S a dealer
-# sale to a customer (our offer), D an inter-dealer trade. The side is also an axis in the tables and charts
-# above; here it is crossed with the characteristics, because a correction that helps on the bid in one
-# segment and hurts on the offer in another has to be gated by both. Cells are the gain of the revised third
-# term F in bp; an asterisk marks |FM t| >= 2. The last figure is the five best cells on each side.
+# The same MAE gains split by the side of the print: P is a dealer purchase from a customer (our bid), S a dealer
+# sale to a customer (our offer), D an inter-dealer trade. A correction that helps on the bid in one segment and
+# hurts on the offer in another has to be gated by both. Cells are the gain of the same-side memory S in bp, the
+# level model D in brackets; an asterisk marks |FM t| >= 2.
 
 # %%
 if HAS_TRADES and 'seg_tables' in globals() and seg_tables and 'side_label' in bk.columns:
+    ORDERS = {'duration bucket': ['<1', '1-2.5', '2.5-4', '4-6', '6-8', '8-11', '>11'], 'liquidity quintile': ['Q1 illiquid', 'Q2', 'Q3', 'Q4', 'Q5 liquid'], 'MSRB side': ['P dealer buys (bid)', 'S dealer sells (offer)', 'D inter-dealer'], 'trade size': QTY_LABELS}
     SIDES = [s for s in ['P dealer buys (bid)', 'S dealer sells (offer)', 'D inter-dealer'] if s in bk['side_label'].unique()]
     SIDE_AXES = {'duration bucket': 'dur_bucket', 'call structure': 'call_structure', 'rating bucket': 'rating_bucket', 'beta-space cluster': 'cluster', 'liquidity quintile': 'liq_q', 'trade size': 'qty_group', 'industry': 'industry_bucket'}
     side_tabs = {}
@@ -2603,87 +2740,14 @@ if HAS_TRADES and 'seg_tables' in globals() and seg_tables and 'side_label' in b
                     if np.isfinite(v):
                         a.text(j, i, f'{v:+.2f}' + ('*' if np.isfinite(tt) and abs(tt) >= 2 else ''), ha='center', va='center', fontsize=8, fontweight='bold' if np.isfinite(tt) and abs(tt) >= 2 else 'normal')
         plt.colorbar(im, ax=axs[-1], fraction=0.046, label='gain S over the algo (bp)')
-        fig.suptitle('Gain of the same-side memory by characteristic and MSRB side (P = bid, S = offer, D = inter-dealer; * = |FM t| >= 2)', fontsize=11); plt.tight_layout(); savefig('12a_gain_by_side_heatmap')
-    # the five best cells on each side
-    side_cells = {}
-    fig, axs = plt.subplots(1, len(SIDES), figsize=(6.6 * len(SIDES), 4.8), squeeze=False); axs = axs.ravel()
-    for a, s in zip(axs, SIDES):
-        cs = gain_table(bk[bk['side_label'] == s], 'cell', CFG.n_min_cell).sort_values('gain S (bp)', ascending=False)
-        side_cells[s] = cs
-        top = cs.head(5).copy(); top.index = [f'{i}  [MAE {x:.1f} -> {y:.1f}]' for i, x, y in zip(top.index, top['MAE A'], top['MAE S'])]
-        if len(top):
-            gain_bars(a, top, f'{s}: five best cells', order=list(top.index[::-1]))
-        else:
-            a.set_title(f'{s}: no cell with >= {CFG.n_min_cell:,} trades', fontsize=10)
-            a.set_axis_off()
-    axs[0].legend(fontsize=8, loc='lower right')
-    fig.suptitle('Five best duration x call x rating cells on each side (bars F with 95% band, diamond D)', fontsize=11); plt.tight_layout(); savefig('12a_top_cells_by_side')
-    for s, cs in side_cells.items():
-        print(f'Top five and bottom three cells, {s}:'); display(pd.concat([cs.head(5), cs.tail(3)])[['n', 'MAE A', 'MAE S', 'MAE D', 'gain S (bp)', 't S', 'gain D (bp)', 't D', 'share of trades']].round(3))
+        fig.suptitle('Gain of the same-side memory by characteristic and MSRB side (P = bid, S = offer, D = inter-dealer; * = |FM t| >= 2)', fontsize=11); plt.tight_layout(); savefig('13_gain_by_side_heatmap')
     record('achievement_by_side', side_summary=side_all.round(4).reset_index().to_dict(orient='records'),
-           by_axis={k: {m: v[m].round(4).reset_index().to_dict(orient='records') for m in ['gain S', 't S', 'gain D', 'n']} for k, v in side_tabs.items()},
-           top_cells={s: cs.head(5).round(4).reset_index().to_dict(orient='records') for s, cs in side_cells.items()})
+           by_axis={k: {m: v[m].round(4).reset_index().to_dict(orient='records') for m in ['gain S', 't S', 'gain D', 'n']} for k, v in side_tabs.items()})
 else:
-    print('Side breakdown skipped: needs Section 12a.')
+    print('Side breakdown skipped: needs Section 13.')
 
 # %% [markdown]
-# ### 12b. What the gains are worth: par- and DV01-weighted error removed
-#
-# A basis point of yield error is not a dollar until it is multiplied by the trade's par and the bond's dollar
-# duration. For every held-out trade the dollar value of one basis point is par x price / 100 x modified duration
-# x 0.0001, and the dollar error removed by a mid is (|algo error| - |mid error|) x that value. Summed by month and
-# by segment this is the mis-pricing the correction removes, in dollars, on the trades that actually printed. It is
-# an accuracy measure, not a P&L: how much of it a desk captures depends on which quotes are hit, which is the
-# fill model this notebook does not have. The par-weighted gain in bp is reported next to it so the two views can
-# be compared.
-
-# %%
-if HAS_TRADES and 'bk' in globals() and 'msrb_price' in bk.columns:
-    # par must be finite and plausible: the raw MSRB quantity field carries a few inf / absurd values that would swamp every sum
-    _q = pd.to_numeric(bk['msrb_quantity'], errors='coerce').replace([np.inf, -np.inf], np.nan)
-    _bad = _q.isna() | (_q <= 0) | (_q > 1e8)
-    print(f'par filter for the dollar view: {int(_bad.sum()):,} of {len(bk):,} trades dropped (non-finite, non-positive or above $100mm par)')
-    bk = bk[~_bad].copy(); bk['msrb_quantity'] = _q[~_bad].astype(float)
-    _px = pd.to_numeric(bk['msrb_price'], errors='coerce').replace([np.inf, -np.inf], np.nan).clip(1, 300).fillna(100.0)
-    bk['dollar_per_bp'] = (bk['msrb_quantity'] * _px / 100.0 * bk['modified_duration_lag1'].clip(lower=0).fillna(0) * 1e-4)
-    DOL = {'C side-pooled EWMA': 'e_C_bp', 'S same-side memory': 'e_S_bp', 'K per-side state-space memory': 'e_K_bp', 'D level model': 'e_D_bp'}
-    for k, c in DOL.items():
-        bk[f'$ removed [{k}]'] = (bk['e_algo_bp'].abs() - bk[c].abs()) * bk['dollar_per_bp']
-        bk[f'par-bp [{k}]'] = (bk['e_algo_bp'].abs() - bk[c].abs()) * bk['msrb_quantity'].clip(lower=0).fillna(0)
-    months_held = bk['month'].nunique()
-
-    def dollar_table(frame: pd.DataFrame, by: str, n_min: int = 0) -> pd.DataFrame:
-        g = frame.groupby(by, observed=True)
-        out = pd.DataFrame({'trades': g.size(), 'par traded ($mm)': g['msrb_quantity'].sum() / 1e6, 'algo |error| ($k)': (frame['e_algo_bp'].abs() * frame['dollar_per_bp']).groupby(frame[by], observed=True).sum() / 1e3})
-        for k in DOL:
-            out[f'$ removed per month ($k) [{k}]'] = g[f'$ removed [{k}]'].sum() / 1e3 / months_held
-            out[f'par-weighted gain (bp) [{k}]'] = g[f'par-bp [{k}]'].sum() / g['msrb_quantity'].sum().replace(0, np.nan)
-        return out[out['trades'] >= n_min]
-
-    dol_month = dollar_table(bk, 'month'); dol_month.index = dol_month.index.astype(str)
-    dol_all = dollar_table(bk.assign(all='ALL'), 'all')
-    print(f'Dollar error removed on held-out trades ({months_held} months, {len(bk):,} trades, {bk["msrb_quantity"].sum()/1e9:.1f} bn par):'); display(dol_all.T.round(2))
-    print('By month:'); display(dol_month[['trades', 'par traded ($mm)'] + [c for c in dol_month.columns if c.startswith('$ removed')]].round(1))
-    dol_seg = {name: dollar_table(bk, col, CFG.n_min_cell) for name, col in [('rating bucket', 'rating_bucket'), ('duration bucket', 'dur_bucket'), ('call structure', 'call_structure'), ('beta-space cluster', 'cluster'), ('trade size', 'qty_group')] + ([('industry', 'industry_bucket')] if 'industry_bucket' in bk.columns and bk['industry_bucket'].notna().any() else [])}
-    for name, tbl in dol_seg.items():
-        print(f'By {name}:'); display(tbl[['trades', 'par traded ($mm)', 'algo |error| ($k)'] + [c for c in tbl.columns if '$ removed' in c]].round(1))
-    dol_cells = dollar_table(bk, 'cell', CFG.n_min_cell).sort_values('$ removed per month ($k) [S same-side memory]', ascending=False)
-    print('Top characteristic cells by dollars removed per month, same-side memory:'); display(dol_cells.head(10)[['trades', 'par traded ($mm)', 'algo |error| ($k)', '$ removed per month ($k) [S same-side memory]', 'par-weighted gain (bp) [S same-side memory]', '$ removed per month ($k) [D level model]']].round(1))
-    _pos = bk.groupby('cell', observed=True)['$ removed [S same-side memory]'].sum(); _parc = bk.groupby('cell', observed=True)['msrb_quantity'].sum()
-    print(f'share of par traded in cells where the same-side memory removes error: {_parc[_pos > 0].sum() / _parc.sum():.1%} | share of dollars removed coming from the top 10 cells: {dol_cells.head(10)["$ removed per month ($k) [S same-side memory]"].sum() / max(dol_cells["$ removed per month ($k) [S same-side memory]"].clip(lower=0).sum(), 1e-9):.1%}')
-    fig, ax = plt.subplots(1, 3, figsize=(19, 4.8))
-    dol_month[[c for c in dol_month.columns if c.startswith('$ removed')]].rename(columns=lambda c: c.split('[')[1].rstrip(']')).plot.bar(ax=ax[0]); ax[0].axhline(0, color='k', lw=0.6); ax[0].set_title('Dollar error removed per month ($k), by mid', fontsize=10); ax[0].set_xlabel(''); ax[0].legend(fontsize=8)
-    _dc = dol_seg['beta-space cluster'][[c for c in dol_seg['beta-space cluster'].columns if c.startswith('$ removed')]].rename(columns=lambda c: c.split('[')[1].rstrip(']'))
-    _dc.plot.barh(ax=ax[1]); ax[1].axvline(0, color='k', lw=0.6); ax[1].set_title('Dollar error removed per month ($k) by beta-space cluster', fontsize=10); ax[1].set_ylabel(''); ax[1].legend(fontsize=7); ax[1].tick_params(axis='y', labelsize=8)
-    _tc = dol_cells.head(10)['$ removed per month ($k) [S same-side memory]'][::-1]
-    _tc.plot.barh(ax=ax[2], color='#55A868'); ax[2].set_title('Top 10 characteristic cells: $k removed per month, same-side memory', fontsize=10); ax[2].set_ylabel(''); ax[2].tick_params(axis='y', labelsize=7)
-    savefig('12b_dollars_removed')
-    record('dollars', months=months_held, overall=dol_all.round(3).to_dict(orient='records'), by_month=dol_month.round(3).reset_index().to_dict(orient='records'), by_segment={k: v.round(3).reset_index().to_dict(orient='records') for k, v in dol_seg.items()}, top_cells=dol_cells.head(10).round(3).reset_index().to_dict(orient='records'))
-else:
-    print('Section 12b skipped: needs trade par and price.')
-
-# %% [markdown]
-# ## 13. Systematic path: factor roll-forward of stale marks, by segment
+# ## 14. Systematic path: factor roll-forward of stale marks, by segment
 #
 # The one systematic use of the factor model that the v5 print-to-print panel confirmed out of panel: the next
 # print follows the factor-implied move (coefficient 0.83) and ignores the residual move in the marks. Here the
@@ -2702,7 +2766,7 @@ rollf = pd.DataFrame(rf_rows).set_index('horizon'); rollf['rmse_reduction'] = 1 
 display(rollf.round(3))
 fig, ax = plt.subplots(figsize=(7, 4))
 ax.plot(rollf.index, rollf['stale_mae_bp'], marker='o', label='leave mark stale'); ax.plot(rollf.index, rollf['rolled_mae_bp'], marker='o', label='roll forward by beta . f'); ax.set_xlabel('horizon (observations)'); ax.set_ylabel('MAE (bp)'); ax.legend(); ax.set_title('Factor roll-forward of marks (in-panel upper bound)')
-savefig('13_roll_forward')
+savefig('14_roll_forward')
 record('systematic_path', roll_forward=rollf.round(4).reset_index().to_dict(orient='records'))
 
 # %%
@@ -2721,11 +2785,11 @@ for name, col in [('duration bucket', 'dur_bucket'), ('call structure', 'call_st
 fig, ax = plt.subplots(1, 3, figsize=(18, 4.2))
 for a, (name, t) in zip(ax, rf_seg.items()):
     t['rmse_reduction'].plot.bar(ax=a, color='#8172B2'); a.set_title(f'Roll-forward RMSE reduction (h={h}) by {name}', fontsize=10); a.set_xlabel(''); a.tick_params(axis='x', rotation=30, labelsize=8)
-savefig('13_roll_forward_by_segment')
+savefig('14_roll_forward_by_segment')
 record('systematic_path', roll_forward_by_segment={k: v.round(4).reset_index().to_dict(orient='records') for k, v in rf_seg.items()})
 
 # %% [markdown]
-# ## 14. Results registry and summary
+# ## 15. Results registry and summary
 
 # %%
 score = resid[['cusip', 'date', 'gamma_version', 'fold', 'target_bp', 'fitted_bp', 'pit_residual', 'activity_bucket'] + beta_cols + [c for c in ['ssm_signal', 'ssm_drift', 'ssm_mark_noise'] if c in resid.columns]].copy()
@@ -2749,7 +2813,9 @@ for nm in fc_table.index:
     summary_rows.append((f'Forecaster: {nm}', f"rank IC {fc_table.loc[nm, 'ic_mean']:+.3f} (t {fc_table.loc[nm, 'ic_t']:+.2f}); sign acc {fc_table.loc[nm, 'sign_acc']:.3f}"))
 if not ssmb_params.empty:
     summary_rows.append(('State-space parameters by bucket (last fold)', '; '.join(f"{g}: phi {r['phi']:.2f}, drift/noise {r['signal_to_noise']:.2f}" for g, r in lastp.iterrows() if g != 'UNKNOWN')))
-summary_rows.append(('Paper portfolio hedged Sharpe (vol-scaled, ALL)', '; '.join(f"{k}: {v:.2f}" for k, v in paper['ALL'].items()) + (f"; walk-forward selected {sharpe(pnl_selected):.2f}" if len(pnl_selected) else '')))
+if 'risk_model' in REGISTRY:
+    _rk = pd.DataFrame(REGISTRY['risk_model']['by_cluster']).set_index('cluster')
+    summary_rows.append(('Risk model snapshot (median systematic share of daily variance; systematic / idio sd bp)', f"{_rk['systematic_share'].median():.0%}; {_rk['systematic_sd_bp'].median():.2f} / {_rk['idio_sd_bp'].median():.2f} bp over {REGISTRY['risk_model']['bonds']:,} bonds"))
 if HAS_TRADES and not tv.empty:
     _r = tx[(tx['score'] == 'state-space signal rank (record)') & (tx['bucket'] == 'ALL') & tx['target'].isin(['trade - prior mark', 'trade - algo quote'])].set_index('target')
     summary_rows.append(('Record signal vs prior mark | vs algo quote', f"FM {_r.loc['trade - prior mark', 'fm_beta']:+.2f} bp/rank (t {_r.loc['trade - prior mark', 'fm_t']:+.2f}, boot {_r.loc['trade - prior mark', 'boot_t']:+.2f}) | {_r.loc['trade - algo quote', 'fm_beta']:+.2f} (t {_r.loc['trade - algo quote', 'fm_t']:+.2f}, boot {_r.loc['trade - algo quote', 'boot_t']:+.2f})"))
@@ -2779,7 +2845,20 @@ if 'breakdown' in REGISTRY:
         summary_rows.append(('Top characteristic cell by gain of the same-side memory', f"{_tc.iloc[0]['cell']}: {_tc.iloc[0]['gain S (bp)']:+.2f} bp over {int(_tc.iloc[0]['n']):,} trades"))
 if 'error_correction' in REGISTRY and 'ecp' in globals():
     _ex = ecp[ecp['modified_duration_lag1'] >= 1.0]
-    summary_rows.append(('Headline MAE excluding duration < 1y: algo | C | S | K | D', ' | '.join(f"{_ex[c].abs().mean():.2f}" for c in ['e_algo_bp', 'e_C_bp', 'e_S_bp', 'e_K_bp', 'e_D_bp']) + f' bp ({len(_ex):,} trades, {len(_ex) / len(ecp):.0%})'))
+    summary_rows.append(('Headline MAE excluding duration < 1y: algo | C | S | SQ | K | D', ' | '.join(f"{_ex[c].abs().mean():.2f}" for c in ['e_algo_bp', 'e_C_bp', 'e_S_bp', 'e_SQ_bp', 'e_K_bp', 'e_D_bp']) + f' bp ({len(_ex):,} trades, {len(_ex) / len(ecp):.0%})'))
+if 'markout' in REGISTRY:
+    _rr = pd.DataFrame(REGISTRY['markout']['rerank']).set_index('mid'); _hr = REGISTRY['markout']['record_h']
+    summary_rows.append((f'Markout $ per month at h={_hr} (would-have-filled, upper bound): algo | S | SQ | AQ | D', ' | '.join(f"{_rr.loc[k_, '$ per month ($k)']:,.0f}" for k_ in ['A algo quote', 'S same-side EWMA', 'SQ same-side EWMA + side x size intercept', 'AQ algo + side x size intercept', 'D level model with error features'] if k_ in _rr.index) + ' $k'))
+    summary_rows.append((f'Markout P&L per print at h={_hr} (bp): algo | S | SQ | AQ | D', ' | '.join(f"{_rr.loc[k_, 'P&L per print (bp)']:+.2f}" for k_ in ['A algo quote', 'S same-side EWMA', 'SQ same-side EWMA + side x size intercept', 'AQ algo + side x size intercept', 'D level model with error features'] if k_ in _rr.index)))
+    summary_rows.append(('Markout winner ($ rank 1) and whether it clears the bar vs S', f"{_rr.index[0]}: {_rr.iloc[0]['$ per month ($k)']:,.0f} $k/month, MAE rank {int(_rr.iloc[0]['MAE rank'])}, boot t vs S {_rr.iloc[0]['boot t vs S']:+.1f}, bar {'PASS' if bool(_rr.iloc[0]['beats S (bar)']) else 'no'}"))
+    _ad = pd.DataFrame(REGISTRY['markout']['adverse_selection'])
+    _adf = _ad[_ad['prints'] == 'would have filled'].set_index('side')
+    summary_rows.append((f'Adverse selection on would-be fills (algo quote): edge at quote | mark move after {_hr}d, P / S (bp)', ' / '.join(f"{_adf.loc[s_, 'edge at our quote (bp)']:+.1f} | {_adf.loc[s_, f'mark move after, h={_hr} (bp)']:+.1f}" for s_ in _adf.index)))
+    _cc = pd.DataFrame(REGISTRY['markout']['concession']).set_index('index') if 'index' in pd.DataFrame(REGISTRY['markout']['concession']).columns else pd.DataFrame(REGISTRY['markout']['concession'])
+    summary_rows.append(('Cell-optimal concession, walk-forward: S at 0 | S + delta* per side | S + delta* per side x size ($k/month)', ' | '.join(f"{_cc.loc[k_, '$ per month ($k)']:,.0f}" for k_ in ['S same-side EWMA, delta 0', 'S + delta* per side (walk-forward)', 'S + delta* per side x size cell (walk-forward)'] if k_ in _cc.index)))
+if 'quantile_grid' in REGISTRY and REGISTRY['quantile_grid']['calibration']:
+    _cg = pd.DataFrame(REGISTRY['quantile_grid']['calibration']).set_index('side')
+    summary_rows.append(('Quantile grid calibration (realised share below q at tau 0.10 / 0.50 / 0.90, P then S)', '; '.join(f"{s_}: {_cg.loc[s_, 'tau 0.10']:.2f} / {_cg.loc[s_, 'tau 0.50']:.2f} / {_cg.loc[s_, 'tau 0.90']:.2f}" for s_ in _cg.index)))
 if 'conformal_band' in REGISTRY and 'efficiency' in REGISTRY['conformal_band']:
     _ef = pd.DataFrame(REGISTRY['conformal_band']['efficiency']); _efD = _ef[_ef['mid'] == 'level model D'].set_index('band')
     summary_rows.append(('Band efficiency, level model D mid (half-width bp per coverage point)', '; '.join(f"{b}: {_efD.loc[b, 'width per point of coverage']:.3f} ({_efD.loc[b, 'coverage']:.0%} at {_efD.loc[b, 'half-width (bp)']:.1f} bp)" for b in ['rolling_fixed', 'rolling'] if b in _efD.index)))
@@ -2800,7 +2879,7 @@ if len(_cl):
     record('stage_cache', log=_cl.round(2).to_dict(orient='records'), keys=STAGE_KEYS)
 
 # %% [markdown]
-# ## 15. Robustness: dispersion-day exclusions, bootstrap inference, pre-registered choices
+# ## 16. Robustness: dispersion-day exclusions, bootstrap inference, pre-registered choices
 
 # %%
 rob_rows = [{'check': 'Residual ACF lag 1 (Pearson)', 'all days': acf.loc[1, 'pearson'], 'ex dispersion days': acf.loc[1, 'pearson_ex_dispersion']},
