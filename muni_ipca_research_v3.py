@@ -16,10 +16,16 @@
 # 3. **The by-bucket state-space filter as the residual signal of record**: AR drift plus mark-noise MA, parameters
 #    by activity bucket, with the filtered drift as the signal and the filtered mark noise as the mark-quality score.
 # 4. **Algo error correction**: the v5 print-to-print panel found the algo's own pricing error persists 58% from
-#    one print to the next. That persistence is turned into point-in-time features (last matched print's algo
-#    error, its age, an exponentially weighted history), a two-parameter baseline (algo + rho(age) x last error),
-#    and a level model with and without the error features. The band around the chosen mid is then calibrated
-#    by **split conformal** scaling, which fixes the under-coverage of the raw quantile model.
+#    one print to the next. The algo quote is MMD yield + side-specific MMD spread + a last-value adjustment, so
+#    that persistence says the existing adjustment is under-sized. It is turned into point-in-time features (last
+#    matched print's algo error, its age, an exponentially weighted history), two diagnostics of the algo's own
+#    last-value term, side-intercept and EWMA baselines (the "revised third term"), and a level model with and
+#    without the error features. The band around the chosen mid is calibrated by conformal scaling, split by
+#    month and rolling over the last ten trading days, with a lagged market-dispersion feature.
+# 5. **Where the gains live**: every result is cut by the model's own axes (duration, call structure, rating,
+#    state, liquidity, factor-beta terciles, point-in-time beta-space clusters). The aim is not to improve the
+#    whole universe but to find the characteristic cells and factor exposures where the improvement concentrates,
+#    and to ask whether the algo's error loads on the factor betas at all.
 #
 # **Inputs** (from `data_pipeline/muni_data_pipeline.py`, under `./data_pipeline/`): `research_panel_step3_yield.parquet`,
 # `data/closing_marks/*.parquet`, `data/algosignal_msrb/*.parquet`. **Outputs** go to `./artifacts_v3/`.
@@ -35,10 +41,11 @@
 # 8. Hedged paper portfolio (vol-scaled) as the information metric
 # 9. Transaction validation of the signal of record (Fama-MacBeth with block bootstrap)
 # 10. Algo error correction: persistence, point-in-time error features, baselines, level model with and without them
-# 11. Conformal band around the chosen mid
-# 12. Systematic path: factor roll-forward of stale marks
-# 13. Results registry and summary
-# 14. Robustness: dispersion-day exclusions, bootstrap inference, pre-registered choices
+# 11. Conformal band around the chosen mid: split (monthly) and rolling (10-day) calibration
+# 12. Where the gains live: breakdown by characteristics, factor betas and beta-space clusters
+# 13. Systematic path: factor roll-forward of stale marks, by segment
+# 14. Results registry and summary
+# 15. Robustness: dispersion-day exclusions, bootstrap inference, pre-registered choices
 #
 # Every leakage boundary is explicit: Gamma is refit on past dates only, instruments are lagged and rank-normalised
 # within date, every trade is matched to a residual dated strictly before the trade date, every print-derived
@@ -116,8 +123,8 @@ class RunConfig:
     exclude_dispersion_from_fit: bool = True
     partial_day_ratio: float = 0.6        # a partial-mark day: bonds priced below this share of the trailing-20-date median; dropped
     # --- refit cadence (Section 5) ---
-    cadences: tuple[str, ...] = ('weekly', 'monthly', 'quarterly', 'frozen', 'regime')
-    record_cadence: str = 'monthly'       # residuals of record (pre-registered after the v5 swap test)
+    cadences: tuple[str, ...] = ('monthly', 'quarterly', 'frozen')   # weekly and regime-conditional closed in v31 (within 0.3 pp)
+    record_cadence: str = 'monthly'       # residuals of record
     regime_cadence_days: int = 30
     # --- residual signal (Sections 7-8) ---
     portfolio_scaling: str = 'vol'
@@ -125,22 +132,29 @@ class RunConfig:
     n_boot: int = 500
     ssm_fit_bonds: int = 2000
     ssm_maxiter: int = 120
+    record_signal: str = 'pooled'         # 'pooled' | 'bucket': which state-space filter is the signal of record (v31: pooled wins)
     # --- algo error correction and band (Sections 10-11) ---
     err_halflife_prints: float = 3.0      # EWMA of past algo errors, in prints
     age_bins_days: tuple[float, ...] = (0, 1, 3, 7, 21, 1e9)
     level_model_trees: int = 600
     conformal_calibration_months: int = 1
+    conformal_window_days: int = 10       # rolling conformal: trading days of realised scores used to set the scale
+    n_clusters: int = 8                   # beta-space clusters for the breakdown (fitted on the first OOS month, applied forward)
+    n_min_cell: int = 2000                # minimum trades in a characteristic cell for the breakdown tables
     seed: int = 20260921
 
 # Pre-registered choices, fixed on 2026-10-07 after the v5 review and before this notebook was run. Section 14
 # prints them so a reader can tell a choice from a fit.
 PRE_REGISTERED = {
-    'fixed_on': '2026-10-07',
+    'fixed_on': '2026-10-07 (v3.1, after the v31 review)',
     'selected_k': 3, 'record_cadence': 'monthly', 'level_signal_window': 20, 'activity_window': 20,
+    'record_signal': 'pooled state-space filter (the by-bucket filter stays as a diagnostic)', 'ewma_half_life_prints': 3,
+    'revised_third_term': 'algo + per-side intercept + rho x EWMA(past algo errors), all estimated on prior months',
+    'conformal_rolling_window_days': 10, 'breakdown_axes': 'duration, call structure, rating, state, liquidity, factor-beta terciles, 8 beta-space clusters fitted on the first OOS month',
     'dispersion_rule': 'share of |target - median_t| > 10 bp above 10% of bonds -> zero weight in the fit',
     'common_move_rule': '|median_t| > 10 bp -> flagged and kept', 'partial_day_rule': 'bonds priced < 60% of trailing-20-date median -> dropped',
     'date_weighting': 'inverse variance, cap 4x', 'duration_instrument': 'ratio',
-    'residual_signal_of_record': 'state-space AR drift + mark-noise MA, parameters by activity bucket, winsorised increments',
+
     'portfolio_scaling': 'vol', 'band_coverage': 0.80, 'conformal': 'split conformal, calibration = the month before the test month, normalised score |err| / q_hat',
     'error_correction_baseline': 'algo + rho(age bucket) x last matched print algo error, rho estimated on prior months',
 }
@@ -593,11 +607,10 @@ record('ipca_full_sample', factor_variance_share=[float(x) for x in fshare], gam
 # Gamma is estimated on dates strictly before each test block, aligned across versions by orthogonal Procrustes,
 # and applied to the test block. The v5 Gamma swap test found that a Gamma frozen two months earlier explained
 # *more* out-of-sample variance than the weekly refit in every month from June on. Five schemes are therefore run
-# side by side on identical test dates: weekly, monthly and quarterly refits on an expanding window, a Gamma
-# frozen at the first OOS date, and a **regime-conditional** Gamma, where two Gammas are fitted on training dates
-# split by cross-sectional dispersion (above or below the training median of the daily target sd) and each test
-# date uses the Gamma of the regime indicated by the *previous* day's dispersion. The residuals of record come
-# from the pre-registered cadence (`record_cadence`), not from the winner of this table.
+# side by side on identical test dates (`cadences`): monthly and quarterly refits on an expanding window and a Gamma
+# frozen at the first OOS date. The v31 run also ran weekly and a dispersion-regime-conditional Gamma; all five sat
+# within 0.3 points of variance explained in every month, so those two are closed and dropped from the default run
+# (the code still supports 'weekly' and 'regime'). The residuals of record come from the pre-registered cadence.
 
 # %%
 def make_folds(dates: pd.DatetimeIndex, train_start: str, first_oos: str, test_days: int | None) -> list[dict]:
@@ -694,7 +707,7 @@ if 'regime' in runs:
     print('Regime-conditional Gamma: test dates by regime'); display(_rg.round(4))
 fig, ax = plt.subplots(1, 2, figsize=(15, 4.2))
 cadence.drop(index='ALL').plot.bar(ax=ax[0]); ax[0].set_title('OOS variance explained by month: refit cadence and regime-conditional Gamma'); ax[0].set_xlabel(''); ax[0].legend(fontsize=8)
-(cadence.drop(index='ALL').sub(cadence.drop(index='ALL')['weekly'], axis=0)).drop(columns='weekly').plot(ax=ax[1], marker='o'); ax[1].axhline(0, color='k', lw=0.6); ax[1].set_title('Gain over the weekly refit (points of variance explained)'); ax[1].set_xlabel('')
+(cadence.drop(index='ALL').sub(cadence.drop(index='ALL')[CFG.record_cadence], axis=0)).drop(columns=CFG.record_cadence).plot(ax=ax[1], marker='o'); ax[1].axhline(0, color='k', lw=0.6); ax[1].set_title(f'Difference from the {CFG.record_cadence} refit (points of variance explained)'); ax[1].set_xlabel('')
 savefig('05_refit_cadence')
 record('walk_forward', cadence_table=cadence.round(4).to_dict(), record_cadence=CFG.record_cadence)
 
@@ -871,6 +884,21 @@ savefig('06b_clusters_and_ranking')
 snap.drop(columns=['label']).to_parquet(ARTIFACTS / f'beta_space_snapshot_{last_date.date()}.parquet', index=False)
 record('factor_space', date=str(last_date.date()), embedding=emb_name, clusters=N_CLUSTERS, cluster_profile=profile.round(4).reset_index().to_dict(orient='records'))
 
+# %%
+# Point-in-time beta-space clusters for the breakdowns in Section 12: k-means fitted on the standardised betas of the
+# FIRST OOS month and applied to every later bond-day with the same centroids and scaling, so membership never looks ahead.
+_first_m = resid['date'].dt.to_period('M').min()
+_fit = resid[resid['date'].dt.to_period('M') == _first_m]
+_mu, _sd = _fit[beta_cols].mean(), _fit[beta_cols].std().replace(0, 1.0)
+km_pit = KMeans(n_clusters=CFG.n_clusters, n_init=10, random_state=CFG.seed).fit(((_fit[beta_cols] - _mu) / _sd).to_numpy(float))
+resid['beta_cluster'] = km_pit.predict(((resid[beta_cols] - _mu) / _sd).to_numpy(float))
+_prof = resid[['cusip', 'date', 'beta_cluster']].merge(model[['cusip', 'date', 'modified_duration_lag1', 'is_callable', 'extension', 'rating_score', 'closing_yield']], on=['cusip', 'date'], how='left')
+cluster_profile = _prof.groupby('beta_cluster').agg(bond_days=('cusip', 'size'), mod_duration=('modified_duration_lag1', 'mean'), share_callable=('is_callable', 'mean'), extension=('extension', 'mean'), rating_score=('rating_score', 'mean'), yield_pct=('closing_yield', 'mean')).sort_values('mod_duration')
+cluster_profile['label'] = [f"C{c}: dur {r['mod_duration']:.1f}, call {r['share_callable']:.0%}, ext {r['extension']:.1f}" for c, r in cluster_profile.iterrows()]
+CLUSTER_LABEL = cluster_profile['label'].to_dict()
+print(f'PIT beta-space clusters (k={CFG.n_clusters}) fitted on {_first_m}, applied forward:'); display(cluster_profile.round(3))
+record('factor_space', pit_clusters=cluster_profile.round(4).reset_index().to_dict(orient='records'))
+
 # %% [markdown]
 # ## 7. Residual dynamics: autocorrelation, activity buckets, the state-space filter
 #
@@ -1008,7 +1036,7 @@ for name, cols, winsor, fitter in FC_SPECS:
     print(f'{name}: {time.perf_counter()-t0:.1f}s', '' if 'params' not in summ else summ['params'])
 
 # %% [markdown]
-# ### 7b. The signal of record: state-space filter, AR drift plus mark-noise, by activity bucket
+# ### 7b. The signal of record: state-space filter, AR drift plus mark-noise
 #
 # The structural reading of the residual diagnostics is two components: a slow, persistent deviation of the bond
 # from factor-implied fair value (what the trailing mean picks up) and evaluated-mark noise that enters the daily
@@ -1023,9 +1051,10 @@ for name, cols, winsor, fitter in FC_SPECS:
 # attributes to mark noise. This is the model the LongConv-lite ridge approximates, with the weights derived
 # rather than fitted, and it gives two by-products the ridge cannot: a filtered **mark-noise** estimate per
 # bond-day (a mark-quality score) and parameters per activity bucket, which say whether the hand-coded fade in
-# active names is what the data imply (the v5 run found phi near 1 in quiet buckets and near 0 in active ones).
-# Increments are winsorised at the training quantiles before filtering. The by-bucket filter's one-step forecast
-# is the residual signal of record and is carried into Sections 8, 9 and 13.
+# active names is what the data imply (phi near 1 in quiet buckets and near 0 in active ones in v5 and v31).
+# Increments are winsorised at the training quantiles before filtering. The v31 run found the pooled filter beats
+# the by-bucket filter on IC, sign accuracy and hedged Sharpe once weights are vol-scaled, so the pooled filter's
+# one-step forecast is the residual signal of record (`record_signal`); the bucket parameters stay as the diagnostic.
 
 # %%
 LOG2PI = np.log(2.0 * np.pi)
@@ -1103,7 +1132,9 @@ def ssm_walk_forward(name: str, by_bucket: bool) -> tuple[pd.DataFrame, dict, pd
             groups['UNKNOWN'] = np.setdiff1d(tr['cusip'].unique(), modal.index.to_numpy())
         fitted = {}
         for gname, bonds in groups.items():
-            fit_bonds = bonds if gname != 'UNKNOWN' else groups.get('ALL', bonds)
+            if gname == 'UNKNOWN':
+                continue   # new bonds with short histories: filtered with the mean of the bucket parameters, not fitted on their own
+            fit_bonds = bonds
             if len(fit_bonds) < 50:
                 continue
             sub = RNG.choice(fit_bonds, min(len(fit_bonds), CFG.ssm_fit_bonds), replace=False)
@@ -1145,9 +1176,10 @@ for nm, pr, sm in [(ssm_summ['forecaster'], ssm_pred, ssm_summ), (ssmb_summ['for
 if not ssm_pred.empty:
     resid = resid.merge(ssm_pred[['cusip', 'date', 'm_hat', 'eta_hat']].rename(columns={'m_hat': 'ssm_drift', 'eta_hat': 'ssm_mark_noise'}), on=['cusip', 'date'], how='left')
     resid['eta_abs'] = resid['ssm_mark_noise'].abs()
-if not ssmb_pred.empty:
-    # the signal of record: the by-bucket filter's one-step forecast, strictly out of sample
-    resid = resid.merge(ssmb_pred[['cusip', 'date', 'yhat']].rename(columns={'yhat': 'ssm_signal'}), on=['cusip', 'date'], how='left')
+_rec_pred = ssm_pred if CFG.record_signal == 'pooled' else ssmb_pred
+if not _rec_pred.empty:
+    # the signal of record: the chosen filter's one-step forecast, strictly out of sample
+    resid = resid.merge(_rec_pred[['cusip', 'date', 'yhat']].rename(columns={'yhat': 'ssm_signal'}), on=['cusip', 'date'], how='left')
 fc_table = pd.DataFrame(fc_results).set_index('forecaster')
 display(fc_table.drop(columns=[c for c in ['params'] if c in fc_table.columns]))
 if not ssm_params.empty:
@@ -1343,7 +1375,7 @@ def standardize_trades(tr: pd.DataFrame) -> pd.DataFrame:
     return t
 
 def join_trades_to_residual(t: pd.DataFrame, res: pd.DataFrame, min_age: int) -> pd.DataFrame:
-    extra = [c for c in ['eta_abs', 'ssm_drift', 'ssm_signal', 'fitted_bp'] if c in res.columns]
+    extra = [c for c in ['eta_abs', 'ssm_drift', 'ssm_signal', 'fitted_bp', 'beta_cluster'] if c in res.columns]
     score = res[['cusip', 'date', 'pit_residual', 'activity_bucket', 'resid_mean', 'resid_sd', 'target_abs_vol'] + extra + beta_cols].copy()
     score['cusip'] = score['cusip'].astype('string')
     score = score.merge(model[['cusip', 'date', 'modified_duration_lag1', 'mark_unchanged', 'days_since_mark_move']], on=['cusip', 'date'], how='left')
@@ -1552,7 +1584,7 @@ if HAS_TRADES and not tv.empty and 'cum_fitted_bp' in tv.columns:
     ec['month'] = ec['trade_date'].dt.to_period('M')
     ec['spread_bp'] = 100.0 * (ec['msrb_yield'] - ec['MmdYld'])
     print(f'trades with a prior matched print before the signal time: {ec["has_err"].mean():.1%} of {len(ec):,}')
-    feat_panel = model[['cusip', 'date', 'rating_score', 'years_to_worst', 'extension', 'cpn', 'closing_yield_lag1', 'state_others'] + [c for c in CHARS if c != 'market_fv']].rename(columns={'date': 'residual_date'})
+    feat_panel = model[['cusip', 'date', 'rating_score', 'years_to_worst', 'extension', 'cpn', 'closing_yield_lag1', 'state_others', 'call_structure', 'state_bucket', 'is_callable'] + [c for c in CHARS if c != 'market_fv']].rename(columns={'date': 'residual_date'})
     feat_panel = feat_panel[[c for c in feat_panel.columns if c in ('cusip', 'residual_date') or c not in ec.columns]]
     feat_panel['residual_date'] = to_ns(feat_panel['residual_date']); ec['residual_date'] = to_ns(ec['residual_date'])
     ec = ec.merge(feat_panel, on=['cusip', 'residual_date'], how='left')
@@ -1582,6 +1614,17 @@ if HAS_TRADES and not tv.empty and 'cum_fitted_bp' in tv.columns:
             mdl = HistGradientBoostingRegressor(loss='absolute_error', max_iter=max(100, n_trees * 2 // 3), learning_rate=0.05, max_leaf_nodes=63, min_samples_leaf=50, random_state=CFG.seed).fit(Xtr, ytr); imp = None
         return mdl.predict(Xte), imp
 
+    # Diagnostics of the algo's own third term. The quote is MMD + side-specific spread + a last-value adjustment, so
+    # the persistence above says that adjustment is under-sized. (a) Regress the error on the adjustment: a positive
+    # coefficient means the algo under-reacts to the last value by that fraction. (b) How much of our last-error
+    # feature is already in the adjustment.
+    if 'last_value' in ec.columns and ec['last_value'].notna().mean() > 0.3:
+        _lv = ec.dropna(subset=['last_value'])
+        lv_rows = [{'bucket': 'ALL', **fm_slope(_lv, 'e_algo_bp', 'last_value', ['log_size'])}] + [{'bucket': f'side={s}', **fm_slope(g, 'e_algo_bp', 'last_value', ['log_size'])} for s, g in _lv.groupby('side')] + [{'bucket': f'age {b}', **fm_slope(g, 'e_algo_bp', 'last_value', ['log_size'])} for b, g in _lv.groupby('age_bucket') if len(g) >= 2000]
+        lv_diag = pd.DataFrame(lv_rows).set_index('bucket')
+        print("Algo error on the algo's own last-value adjustment (positive = under-reaction, negative = over-reaction):"); display(lv_diag[['n', 'fm_beta', 'fm_t', 'boot_t']].round(3))
+        print(f"corr(last matched algo error, last-value adjustment) = {_lv['last_algo_err_bp'].corr(_lv['last_value']):+.3f}; corr(EWMA error, last-value adjustment) = {_lv['ewm_algo_err_bp'].corr(_lv['last_value']):+.3f}")
+        record('error_correction', last_value_diagnostic=lv_diag.round(4).reset_index().to_dict(orient='records'), corr_last_err_last_value=float(_lv['last_algo_err_bp'].corr(_lv['last_value'])))
     parts, rho_rows, imps = [], [], []
     for m in sorted(ec['month'].unique())[1:]:
         t0 = time.perf_counter()
@@ -1596,6 +1639,14 @@ if HAS_TRADES and not tv.empty and 'cum_fitted_bp' in tv.columns:
         te['rho_age'] = te['age_bucket'].map(rho_age).astype(float)
         te['e_B_bp'] = te['e_algo_bp'] - (te['rho_age'] * te['last_algo_err_bp']).fillna(0.0)
         te['e_C_bp'] = te['e_algo_bp'] - (rho_ewm * te['ewm_algo_err_bp']).fillna(0.0)
+        # (E) per-side intercept: the median algo error by MSRB side on prior months. (F) the revised third term: side intercept
+        # plus rho x EWMA error, rho estimated on the side-demeaned error.
+        side_med = tr.groupby('side')['e_algo_bp'].median(); te['side_bias'] = te['side'].map(side_med).fillna(0.0)
+        te['e_E_bp'] = te['e_algo_bp'] - te['side_bias']
+        trs = trh.assign(e_sd=trh['e_algo_bp'] - trh['side'].map(side_med).fillna(0.0)).dropna(subset=['ewm_algo_err_bp'])
+        rho_F = fm_slope(trs, 'e_sd', 'ewm_algo_err_bp', ['log_size'])['fm_beta']
+        te['e_F_bp'] = te['e_E_bp'] - (rho_F * te['ewm_algo_err_bp']).fillna(0.0)
+        rho_rows[-1]['rho_F'] = rho_F; rho_rows[-1].update({f'side_bias[{s}]': float(v) for s, v in side_med.items()})
         # (D) and (D-) level models on the spread to MMD
         yD, impD = fit_gbm(tr, te, FULL_FEATURES, 'spread_bp', CFG.level_model_trees); te['e_D_bp'] = te['spread_bp'] - yD
         yDm, _ = fit_gbm(tr, te, BASE_FEATURES, 'spread_bp', CFG.level_model_trees); te['e_Dminus_bp'] = te['spread_bp'] - yDm
@@ -1605,7 +1656,7 @@ if HAS_TRADES and not tv.empty and 'cum_fitted_bp' in tv.columns:
         parts.append(te); print(f'  {m}: train {len(tr):,} | test {len(te):,} | rho by age {{{", ".join(f"{k}: {v:+.2f}" for k, v in rho_age.items())}}} | rho_ewm {rho_ewm:+.2f} | {time.perf_counter()-t0:.0f}s')
     ecp = pd.concat(parts, ignore_index=True); rho_path = pd.DataFrame(rho_rows).set_index('month')
     print('Error-correction coefficients by month (estimated on prior months):'); display(rho_path.round(3))
-    PREDS = {'A algo quote': 'e_algo_bp', 'B algo + rho(age) x last error': 'e_B_bp', 'C algo + rho x EWMA error': 'e_C_bp', 'D level model with error features': 'e_D_bp', 'D- level model without error features': 'e_Dminus_bp'}
+    PREDS = {'A algo quote': 'e_algo_bp', 'B algo + rho(age) x last error': 'e_B_bp', 'C algo + rho x EWMA error': 'e_C_bp', 'E algo + side intercept': 'e_E_bp', 'F revised third term (side intercept + rho x EWMA)': 'e_F_bp', 'D level model with error features': 'e_D_bp', 'D- level model without error features': 'e_Dminus_bp'}
 
     def ec_table(frame: pd.DataFrame, by: str) -> pd.DataFrame:
         g = frame.groupby(by, observed=True); out = pd.DataFrame({'n': g.size()})
@@ -1645,7 +1696,7 @@ else:
     print('Section 10 skipped: needs matched trades joined to residuals.')
 
 # %% [markdown]
-# ## 11. Conformal band around the chosen mid
+# ## 11. Conformal band around the chosen mid: split and rolling calibration
 #
 # v2.3 fitted a quantile model of |print − mid| and got 71% coverage at an 80% target: the quantile model is
 # mis-calibrated under the month-to-month shift in error scale. **Split conformal** fixes this without changing
@@ -1653,14 +1704,20 @@ else:
 # $m-1$ gives the scaling constant $s$ = the target quantile of the normalised score $|e| / \hat q$, and the band
 # in month $m$ is $s\,\hat q$. Coverage is then guaranteed on average under exchangeability, and the width still
 # adapts to the trade. Three bands at the same target: fixed (calibration-month quantile of $|e|$), raw quantile
-# model, and conformalised quantile model, each around two mids: the algo quote and the level model D.
+# model, and conformalised quantile model, each around three mids: the algo quote, the revised third term F and
+# the level model D. The v31 run showed the monthly split-conformal scale cannot follow a regime shift inside the
+# test month (September covered 64%), so a **rolling** variant is added: the scale for each test date is the target
+# quantile of the normalised scores over the previous ten trading days, and the quantile model gets the lagged
+# cross-sectional dispersion of the market as a feature.
 
 # %%
 if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
-    BAND_FEATURES = [c for c in ['log_size', 'side_D', 'side_P', 'side_S', 'recency_days_c', 'prints_20d', 'MinuteFromSignal', 'last_print_spread_bp', 'last_algo_err_bp', 'ewm_algo_err_bp', 'abs_resid_z', 'eta_abs', 'modified_duration_lag1', 'rating_score', 'target_abs_vol', 'dMmdSprdSide'] if c in ecp.columns]
+    ecp['market_disp_lag'] = ecp['trade_date'].map(DATE_DISP_LAG)          # cross-sectional sd of the target on the previous panel date: known at the open
+    ecp['market_disp_lag'] = ecp['market_disp_lag'].fillna(ecp['market_disp_lag'].median())
+    BAND_FEATURES = [c for c in ['log_size', 'side_D', 'side_P', 'side_S', 'recency_days_c', 'prints_20d', 'MinuteFromSignal', 'last_print_spread_bp', 'last_algo_err_bp', 'ewm_algo_err_bp', 'abs_resid_z', 'eta_abs', 'modified_duration_lag1', 'rating_score', 'target_abs_vol', 'dMmdSprdSide', 'market_disp_lag'] if c in ecp.columns]
     bands, bimp = [], []
     months_b = sorted(ecp['month'].unique())
-    for mid_name, err_col in [('algo quote', 'e_algo_bp'), ('level model D', 'e_D_bp')]:
+    for mid_name, err_col in [('algo quote', 'e_algo_bp'), ('revised third term F', 'e_F_bp'), ('level model D', 'e_D_bp')]:
         for i in range(2, len(months_b)):
             m, cal_m = months_b[i], months_b[i - CFG.conformal_calibration_months]
             tr = ecp[ecp['month'] < cal_m]; cal = ecp[ecp['month'] == cal_m]; te = ecp[ecp['month'] == m].copy()
@@ -1677,33 +1734,45 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
             s = float(np.quantile(cal[err_col].abs().to_numpy() / q_cal, CFG.band_coverage))
             fixed = float(np.quantile(cal[err_col].abs(), CFG.band_coverage))
             te['mid'] = mid_name; te['abs_err'] = te[err_col].abs(); te['hw_fixed'] = fixed; te['hw_quantile'] = q_te; te['hw_conformal'] = s * q_te; te['s_conformal'] = s
-            bands.append(te[['cusip', 'trade_date', 'side', 'age_bucket', 'recency_bucket', 'month', 'mid', 'abs_err', 'hw_fixed', 'hw_quantile', 'hw_conformal', 's_conformal']])
+            # rolling conformal: for each test date, the scale is the target quantile of the normalised scores over the previous
+            # conformal_window_days trading days (calibration month + earlier test days), so a regime shift re-scales within days
+            hist_dates = pd.concat([cal.assign(_q=q_cal), te.assign(_q=q_te)])[['trade_date', err_col, '_q']].assign(score=lambda d: d[err_col].abs() / d['_q'])
+            daily_scores = {d: g['score'].to_numpy() for d, g in hist_dates.groupby('trade_date')}
+            all_days = sorted(daily_scores); s_roll = {}
+            for d in sorted(te['trade_date'].unique()):
+                prev = [x for x in all_days if x < d][-CFG.conformal_window_days:]
+                pool = np.concatenate([daily_scores[x] for x in prev]) if prev else np.array([s])
+                s_roll[d] = float(np.quantile(pool, CFG.band_coverage)) if len(pool) > 50 else s
+            te['s_rolling'] = te['trade_date'].map(s_roll); te['hw_rolling'] = te['s_rolling'] * q_te
+            bands.append(te[['cusip', 'trade_date', 'side', 'age_bucket', 'recency_bucket', 'month', 'mid', 'abs_err', 'hw_fixed', 'hw_quantile', 'hw_conformal', 'hw_rolling', 's_conformal', 's_rolling']])
     if bands:
         bd = pd.concat(bands, ignore_index=True); bd['month'] = bd['month'].astype(str)
-        for k in ['fixed', 'quantile', 'conformal']:
+        BANDS = ['fixed', 'quantile', 'conformal', 'rolling']
+        for k in BANDS:
             bd[f'cov_{k}'] = (bd['abs_err'] <= bd[f'hw_{k}']).astype(float)
 
         def band_table(frame: pd.DataFrame, by: str) -> pd.DataFrame:
             g = frame.groupby(by, observed=True)
-            return pd.DataFrame({'n': g.size(), **{f'coverage {k}': g[f'cov_{k}'].mean() for k in ['fixed', 'quantile', 'conformal']}, **{f'half-width {k} (bp)': g[f'hw_{k}'].mean() for k in ['fixed', 'quantile', 'conformal']}})
+            return pd.DataFrame({'n': g.size(), **{f'coverage {k}': g[f'cov_{k}'].mean() for k in BANDS}, **{f'half-width {k} (bp)': g[f'hw_{k}'].mean() for k in BANDS}})
 
         for mid_name, g in bd.groupby('mid'):
             print(f'Band around the {mid_name}, target {CFG.band_coverage:.0%} (held-out months; conformal scale s by month: {g.groupby("month")["s_conformal"].first().round(2).to_dict()})')
             display(band_table(g.assign(all='ALL'), 'all').round(3)); display(band_table(g, 'month').round(3)); display(band_table(g, 'side').round(3))
-        gD = bd[bd['mid'] == 'level model D'].copy(); gD['width_decile'] = pd.qcut(gD['hw_conformal'].rank(method='first'), 10, labels=False) + 1
+        gD = bd[bd['mid'] == 'level model D'].copy(); gD['width_decile'] = pd.qcut(gD['hw_rolling'].rank(method='first'), 10, labels=False) + 1
         dec = band_table(gD, 'width_decile')
-        print('Calibration by conformal-width decile, level model D mid (flat at the target = calibrated):'); display(dec[['n', 'coverage fixed', 'coverage quantile', 'coverage conformal', 'half-width conformal (bp)']].round(3))
+        print('Calibration by rolling-conformal width decile, level model D mid (flat at the target = calibrated):'); display(dec[['n', 'coverage fixed', 'coverage quantile', 'coverage conformal', 'coverage rolling', 'half-width rolling (bp)']].round(3))
+        s_path = bd[bd['mid'] == 'level model D'].groupby('trade_date')[['s_conformal', 's_rolling']].first()
         fig, ax = plt.subplots(1, 3, figsize=(19, 4.3))
-        for k, st in [('fixed', 's--'), ('quantile', '^-.'), ('conformal', 'o-')]:
+        for k, st in [('fixed', 's--'), ('quantile', '^-.'), ('conformal', 'o-'), ('rolling', 'D-')]:
             ax[0].plot(dec.index, dec[f'coverage {k}'], st, label=k)
-        ax[0].axhline(CFG.band_coverage, color='k', ls='--', lw=0.8); ax[0].set_ylim(0.4, 1.0); ax[0].set_xlabel('conformal half-width decile'); ax[0].legend(fontsize=8); ax[0].set_title('Coverage by predicted-width decile (level model D mid)', fontsize=10)
-        bm = bd.groupby(['mid', 'month'])[['cov_fixed', 'cov_quantile', 'cov_conformal']].mean()
-        for mid_name, st in [('algo quote', '--'), ('level model D', '-')]:
-            for k, c in [('fixed', 'grey'), ('conformal', '#4C72B0')]:
-                ax[1].plot(bm.loc[mid_name].index, bm.loc[mid_name][f'cov_{k}'], st, color=c, marker='o', label=f'{k}, {mid_name}')
-        ax[1].axhline(CFG.band_coverage, color='k', ls='--', lw=0.8); ax[1].legend(fontsize=7); ax[1].set_title('Coverage by month: fixed vs conformal, two mids', fontsize=10)
-        bw = bd.groupby(['mid', 'side'])[['hw_fixed', 'hw_conformal']].mean()
-        bw.plot.bar(ax=ax[2]); ax[2].set_title('Mean half-width by mid and side (bp)', fontsize=10); ax[2].set_xlabel(''); ax[2].legend(['fixed', 'conformal'], fontsize=8)
+        ax[0].axhline(CFG.band_coverage, color='k', ls='--', lw=0.8); ax[0].set_ylim(0.4, 1.0); ax[0].set_xlabel('rolling-conformal half-width decile'); ax[0].legend(fontsize=8); ax[0].set_title('Coverage by predicted-width decile (level model D mid)', fontsize=10)
+        dcov = bd[bd['mid'] == 'level model D'].groupby('trade_date')[['cov_fixed', 'cov_conformal', 'cov_rolling']].mean().rolling(5).mean()
+        for k, c in [('fixed', 'grey'), ('conformal', '#4C72B0'), ('rolling', '#C44E52')]:
+            ax[1].plot(dcov.index, dcov[f'cov_{k}'], color=c, lw=1.2, label=k)
+        ax[1].axhline(CFG.band_coverage, color='k', ls='--', lw=0.8); ax[1].legend(fontsize=8); ax[1].set_title('Daily coverage (5-day mean), level model D mid: monthly vs rolling calibration', fontsize=10)
+        ax2 = ax[1].twinx(); ax2.plot(s_path.index, s_path['s_rolling'], color='#C44E52', ls=':', lw=0.8); ax2.set_ylabel('rolling scale s', color='#C44E52')
+        bw = bd.groupby(['mid', 'side'])[['hw_fixed', 'hw_rolling']].mean()
+        bw.plot.bar(ax=ax[2]); ax[2].set_title('Mean half-width by mid and side (bp)', fontsize=10); ax[2].set_xlabel(''); ax[2].legend(['fixed', 'rolling conformal'], fontsize=8); ax[2].tick_params(axis='x', labelsize=7)
         savefig('11_conformal_band')
         bd.to_parquet(ARTIFACTS / 'conformal_band_v3.parquet', index=False)
         record('conformal_band', features=BAND_FEATURES, by_mid={mid_name: band_table(g.assign(all='ALL'), 'all').round(4).to_dict(orient='records')[0] for mid_name, g in bd.groupby('mid')}, by_width_decile=dec.round(4).reset_index().to_dict(orient='records'))
@@ -1713,7 +1782,99 @@ else:
     print('Section 11 skipped: needs Section 10.')
 
 # %% [markdown]
-# ## 12. Systematic path: factor roll-forward of stale marks
+# ## 12. Where the gains live: breakdown by characteristics, factor betas and beta-space clusters
+#
+# The research question is not whether the whole universe improves but *where* the improvement concentrates, in
+# the model's own coordinates. Every bond-day carries its characteristics, its three factor betas and a
+# point-in-time beta-space cluster; every trade inherits them from its residual date. Four views, all on the same
+# segmentation: (1) the error-correction gain of the revised third term (F) and the level model (D) over the algo
+# by segment, with a duration-by-call heatmap and the top characteristic cells; (2) whether the algo's error
+# loads on the factor betas at all, before and after correction, which is the direct tie between the pricing
+# layer and the factor model; (3) the record residual signal within each cluster (hedged Sharpe, IC, trade test);
+# (4) the factor roll-forward by segment, in Section 13.
+
+# %%
+if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
+    bk = ecp.copy()
+    bk['dur_bucket'] = pd.cut(bk['modified_duration_lag1'], bins=[-1, 1, 2.5, 4, 6, 8, 11, 100], labels=['<1', '1-2.5', '2.5-4', '4-6', '6-8', '8-11', '>11']).astype(str)
+    bk['rating_bucket'] = pd.cut(bk['rating_score'].fillna(-1), bins=[-2, -0.5, 14.5, 17.5, 20.5, 21.5], labels=['NR', 'BBB and below', 'A', 'AA', 'AAA']).astype(str)
+    bk['liq_q'] = bk.groupby('trade_date', observed=True)['z_liquidity_20'].transform(lambda s: pd.qcut(s.rank(method='first'), 5, labels=['Q1 illiquid', 'Q2', 'Q3', 'Q4', 'Q5 liquid']).astype(str) if s.notna().sum() > 50 else 'NA')
+    for j in range(CFG.selected_k):
+        bk[f'beta{j+1}_tercile'] = bk.groupby('trade_date', observed=True)[f'beta{j+1}'].transform(lambda s: pd.qcut(s.rank(method='first'), 3, labels=['low', 'mid', 'high']).astype(str) if s.notna().sum() > 30 else 'NA')
+    bk['cluster'] = bk['beta_cluster'].map(CLUSTER_LABEL).fillna('NA')
+    MIDS_BK = {'A algo quote': 'e_algo_bp', 'E algo + side intercept': 'e_E_bp', 'F revised third term': 'e_F_bp', 'D level model': 'e_D_bp'}
+
+    def gain_table(frame: pd.DataFrame, by: str, n_min: int) -> pd.DataFrame:
+        g = frame.groupby(by, observed=True); out = pd.DataFrame({'n': g.size()})
+        for k, c in MIDS_BK.items():
+            out[f'MAE {k.split()[0]}'] = g[c].apply(lambda s: s.abs().mean())
+        for k, c in list(MIDS_BK.items())[1:]:
+            d = frame.assign(gain=frame['e_algo_bp'].abs() - frame[c].abs()).groupby([by, 'trade_date'], observed=True)['gain'].mean().groupby(level=0)
+            out[f'gain {k.split()[0]} (bp)'] = d.mean(); out[f't {k.split()[0]}'] = np.sqrt(d.count()) * d.mean() / d.std().replace(0, np.nan)
+        out['share of trades'] = out['n'] / len(frame)
+        return out[out['n'] >= n_min]
+
+    SEGMENTS = {'duration bucket': 'dur_bucket', 'call structure': 'call_structure', 'rating bucket': 'rating_bucket', 'state bucket': 'state_bucket', 'liquidity quintile': 'liq_q', 'beta-space cluster': 'cluster', 'beta1 tercile': 'beta1_tercile', 'beta2 tercile': 'beta2_tercile', 'beta3 tercile': 'beta3_tercile'}
+    seg_tables = {}
+    for name, col in SEGMENTS.items():
+        if col in bk.columns:
+            seg_tables[name] = gain_table(bk, col, CFG.n_min_cell)
+            print(f'Gain over the algo by {name}:'); display(seg_tables[name].round(3))
+    # characteristic cells: duration x call x rating, ranked by the gain of the revised third term
+    bk['cell'] = bk['dur_bucket'] + ' | ' + bk['call_structure'].astype(str) + ' | ' + bk['rating_bucket']
+    cells = gain_table(bk, 'cell', CFG.n_min_cell).sort_values('gain F (bp)', ascending=False)
+    print(f'Top and bottom characteristic cells by the gain of the revised third term (cells with >= {CFG.n_min_cell:,} trades):'); display(pd.concat([cells.head(10), cells.tail(5)]).round(3))
+    # (2) does the algo error load on the factor betas? FM of the error on the three betas (plus side), before and after correction
+    load_rows = []
+    for k, c in MIDS_BK.items():
+        r = fm_multi(bk.dropna(subset=beta_cols), c, beta_cols, ['log_size', 'side_P', 'side_S']).assign(mid=k)
+        load_rows.append(r)
+    beta_loading = pd.concat(load_rows, ignore_index=True)
+    print('Fama-MacBeth: pricing error on the factor betas (does the quote miss a factor axis?), by mid'); display(beta_loading.round(4))
+    fig, ax = plt.subplots(1, 3, figsize=(19, 5.2))
+    hm = bk.groupby(['dur_bucket', 'call_structure'], observed=True).apply(lambda g: (g['e_algo_bp'].abs() - g['e_F_bp'].abs()).mean() if len(g) >= CFG.n_min_cell else np.nan, include_groups=False).unstack('call_structure').reindex(['<1', '1-2.5', '2.5-4', '4-6', '6-8', '8-11', '>11'])
+    im = ax[0].imshow(hm.to_numpy(float), cmap='RdYlGn', aspect='auto', vmin=-np.nanmax(np.abs(hm.to_numpy(float))), vmax=np.nanmax(np.abs(hm.to_numpy(float))))
+    ax[0].set_xticks(range(hm.shape[1])); ax[0].set_xticklabels(hm.columns, rotation=20, fontsize=8); ax[0].set_yticks(range(hm.shape[0])); ax[0].set_yticklabels(hm.index); ax[0].set_ylabel('modified duration bucket')
+    for i in range(hm.shape[0]):
+        for j in range(hm.shape[1]):
+            v = hm.iloc[i, j]
+            if np.isfinite(v):
+                ax[0].text(j, i, f'{v:+.2f}', ha='center', va='center', fontsize=8)
+    ax[0].set_title('Gain of the revised third term over the algo (bp): duration x call structure', fontsize=10); ax[0].grid(False); plt.colorbar(im, ax=ax[0], fraction=0.046)
+    cl = seg_tables.get('beta-space cluster')
+    if cl is not None and len(cl):
+        cl[['gain F (bp)', 'gain D (bp)']].plot.barh(ax=ax[1]); ax[1].axvline(0, color='k', lw=0.6); ax[1].set_title('Gain over the algo by beta-space cluster (bp)', fontsize=10); ax[1].set_ylabel(''); ax[1].legend(['F revised third term', 'D level model'], fontsize=8); ax[1].tick_params(axis='y', labelsize=8)
+    bl = beta_loading[beta_loading['mid'].isin(['A algo quote', 'F revised third term', 'D level model'])].pivot(index='score', columns='mid', values='fm_beta').reindex(beta_cols)
+    bl.plot.bar(ax=ax[2]); ax[2].axhline(0, color='k', lw=0.6); ax[2].set_title('FM loading of the pricing error on each factor beta (bp per unit beta)', fontsize=10); ax[2].set_xlabel(''); ax[2].legend(fontsize=8)
+    savefig('12_where_the_gains_live')
+    # (3) the record residual signal within each cluster
+    rec_name = next(k for k in signals if (k.startswith('State-space') and ('pooled' in k) == (CFG.record_signal == 'pooled')))
+    sig = signals[rec_name].merge(resid[['cusip', 'date', 'beta_cluster']], on=['cusip', 'date'], how='left')
+    sig['cluster'] = sig['beta_cluster'].map(CLUSTER_LABEL)
+    sig_rows = []
+    for c, g in sig.groupby('cluster'):
+        if len(g) < CFG.n_min_cell:
+            continue
+        ic = ic_summary(daily_rank_ic(g, 'yhat', 'next_residual'))
+        sig_rows.append({'cluster': c, 'bond_days': len(g), 'rank IC': ic['ic_mean'], 'IC t': ic['ic_t'], 'hedged Sharpe (within cluster)': sharpe(portfolio_pnl(g))})
+    sig_cluster = pd.DataFrame(sig_rows, columns=['cluster', 'bond_days', 'rank IC', 'IC t', 'hedged Sharpe (within cluster)']).set_index('cluster')
+    if 'ssm_rank' in tv.columns and len(sig_cluster):
+        tvc = tv.copy(); tvc['cluster'] = tvc['beta_cluster'].map(CLUSTER_LABEL)   # beta_cluster already rides on the trade frame from the residual join
+        fmc = {c: fm_slope(g, 'e_mark_bp', 'ssm_rank', CONTROLS) for c, g in tvc.dropna(subset=['ssm_rank']).groupby('cluster') if len(g) >= CFG.n_min_cell}
+        sig_cluster['trade - mark on signal (FM bp/rank)'] = pd.Series({c: v['fm_beta'] for c, v in fmc.items()}); sig_cluster['FM t'] = pd.Series({c: v['fm_t'] for c, v in fmc.items()})
+    print(f'Record residual signal ({rec_name}) within beta-space clusters:'); display(sig_cluster.round(3))
+    fig, ax = plt.subplots(1, 2, figsize=(15, 4.6))
+    if len(sig_cluster):
+        sig_cluster['hedged Sharpe (within cluster)'].plot.barh(ax=ax[0], color='#4C72B0'); ax[0].axvline(0, color='k', lw=0.6); ax[0].set_title('Record signal: hedged Sharpe within each beta-space cluster', fontsize=10); ax[0].set_ylabel(''); ax[0].tick_params(axis='y', labelsize=8)
+        sig_cluster['rank IC'].plot.barh(ax=ax[1], color='#55A868')
+    ax[1].axvline(0, color='k', lw=0.6); ax[1].set_title('Record signal: next-day rank IC within each cluster', fontsize=10); ax[1].set_ylabel(''); ax[1].tick_params(axis='y', labelsize=8)
+    savefig('12_signal_by_cluster')
+    record('breakdown', segments={k: v.round(4).reset_index().to_dict(orient='records') for k, v in seg_tables.items()}, top_cells=cells.head(10).round(4).reset_index().to_dict(orient='records'), beta_loading=beta_loading.round(4).to_dict(orient='records'), signal_by_cluster=sig_cluster.round(4).reset_index().to_dict(orient='records'))
+else:
+    print('Section 12 skipped: needs Section 10.')
+
+# %% [markdown]
+# ## 13. Systematic path: factor roll-forward of stale marks, by segment
 #
 # The one systematic use of the factor model that the v5 print-to-print panel confirmed out of panel: the next
 # print follows the factor-implied move (coefficient 0.83) and ignores the residual move in the marks. Here the
@@ -1732,11 +1893,30 @@ rollf = pd.DataFrame(rf_rows).set_index('horizon'); rollf['rmse_reduction'] = 1 
 display(rollf.round(3))
 fig, ax = plt.subplots(figsize=(7, 4))
 ax.plot(rollf.index, rollf['stale_mae_bp'], marker='o', label='leave mark stale'); ax.plot(rollf.index, rollf['rolled_mae_bp'], marker='o', label='roll forward by beta . f'); ax.set_xlabel('horizon (observations)'); ax.set_ylabel('MAE (bp)'); ax.legend(); ax.set_title('Factor roll-forward of marks (in-panel upper bound)')
-savefig('12_roll_forward')
+savefig('13_roll_forward')
 record('systematic_path', roll_forward=rollf.round(4).reset_index().to_dict(orient='records'))
 
+# %%
+# roll-forward by segment: where does the factor model move stale marks most usefully?
+h = 5
+_rs = resid.sort_values(['cusip', 'date'], kind='stable'); _g = _rs.groupby('cusip', observed=True)
+_rs = _rs.assign(cum_target=_g['target_bp'].transform(lambda s: s.rolling(h).sum().shift(-h + 1)), cum_resid=_g['pit_residual'].transform(lambda s: s.rolling(h).sum().shift(-h + 1))).dropna(subset=['cum_target', 'cum_resid'])
+_rs = _rs.merge(model[['cusip', 'date', 'modified_duration_lag1', 'call_structure']], on=['cusip', 'date'], how='left')
+_rs['dur_bucket'] = pd.cut(_rs['modified_duration_lag1'], bins=[-1, 1, 2.5, 4, 6, 8, 11, 100], labels=['<1', '1-2.5', '2.5-4', '4-6', '6-8', '8-11', '>11']).astype(str)
+_rs['cluster'] = _rs['beta_cluster'].map(CLUSTER_LABEL)
+rf_seg = {}
+for name, col in [('duration bucket', 'dur_bucket'), ('call structure', 'call_structure'), ('beta-space cluster', 'cluster')]:
+    g = _rs.groupby(col, observed=True)
+    t = pd.DataFrame({'bond_days': g.size(), 'stale_rmse_bp': g['cum_target'].apply(lambda s: np.sqrt((s ** 2).mean())), 'rolled_rmse_bp': g['cum_resid'].apply(lambda s: np.sqrt((s ** 2).mean()))}); t['rmse_reduction'] = 1 - t['rolled_rmse_bp'] / t['stale_rmse_bp']
+    rf_seg[name] = t; print(f'Roll-forward at h={h} by {name}:'); display(t.round(3))
+fig, ax = plt.subplots(1, 3, figsize=(18, 4.2))
+for a, (name, t) in zip(ax, rf_seg.items()):
+    t['rmse_reduction'].plot.bar(ax=a, color='#8172B2'); a.set_title(f'Roll-forward RMSE reduction (h={h}) by {name}', fontsize=10); a.set_xlabel(''); a.tick_params(axis='x', rotation=30, labelsize=8)
+savefig('13_roll_forward_by_segment')
+record('systematic_path', roll_forward_by_segment={k: v.round(4).reset_index().to_dict(orient='records') for k, v in rf_seg.items()})
+
 # %% [markdown]
-# ## 13. Results registry and summary
+# ## 14. Results registry and summary
 
 # %%
 score = resid[['cusip', 'date', 'gamma_version', 'fold', 'target_bp', 'fitted_bp', 'pit_residual', 'activity_bucket'] + beta_cols + [c for c in ['ssm_signal', 'ssm_drift', 'ssm_mark_noise'] if c in resid.columns]].copy()
@@ -1769,11 +1949,20 @@ if HAS_TRADES and not tv.empty:
 if 'error_correction' in REGISTRY:
     _p = pers.set_index('score'); _o = ec_all.iloc[0]
     summary_rows.append(('Algo error persistence print to print', f"{_p.loc['e_algo_bp_0', 'fm_beta']:+.3f} (t {_p.loc['e_algo_bp_0', 'fm_t']:+.1f}, boot {_p.loc['e_algo_bp_0', 'boot_t']:+.1f})"))
-    summary_rows.append(('Held-out MAE vs print: A algo | B rho(age) | C EWMA | D level+err | D- level', ' | '.join(f"{_o[f'MAE {k}']:.2f}" for k in PREDS) + ' bp'))
+    summary_rows.append(('Held-out MAE vs print: A | B | C | E | F | D | D-', ' | '.join(f"{_o[f'MAE {k}']:.2f}" for k in PREDS) + ' bp'))
+    if 'last_value_diagnostic' in REGISTRY['error_correction']:
+        _lvd = pd.DataFrame(REGISTRY['error_correction']['last_value_diagnostic']).set_index('bucket')
+        summary_rows.append(("Algo error on its own last-value adjustment (ALL)", f"{_lvd.loc['ALL', 'fm_beta']:+.3f} (t {_lvd.loc['ALL', 'fm_t']:+.1f}); corr(last error, adjustment) {REGISTRY['error_correction']['corr_last_err_last_value']:+.2f}"))
     summary_rows.append(('Gain over algo (bp, daily FM t, bootstrap t)', '; '.join(f"{k.split()[0]}: {_o[f'gain {k.split()[0]} (bp)']:+.2f} (t {_o[f't {k.split()[0]}']:+.1f}, boot {boot_gain[k]:+.1f})" for k in list(PREDS)[1:])))
 if 'conformal_band' in REGISTRY:
     for mid_name, r in REGISTRY['conformal_band']['by_mid'].items():
-        summary_rows.append((f'Band around {mid_name} ({CFG.band_coverage:.0%} target)', f"fixed {r['coverage fixed']:.1%} at {r['half-width fixed (bp)']:.1f} bp | quantile {r['coverage quantile']:.1%} at {r['half-width quantile (bp)']:.1f} | conformal {r['coverage conformal']:.1%} at {r['half-width conformal (bp)']:.1f}"))
+        summary_rows.append((f'Band around {mid_name} ({CFG.band_coverage:.0%} target)', f"fixed {r['coverage fixed']:.1%} at {r['half-width fixed (bp)']:.1f} bp | split conformal {r['coverage conformal']:.1%} at {r['half-width conformal (bp)']:.1f} | rolling conformal {r['coverage rolling']:.1%} at {r['half-width rolling (bp)']:.1f}"))
+if 'breakdown' in REGISTRY:
+    _bl = pd.DataFrame(REGISTRY['breakdown']['beta_loading']); _a = _bl[_bl['mid'] == 'A algo quote'].set_index('score')
+    summary_rows.append(('Algo error loading on factor betas (FM bp per unit beta, t)', '; '.join(f"{b}: {_a.loc[b, 'fm_beta']:+.2f} (t {_a.loc[b, 'fm_t']:+.1f})" for b in beta_cols)))
+    _tc = pd.DataFrame(REGISTRY['breakdown']['top_cells'])
+    if len(_tc):
+        summary_rows.append(('Top characteristic cell by gain of the revised third term', f"{_tc.iloc[0]['cell']}: {_tc.iloc[0]['gain F (bp)']:+.2f} bp over {int(_tc.iloc[0]['n']):,} trades"))
 summary_rows.append(('Roll-forward RMSE reduction, h=1 / h=10', f"{rollf.loc[1, 'rmse_reduction']:.0%} / {rollf.loc[10, 'rmse_reduction']:.0%}"))
 summary = pd.DataFrame(summary_rows, columns=['item', 'result']).set_index('item')
 display(summary)
@@ -1784,7 +1973,7 @@ for p in sorted(ARTIFACTS.glob('*')):
 print('Figures:', len(list(FIGURES.glob('*.png'))))
 
 # %% [markdown]
-# ## 14. Robustness: dispersion-day exclusions, bootstrap inference, pre-registered choices
+# ## 15. Robustness: dispersion-day exclusions, bootstrap inference, pre-registered choices
 
 # %%
 rob_rows = [{'check': 'Residual ACF lag 1 (Pearson)', 'all days': acf.loc[1, 'pearson'], 'ex dispersion days': acf.loc[1, 'pearson_ex_dispersion']},
