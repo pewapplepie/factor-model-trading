@@ -43,6 +43,8 @@ while i < n:
         out.append(f'<h{lvl} id="{anchor}">{inline(txt)}</h{lvl}>'); i += 1; continue
     if st == '---':
         flush_para(); out.append('<hr>'); i += 1; continue
+    if st.startswith('$$') and st.endswith('$$') and len(st) > 4:
+        flush_para(); out.append('<div class="eq">' + inline(st[2:-2].strip()) + '</div>'); i += 1; continue
     if st == '↓':
         flush_para(); out.append('<div class="arrow">↓</div>'); i += 1; continue
     m = re.match(r'^!\[(.*?)\]\((.*?)\)$', st)
@@ -109,6 +111,10 @@ tr.hl td{background:var(--hl)}
 .box{background:var(--box);border-left:4px solid var(--accent);padding:10px 16px;margin:1.1em 0;font-size:.95em;page-break-inside:avoid}
 .box p{margin:.4em 0}
 .arrow{text-align:center;color:var(--muted);font-size:1.3em;margin:-.2em 0}
+.eq{display:block;text-align:center;margin:1.1em auto;padding:10px 14px;font:1.08em/1.7 'Cambria','Times New Roman',Georgia,serif;overflow-x:auto;white-space:nowrap;max-width:100%;page-break-inside:avoid;break-inside:avoid;background:var(--box);border-radius:6px}
+.eq sub,.eq sup{font-size:.7em}
+.eq .eqn{float:right;color:var(--muted);font-size:.8em}
+@media print{.eq{white-space:normal;font-size:1em}}
 figure{margin:1.3em 0;page-break-inside:avoid}
 figure img{width:100%;height:auto;border:1px solid var(--line)}
 figcaption{font:13px/1.45 Helvetica,Arial,sans-serif;color:var(--muted);margin-top:6px}
