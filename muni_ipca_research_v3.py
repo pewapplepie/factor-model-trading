@@ -2565,7 +2565,7 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty:
 
     def lookup(g: pd.DataFrame, marg: pd.DataFrame, te: pd.DataFrame) -> np.ndarray:
         key = pd.MultiIndex.from_arrays([te['side'].astype(str).to_numpy(), te['qty_group'].astype(str).to_numpy(), te['cluster_id'].astype(str).to_numpy()])
-        q = g.reindex(key)[TAUS].to_numpy(float)
+        q = g.reindex(key)[TAUS].to_numpy(dtype=float, copy=True)   # copy=True: to_numpy may return a read-only view, and q is mutated below
         qm = marg.reindex(pd.MultiIndex.from_arrays([te['side'].astype(str).to_numpy(), te['qty_group'].astype(str).to_numpy()]))[TAUS].to_numpy(float)
         miss = ~np.isfinite(q[:, 0])
         q[miss] = qm[miss]
