@@ -1876,6 +1876,7 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
     for j in range(CFG.selected_k):
         bk[f'beta{j+1}_tercile'] = bk.groupby('trade_date', observed=True)[f'beta{j+1}'].transform(lambda s: pd.qcut(s.rank(method='first'), 3, labels=['low', 'mid', 'high']).astype(str) if s.notna().sum() > 30 else 'NA')
     bk['cluster'] = bk['beta_cluster'].map(CLUSTER_LABEL).fillna('NA')
+    bk['side_label'] = bk['side'].map({'P': 'P dealer buys (bid)', 'S': 'S dealer sells (offer)', 'D': 'D inter-dealer'}).fillna(bk['side'].astype(str))
     MIDS_BK = {'A algo quote': 'e_algo_bp', 'E algo + side intercept': 'e_E_bp', 'F revised third term': 'e_F_bp', 'G factor-beta correction': 'e_G_bp', 'D level model': 'e_D_bp'}
 
     def gain_table(frame: pd.DataFrame, by: str, n_min: int) -> pd.DataFrame:
@@ -1888,7 +1889,7 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
         out['share of trades'] = out['n'] / len(frame)
         return out[out['n'] >= n_min]
 
-    SEGMENTS = {'duration bucket': 'dur_bucket', 'call structure': 'call_structure', 'rating bucket': 'rating_bucket', 'state bucket': 'state_bucket', 'liquidity quintile': 'liq_q', 'beta-space cluster': 'cluster', 'beta1 tercile': 'beta1_tercile', 'beta2 tercile': 'beta2_tercile', 'beta3 tercile': 'beta3_tercile'}
+    SEGMENTS = {'duration bucket': 'dur_bucket', 'call structure': 'call_structure', 'rating bucket': 'rating_bucket', 'state bucket': 'state_bucket', 'liquidity quintile': 'liq_q', 'beta-space cluster': 'cluster', 'beta1 tercile': 'beta1_tercile', 'beta2 tercile': 'beta2_tercile', 'beta3 tercile': 'beta3_tercile', 'MSRB side': 'side_label'}
     seg_tables = {}
     for name, col in SEGMENTS.items():
         if col in bk.columns:
@@ -1981,7 +1982,7 @@ if HAS_TRADES and 'seg_tables' in globals() and seg_tables:
         return t
 
     # (1) the ten best segments across every axis, and the ten best / five worst characteristic cells
-    AX_LABEL = {'duration bucket': 'dur', 'call structure': 'call', 'rating bucket': 'rating', 'state bucket': 'state', 'liquidity quintile': 'liq', 'beta-space cluster': 'cluster', 'beta1 tercile': 'beta1', 'beta2 tercile': 'beta2', 'beta3 tercile': 'beta3'}
+    AX_LABEL = {'duration bucket': 'dur', 'call structure': 'call', 'rating bucket': 'rating', 'state bucket': 'state', 'liquidity quintile': 'liq', 'beta-space cluster': 'cluster', 'beta1 tercile': 'beta1', 'beta2 tercile': 'beta2', 'beta3 tercile': 'beta3', 'MSRB side': 'side'}
     allseg = pd.concat([v.set_index(v.index.map(lambda i, k=k: f'{AX_LABEL.get(k, k)}: {i}')) for k, v in seg_tables.items() if len(v)])
     top_seg = allseg.sort_values('gain F (bp)', ascending=False).head(10)
     cells_show = pd.concat([cells.head(10), cells.tail(5)])
@@ -1993,9 +1994,10 @@ if HAS_TRADES and 'seg_tables' in globals() and seg_tables:
     fig.suptitle('Where the error-correction gains live (share of held-out trades in brackets)', fontsize=12); plt.tight_layout(); savefig('12a_top_gains')
 
     # (2) one panel per characteristic axis
-    axes_show = [k for k in ['duration bucket', 'call structure', 'rating bucket', 'state bucket', 'liquidity quintile', 'beta-space cluster'] if k in seg_tables and len(seg_tables[k])]
-    ORDERS = {'duration bucket': ['<1', '1-2.5', '2.5-4', '4-6', '6-8', '8-11', '>11'], 'liquidity quintile': ['Q1 illiquid', 'Q2', 'Q3', 'Q4', 'Q5 liquid']}
-    fig, axs = plt.subplots(2, 3, figsize=(20, 10)); axs = axs.ravel()
+    axes_show = [k for k in ['duration bucket', 'call structure', 'rating bucket', 'MSRB side', 'state bucket', 'liquidity quintile', 'beta-space cluster'] if k in seg_tables and len(seg_tables[k])]
+    ORDERS = {'duration bucket': ['<1', '1-2.5', '2.5-4', '4-6', '6-8', '8-11', '>11'], 'liquidity quintile': ['Q1 illiquid', 'Q2', 'Q3', 'Q4', 'Q5 liquid'], 'MSRB side': ['P dealer buys (bid)', 'S dealer sells (offer)', 'D inter-dealer']}
+    _nr = max(1, int(np.ceil(len(axes_show) / 3)))
+    fig, axs = plt.subplots(_nr, 3, figsize=(20, 5 * _nr), squeeze=False); axs = axs.ravel()
     for a, k in zip(axs, axes_show):
         order = [o for o in ORDERS.get(k, []) if o in seg_tables[k].index]
         gain_bars(a, seg_tables[k], f'By {k}', order=order[::-1] if order else None)
@@ -2035,6 +2037,72 @@ if HAS_TRADES and 'seg_tables' in globals() and seg_tables:
     record('achievement_map', top_segments=top_seg.round(4).reset_index().to_dict(orient='records'), scorecard=scorecard.round(4).reset_index().to_dict(orient='records'))
 else:
     print('Section 12a skipped: needs Section 12.')
+
+# %% [markdown]
+# #### By MSRB side: bid, offer and inter-dealer
+#
+# The same gains split by the side of the print: P is a dealer purchase from a customer (our bid), S a dealer
+# sale to a customer (our offer), D an inter-dealer trade. The side is also an axis in the tables and charts
+# above; here it is crossed with the characteristics, because a correction that helps on the bid in one
+# segment and hurts on the offer in another has to be gated by both. Cells are the gain of the revised third
+# term F in bp; an asterisk marks |FM t| >= 2. The last figure is the five best cells on each side.
+
+# %%
+if HAS_TRADES and 'seg_tables' in globals() and seg_tables and 'side_label' in bk.columns:
+    SIDES = [s for s in ['P dealer buys (bid)', 'S dealer sells (offer)', 'D inter-dealer'] if s in bk['side_label'].unique()]
+    SIDE_AXES = {'duration bucket': 'dur_bucket', 'call structure': 'call_structure', 'rating bucket': 'rating_bucket', 'beta-space cluster': 'cluster', 'liquidity quintile': 'liq_q'}
+    side_tabs = {}
+    for name, col in SIDE_AXES.items():
+        if col not in bk.columns:
+            continue
+        parts = {s: gain_table(bk[bk['side_label'] == s], col, CFG.n_min_cell) for s in SIDES}
+        g = pd.DataFrame({s: p['gain F (bp)'] for s, p in parts.items()}); t = pd.DataFrame({s: p['t F'] for s, p in parts.items()})
+        d = pd.DataFrame({s: p['gain D (bp)'] for s, p in parts.items()}); n = pd.DataFrame({s: p['n'] for s, p in parts.items()})
+        order = [o for o in ORDERS.get(name, []) if o in g.index] or list(g.index)
+        side_tabs[name] = {'gain F': g.reindex(order), 't F': t.reindex(order), 'gain D': d.reindex(order), 'n': n.reindex(order)}
+        show = side_tabs[name]['gain F'].round(2).astype(str) + np.where(side_tabs[name]['t F'].abs() >= 2, '*', '') + '  (D ' + side_tabs[name]['gain D'].round(2).astype(str) + ')'
+        print(f'Gain over the algo by {name} x MSRB side: F revised third term (* = |FM t| >= 2), D level model in brackets'); display(show)
+    # side-level summary across every mid, with the algo MAE
+    side_all = gain_table(bk, 'side_label', CFG.n_min_cell).reindex(SIDES)
+    print('Gain over the algo by MSRB side, every mid:'); display(side_all.round(3))
+    # heatmaps: rows = segment, columns = side
+    hm_axes = [k for k in ['duration bucket', 'call structure', 'rating bucket', 'beta-space cluster'] if k in side_tabs]
+    if hm_axes:
+        fig, axs = plt.subplots(1, len(hm_axes), figsize=(5.2 * len(hm_axes), 5.6), squeeze=False); axs = axs.ravel()
+        vmax = max(np.nanmax(np.abs(side_tabs[k]['gain F'].to_numpy(float))) for k in hm_axes) or 1.0
+        for a, k in zip(axs, hm_axes):
+            g = side_tabs[k]['gain F']; t = side_tabs[k]['t F']
+            im = a.imshow(g.to_numpy(float), cmap='RdYlGn', aspect='auto', vmin=-vmax, vmax=vmax)
+            a.set_xticks(range(g.shape[1])); a.set_xticklabels([s.split(' ')[0] + ' ' + s.split('(')[-1].rstrip(')') if '(' in s else s for s in g.columns], fontsize=8)
+            a.set_yticks(range(g.shape[0])); a.set_yticklabels(g.index, fontsize=8); a.set_title(f'{k} x side', fontsize=10); a.grid(False)
+            for i in range(g.shape[0]):
+                for j in range(g.shape[1]):
+                    v = g.iloc[i, j]; tt = t.iloc[i, j]
+                    if np.isfinite(v):
+                        a.text(j, i, f'{v:+.2f}' + ('*' if np.isfinite(tt) and abs(tt) >= 2 else ''), ha='center', va='center', fontsize=8, fontweight='bold' if np.isfinite(tt) and abs(tt) >= 2 else 'normal')
+        plt.colorbar(im, ax=axs[-1], fraction=0.046, label='gain F over the algo (bp)')
+        fig.suptitle('Gain of the revised third term by characteristic and MSRB side (P = bid, S = offer, D = inter-dealer; * = |FM t| >= 2)', fontsize=11); plt.tight_layout(); savefig('12a_gain_by_side_heatmap')
+    # the five best cells on each side
+    side_cells = {}
+    fig, axs = plt.subplots(1, len(SIDES), figsize=(6.6 * len(SIDES), 4.8), squeeze=False); axs = axs.ravel()
+    for a, s in zip(axs, SIDES):
+        cs = gain_table(bk[bk['side_label'] == s], 'cell', CFG.n_min_cell).sort_values('gain F (bp)', ascending=False)
+        side_cells[s] = cs
+        top = cs.head(5).copy(); top.index = [f'{i}  [MAE {x:.1f} -> {y:.1f}]' for i, x, y in zip(top.index, top['MAE A'], top['MAE F'])]
+        if len(top):
+            gain_bars(a, top, f'{s}: five best cells', order=list(top.index[::-1]))
+        else:
+            a.set_title(f'{s}: no cell with >= {CFG.n_min_cell:,} trades', fontsize=10)
+            a.set_axis_off()
+    axs[0].legend(fontsize=8, loc='lower right')
+    fig.suptitle('Five best duration x call x rating cells on each side (bars F with 95% band, diamond D)', fontsize=11); plt.tight_layout(); savefig('12a_top_cells_by_side')
+    for s, cs in side_cells.items():
+        print(f'Top five and bottom three cells, {s}:'); display(pd.concat([cs.head(5), cs.tail(3)])[['n', 'MAE A', 'MAE F', 'MAE D', 'gain F (bp)', 't F', 'gain D (bp)', 't D', 'share of trades']].round(3))
+    record('achievement_by_side', side_summary=side_all.round(4).reset_index().to_dict(orient='records'),
+           by_axis={k: {m: v[m].round(4).reset_index().to_dict(orient='records') for m in ['gain F', 't F', 'gain D', 'n']} for k, v in side_tabs.items()},
+           top_cells={s: cs.head(5).round(4).reset_index().to_dict(orient='records') for s, cs in side_cells.items()})
+else:
+    print('Side breakdown skipped: needs Section 12a.')
 
 # %% [markdown]
 # ### 12b. What the gains are worth: par- and DV01-weighted error removed
