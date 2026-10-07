@@ -80,7 +80,6 @@ FIGURES.mkdir(parents=True, exist_ok=True)
 sys.path.insert(0, str(PIPELINE_ROOT))
 import muni_data_pipeline as mdp  # noqa: E402
 
-
 @dataclass(frozen=True)
 class RunConfig:
     spec_version: str = 'ipca_v3_k3'
@@ -132,7 +131,6 @@ class RunConfig:
     conformal_calibration_months: int = 1
     seed: int = 20260921
 
-
 # Pre-registered choices, fixed on 2026-10-07 after the v5 review and before this notebook was run. Section 14
 # prints them so a reader can tell a choice from a fit.
 PRE_REGISTERED = {
@@ -146,12 +144,10 @@ PRE_REGISTERED = {
     'error_correction_baseline': 'algo + rho(age bucket) x last matched print algo error, rho estimated on prior months',
 }
 
-
 CFG = RunConfig()
 PIPE = mdp.Config(root=PIPELINE_ROOT, start_date=CFG.start_date, end_date=CFG.end_date)
 RNG = np.random.default_rng(CFG.seed)
 REGISTRY: dict = {'spec_version': CFG.spec_version, 'config': asdict(CFG), 'run_at': pd.Timestamp.now('UTC').isoformat()}
-
 
 def to_ns(series: pd.Series) -> pd.Series:
     """Coerce any datetime-like column to tz-naive datetime64[ns] so merge keys always match."""
@@ -163,24 +159,20 @@ def to_ns(series: pd.Series) -> pd.Series:
         pass
     return out.astype('datetime64[ns]')
 
-
 def savefig(name: str) -> None:
     plt.tight_layout()
     plt.savefig(FIGURES / f'{name}.png', dpi=130)
     plt.show()
     plt.close()
 
-
 def record(section: str, **values) -> None:
     REGISTRY.setdefault(section, {}).update({k: (v.item() if hasattr(v, 'item') else v) for k, v in values.items()})
-
 
 print('ROOT', ROOT)
 print('Pipeline manifest:', (PIPELINE_ROOT / 'data_pipeline_manifest.json').exists())
 print('Spec', CFG.spec_version, '| window', CFG.start_date, '->', CFG.end_date, '| first OOS', CFG.first_oos_date)
 
 # %% [markdown]
-
 # ## 2. Data load and QA
 #
 # The Step 3 panel is the covered yield-space modelling input written by the pipeline. We also read the
@@ -238,11 +230,9 @@ RATING_SCALE = {'AAA': 21, 'AA+': 20, 'AA': 19, 'AA-': 18, 'A+': 17, 'A': 16, 'A
                 'BB+': 11, 'BB': 10, 'BB-': 9, 'B+': 8, 'B': 7, 'B-': 6, 'CCC+': 5, 'CCC': 4, 'CCC-': 3, 'CC': 2, 'C': 1, 'D': 0}
 BLANKS = {'', 'NAN', 'NONE', 'NULL', '<NA>', 'NR', 'N/A', 'WR'}
 
-
 def clean_rating(series: pd.Series) -> pd.Series:
     s = series.astype('string').str.strip().str.upper()
     return s.where(s.notna() & ~s.isin(BLANKS))
-
 
 def rating_with_fallback(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
     final = clean_rating(frame['final_comp_rating']) if 'final_comp_rating' in frame else pd.Series(pd.NA, index=frame.index, dtype='string')
@@ -251,7 +241,6 @@ def rating_with_fallback(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.
     source = pd.Series(np.where(final.notna(), 'final', np.where(comp.notna(), 'comp_fallback', 'NR')), index=frame.index)
     score = rating.map(RATING_SCALE).astype('float64')
     return rating, score, source
-
 
 _rating, _score, _source = rating_with_fallback(raw_panel)
 rating_audit = pd.DataFrame({
@@ -276,7 +265,6 @@ def flag_extreme_by_date(frame: pd.DataFrame, col: str, k: float) -> pd.Series:
     mad = mad.where(mad > 1e-6, 1e-6)
     return ((frame[col] - med).abs() > k * mad) | ~np.isfinite(frame[col])
 
-
 ext_now = flag_extreme_by_date(raw_panel, 'closing_yield', CFG.yield_mad_k)
 ext_lag = flag_extreme_by_date(raw_panel.assign(closing_yield_lag1=raw_panel['closing_yield_lag1']), 'closing_yield_lag1', CFG.yield_mad_k)
 raw_panel['extreme_yield'] = (ext_now | ext_lag).astype(int)
@@ -297,7 +285,6 @@ plt.suptitle(''); savefig('02_yield_distributions')
 record('data', extreme_yield_rows=int(raw_panel['extreme_yield'].sum()), extreme_yield_share=float(raw_panel['extreme_yield'].mean()), target_over_clip_share=float(big_move.mean()))
 
 # %% [markdown]
-
 # ## 3. Model panel: instruments
 #
 # Thirteen instruments: an intercept, seven rank-normalised continuous characteristics, the NR flag and four
@@ -316,7 +303,6 @@ record('data', extreme_yield_rows=int(raw_panel['extreme_yield'].sum()), extreme
 STATE_DUMMIES = ['CA', 'NY', 'TX', 'FL']
 TARGET = 'closing_yield_change_bp'
 
-
 def rank_normalize(frame: pd.DataFrame, cols: list[str], prefix: str = 'z') -> tuple[pd.DataFrame, list[str]]:
     out = frame
     zcols = []
@@ -325,7 +311,6 @@ def rank_normalize(frame: pd.DataFrame, cols: list[str], prefix: str = 'z') -> t
         out[f'{prefix}_{c}'] = (r - 0.5).fillna(0.0)
         zcols.append(f'{prefix}_{c}')
     return out, zcols
-
 
 def term_characteristics(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     date = frame['date']
@@ -342,7 +327,6 @@ def term_characteristics(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     yrs_to_mat = (mat - date).dt.days / 365.25
     yrs_to_worst = (worst - date).dt.days / 365.25
     return yrs_to_worst, (yrs_to_mat - yrs_to_worst).clip(lower=0)
-
 
 def build_model_panel(panel: pd.DataFrame, cfg: RunConfig) -> tuple[pd.DataFrame, list[str]]:
     yp = panel.copy()
@@ -398,7 +382,6 @@ def build_model_panel(panel: pd.DataFrame, cfg: RunConfig) -> tuple[pd.DataFrame
             'cpn', 'state_code', 'state_bucket', 'state_others', 'mkt_yield', 'long_comp_name', 'maturity_year', 'is_callable', 'call_structure'] + chars
     keep = [c for c in dict.fromkeys(keep) if c in yp.columns]
     return yp[keep].sort_values(['cusip', 'date'], kind='stable').reset_index(drop=True), chars
-
 
 t0 = time.perf_counter()
 model, CHARS = build_model_panel(raw_panel, CFG)
@@ -490,7 +473,6 @@ def date_weights(dates: pd.DatetimeIndex, rr: np.ndarray, nobs: np.ndarray, cfg:
         w = np.where(dates.isin(list(repricing)), 0.0, w)
     return w
 
-
 def precompute_moments(frame: pd.DataFrame, chars: list[str], target: str, weighted: bool = True) -> dict:
     dates = pd.DatetimeIndex(sorted(frame['date'].unique()))
     L = len(chars)
@@ -502,7 +484,6 @@ def precompute_moments(frame: pd.DataFrame, chars: list[str], target: str, weigh
         A[i] = Z.T @ Z; b[i] = Z.T @ r; rr[i] = float(r @ r); nobs[i] = len(g)
     w = date_weights(dates, rr, nobs, CFG, DISPERSION_DAYS) if weighted else np.ones(len(dates))
     return {'dates': dates, 'A': A * w[:, None, None], 'b': b * w[:, None], 'rr': rr * w, 'nobs': nobs, 'chars': list(chars), 'w': w, 'rr_unweighted': rr}
-
 
 class MomentIPCA:
     """IPCA by alternating least squares on per-date moments (Kelly, Pruitt, Su 2019)."""
@@ -565,7 +546,6 @@ class MomentIPCA:
         sse = self._loss(self.Gamma, self.Factors, m) * max(int(m['nobs'].sum()), 1)
         return 1.0 - sse / max(float(m['rr'].sum()), 1e-12)
 
-
 t0 = time.perf_counter()
 moments = precompute_moments(model, CHARS, TARGET)
 print(f'moments: T={len(moments["dates"])}, L={len(CHARS)}, obs={int(moments["nobs"].sum()):,} | {time.perf_counter()-t0:.1f}s')
@@ -608,8 +588,6 @@ savefig('04_gamma_anatomy')
 record('ipca_full_sample', factor_variance_share=[float(x) for x in fshare], gamma=gamma.round(4).to_dict())
 
 # %% [markdown]
-
-# %% [markdown]
 # ## 5. Walk-forward residuals: refit cadence, regime-conditional Gamma, residuals of record
 #
 # Gamma is estimated on dates strictly before each test block, aligned across versions by orthogonal Procrustes,
@@ -635,7 +613,6 @@ def make_folds(dates: pd.DatetimeIndex, train_start: str, first_oos: str, test_d
         start = end
     return folds
 
-
 def procrustes_align(G: np.ndarray, G_ref: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Rotate G onto G_ref within its own column span. Residuals are unchanged; labels, betas and factor paths
     become continuous across refits instead of swapping when eigenvalues cross."""
@@ -643,10 +620,8 @@ def procrustes_align(G: np.ndarray, G_ref: np.ndarray) -> tuple[np.ndarray, np.n
     R = U @ Vt
     return G @ R, R
 
-
 DATE_DISP = model.groupby('date', observed=True)[TARGET].std().sort_index()           # cross-sectional sd of the target by date
 DATE_DISP_LAG = DATE_DISP.shift(1)                                                      # what is known at the start of a date
-
 
 def walk_forward_residuals(frame: pd.DataFrame, chars: list[str], folds: list[dict], cfg: RunConfig, regime: bool = False, verbose: bool = True):
     """Returns (residual frame, aligned Gammas, raw Gammas). With regime=True each fold fits a high- and a low-dispersion
@@ -697,7 +672,6 @@ def walk_forward_residuals(frame: pd.DataFrame, chars: list[str], folds: list[di
         if verbose:
             print(f'  fold {fo["fold"]:02d} | train ->{fo["train_end"].date()} | test {fo["test_start"].date()}..{fo["test_end"].date()} | {"/".join(G_by)} | {time.perf_counter()-t0:.1f}s')
     return pd.concat(parts, ignore_index=True), pd.concat(gammas), pd.concat(gammas_raw)
-
 
 CADENCE_DAYS = {'weekly': 7, 'monthly': 30, 'quarterly': 91, 'frozen': None, 'regime': CFG.regime_cadence_days}
 runs: dict = {}
@@ -815,7 +789,6 @@ record('mimicking_weights', frobenius_leverage_mean=float(levdiag['frobenius_lev
 record('mimicking_weights', max_beta_orthogonality=float(max(orth)), **{f'{k}_{m}': float(v) for k, row in wsum.iterrows() for m, v in row.items()})
 
 # %% [markdown]
-
 # ## 6b. Factor space: beta-space map, clusters and within-cluster ranking
 #
 # The exhibits the attention-factor paper uses to make latent factors legible, adapted to munis. Bonds are
@@ -840,7 +813,6 @@ snap = resid[resid['date'] == last_date][['cusip', 'pit_residual'] + beta_cols].
 snap['pit_rank'] = snap['pit_residual'].rank(pct=True)
 snap['rating_bucket'] = pd.cut(snap['rating_score'], bins=[-1, 11.5, 14.5, 17.5, 20.5, 21.5], labels=['BB and below', 'BBB', 'A', 'AA', 'AAA']).astype(str).replace('nan', 'NR')
 
-
 def bond_label(r: pd.Series, width: int = 26) -> str:
     name = r.get('long_comp_name')
     name = str(name)[:width] if isinstance(name, str) and name.strip() else str(r['cusip'])
@@ -849,7 +821,6 @@ def bond_label(r: pd.Series, width: int = 26) -> str:
     rating = r['rating'] if isinstance(r.get('rating'), str) else 'NR'
     call = {'bullet': 'B', 'priced-to-call': 'C*', 'callable, to maturity': 'C'}.get(r.get('call_structure'), '?')
     return f"{name} {cpn} {mat} {rating} {call}"
-
 
 snap['label'] = snap.apply(bond_label, axis=1)
 Bs = snap[beta_cols].to_numpy(float); Bs = (Bs - Bs.mean(axis=0)) / np.maximum(Bs.std(axis=0), 1e-12)
@@ -903,7 +874,6 @@ snap.drop(columns=['label']).to_parquet(ARTIFACTS / f'beta_space_snapshot_{last_
 record('factor_space', date=str(last_date.date()), embedding=emb_name, clusters=N_CLUSTERS, cluster_profile=profile.round(4).reset_index().to_dict(orient='records'))
 
 # %% [markdown]
-
 # ## 7. Residual dynamics: autocorrelation, activity buckets, the state-space filter
 #
 # The pooled autocorrelation function of the residual at lags 1..10, with and without dispersion days, and the
@@ -951,7 +921,6 @@ resid['next_residual'] = resid.groupby('cusip', observed=True)['pit_residual'].s
 resid['next_date'] = resid.groupby('cusip', observed=True)['date'].shift(-1)
 pairs = resid.dropna(subset=['next_residual'])
 
-
 def daily_rank_ic(frame: pd.DataFrame, x: str, y: str, date_col: str = 'next_date', min_n: int = 50) -> pd.Series:
     out = {}
     for d, g in frame.groupby(date_col, observed=True):
@@ -959,10 +928,8 @@ def daily_rank_ic(frame: pd.DataFrame, x: str, y: str, date_col: str = 'next_dat
             out[d] = g[x].corr(g[y], method='spearman')
     return pd.Series(out)
 
-
 def ic_summary(ic: pd.Series) -> dict:
     return {'ic_mean': float(ic.mean()), 'ic_t': float(np.sqrt(ic.notna().sum()) * ic.mean() / ic.std()) if ic.std() > 0 else np.nan, 'dates': int(ic.notna().sum())}
-
 
 bucket_rows = []
 for b, g in pairs.groupby('activity_bucket', sort=True):
@@ -996,11 +963,9 @@ pairs = resid.dropna(subset=['next_residual']).copy()
 pairs['target_month'] = pairs['next_date'].dt.to_period('M')
 months = sorted(pairs['target_month'].unique())
 
-
 def fit_ridge(X: np.ndarray, y: np.ndarray, alpha: float) -> np.ndarray:
     Xc = np.column_stack([np.ones(len(X)), X])
     return np.linalg.solve(Xc.T @ Xc + alpha * np.eye(Xc.shape[1]), Xc.T @ y)
-
 
 def summarise_forecast(name: str, pred: pd.DataFrame) -> dict:
     if pred.empty:
@@ -1010,7 +975,6 @@ def summarise_forecast(name: str, pred: pd.DataFrame) -> dict:
     ex = pred[~pred['next_date'].isin(DISPERSION_DAYS) & ~pred['date'].isin(DISPERSION_DAYS)]
     return {'forecaster': name, 'rows': len(pred), 'months': pred['month'].nunique(), **ic_summary(ic), 'oos_r2_vs_zero': 1 - ((y - yh) ** 2).sum() / (y ** 2).sum(),
             'sign_acc': float((np.sign(y) == np.sign(yh))[(y != 0) & (yh != 0)].mean()), 'ic_ex_dispersion': ic_summary(daily_rank_ic(ex, 'yhat', 'next_residual'))['ic_mean'] if len(ex) > 1000 else np.nan}
-
 
 def forecaster_eval(name: str, cols: list[str], winsor: bool, alpha: float = 1.0, fitter=None) -> tuple[pd.DataFrame, dict, np.ndarray | None]:
     """Expanding monthly folds. `fitter(Xtr, ytr) -> (predict_fn, coefs)` defaults to ridge; the pooled ARMA(1,1) plugs in here."""
@@ -1037,7 +1001,6 @@ def forecaster_eval(name: str, cols: list[str], winsor: bool, alpha: float = 1.0
         summ['params'] = extra
     return pred, summ, coefs
 
-
 from scipy.optimize import minimize  # noqa: E402
 
 fc_results, fc_preds, fc_coefs = [], {}, {}
@@ -1049,7 +1012,6 @@ for name, cols, winsor, fitter in FC_SPECS:
     print(f'{name}: {time.perf_counter()-t0:.1f}s', '' if 'params' not in summ else summ['params'])
 
 # %% [markdown]
-
 # ### 7b. The signal of record: state-space filter, AR drift plus mark-noise, by activity bucket
 #
 # The structural reading of the residual diagnostics is two components: a slow, persistent deviation of the bond
@@ -1072,10 +1034,8 @@ for name, cols, winsor, fitter in FC_SPECS:
 # %%
 LOG2PI = np.log(2.0 * np.pi)
 
-
 def ssm_unpack(theta: np.ndarray) -> tuple[float, float, float, float]:
     return float(np.tanh(theta[0])), float(np.exp(theta[1])), float(np.exp(theta[2])), float(np.exp(theta[3]))
-
 
 def ssm_filter(Y: np.ndarray, params: tuple[float, float, float, float], want_paths: bool = False):
     """Batched Kalman filter over an (N bonds, T observations) matrix with NaN padding. Returns per-bond log-likelihood
@@ -1098,7 +1058,6 @@ def ssm_filter(Y: np.ndarray, params: tuple[float, float, float, float], want_pa
             fwd[:, t] = (m @ Tm.T) @ H; m_path[:, t] = m[:, 0]; eta_path[:, t] = m[:, 1]
     return ll, fwd, m_path, eta_path
 
-
 def ssm_fit(Y: np.ndarray, theta0: np.ndarray | None = None, maxiter: int = 120) -> tuple[np.ndarray, float]:
     theta0 = np.array([np.arctanh(0.9), np.log(0.5), np.log(2.0), np.log(3.0)]) if theta0 is None else np.asarray(theta0, float)
     n_obs = max(int(np.isfinite(Y).sum()), 1)
@@ -1111,7 +1070,6 @@ def ssm_fit(Y: np.ndarray, theta0: np.ndarray | None = None, maxiter: int = 120)
     sol = minimize(nll, theta0, method='Nelder-Mead', options={'maxiter': maxiter, 'xatol': 1e-4, 'fatol': 1e-7})
     return sol.x, float(-sol.fun)
 
-
 def ssm_implied_taps(params, L_: int = 12) -> np.ndarray:
     """The filter as a linear forecaster: response of the one-step forecast to a unit increment j observations ago."""
     Y = np.zeros((L_, 60 + L_))
@@ -1119,12 +1077,10 @@ def ssm_implied_taps(params, L_: int = 12) -> np.ndarray:
         Y[j, 60 + L_ - 1 - j] = 1.0
     return ssm_filter(Y, params, want_paths=True)[1][:, -1]
 
-
 def to_sequences(frame: pd.DataFrame, value_col: str) -> tuple[np.ndarray, pd.DataFrame]:
     f = frame.sort_values(['cusip', 'date'], kind='stable').copy(); f['obs_idx'] = f.groupby('cusip', observed=True).cumcount()
     wide = f.pivot(index='cusip', columns='obs_idx', values=value_col)
     return wide.to_numpy(float), f.assign(_row_bond=f['cusip'].map({c: i for i, c in enumerate(wide.index)}))
-
 
 def ssm_walk_forward(name: str, by_bucket: bool) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
     """Expanding monthly folds. Parameters are estimated on training observations only (subsampled bonds); the filter then
@@ -1182,7 +1138,6 @@ def ssm_walk_forward(name: str, by_bucket: bool) -> tuple[pd.DataFrame, dict, pd
     pred = pd.concat(preds, ignore_index=True) if preds else pd.DataFrame()
     pred = pred.dropna(subset=['next_residual']).assign(month=lambda d: d['target_month'].astype(str)) if not pred.empty else pred
     return pred, summarise_forecast(name, pred), pd.DataFrame(param_rows)
-
 
 t0 = time.perf_counter()
 ssm_pred, ssm_summ, ssm_params = ssm_walk_forward('State-space AR drift + mark noise (pooled), winsor', by_bucket=False)
@@ -1244,7 +1199,6 @@ savefig('07_two_regime')
 record('residual_diagnostics', two_regime=two_regime.reset_index().astype({'res_bin': str}).round(4).to_dict(orient='records'))
 
 # %% [markdown]
-
 # ## 8. Paper portfolio: is the residual path harvestable?
 #
 # Every forecaster from Section 7 is run as a signal. Forecasts are divided by the bond's trailing vol, cross-sectionally
@@ -1259,11 +1213,9 @@ record('residual_diagnostics', two_regime=two_regime.reset_index().astype({'res_
 
 nxt = resid[['cusip', 'date', 'target_bp']].rename(columns={'date': 'next_date', 'target_bp': 'next_target_bp'})
 
-
 def prep_portfolio_frame(pred: pd.DataFrame) -> pd.DataFrame:
     pp = pred.merge(resid[['cusip', 'date', 'target_abs_vol'] + beta_cols], on=['cusip', 'date'], how='left')
     return pp.merge(nxt, on=['cusip', 'next_date'], how='left').dropna(subset=['next_target_bp'] + beta_cols)
-
 
 def portfolio_pnl(frame: pd.DataFrame, hedge: bool = True, signal_col: str = 'yhat', scaling: str | None = None) -> pd.Series:
     """scaling: 'raw' uses the forecast in bp as the weight (concentrates gross in volatile names and takes cross-bucket
@@ -1287,10 +1239,8 @@ def portfolio_pnl(frame: pd.DataFrame, hedge: bool = True, signal_col: str = 'yh
         out[d] = float((w / gross) @ g['next_target_bp'].to_numpy(float))
     return pd.Series(out).sort_index()
 
-
 def sharpe(x: pd.Series) -> float:
     return float(np.sqrt(252) * x.mean() / x.std()) if len(x) > 2 and x.std() > 0 else np.nan
-
 
 # Candidate signals: every forecaster from Section 7 (the by-bucket state-space filter learns its own sign per bucket)
 signals = {k: prep_portfolio_frame(v) for k, v in fc_preds.items() if not v.empty}
@@ -1333,7 +1283,6 @@ best_portfolio = paper['ALL'].idxmax()
 record('paper_portfolio', table=paper.round(4).reset_index().to_dict(orient='records'), walk_forward_choices=choices, selected_sharpe=float(sharpe(pnl_selected)) if len(pnl_selected) else None, best_by_all=best_portfolio)
 
 # %% [markdown]
-
 # ## 9. Transaction validation (PIT-safe)
 #
 # Each matched trade is joined to the latest residual dated **strictly before** the trade date. Targets:
@@ -1400,7 +1349,6 @@ def standardize_trades(tr: pd.DataFrame) -> pd.DataFrame:
     t['recency_bucket'] = pd.cut(t['recency_days'], bins=[-0.01, 1, 3, 7, 21, np.inf], labels=['<=1d', '1-3d', '3-7d', '7-21d', '>21d']).astype(str).replace('nan', 'first_print')
     return t
 
-
 def join_trades_to_residual(t: pd.DataFrame, res: pd.DataFrame, min_age: int) -> pd.DataFrame:
     extra = [c for c in ['eta_abs', 'ssm_drift', 'ssm_signal', 'fitted_bp'] if c in res.columns]
     score = res[['cusip', 'date', 'pit_residual', 'activity_bucket', 'resid_mean', 'resid_sd', 'target_abs_vol'] + extra + beta_cols].copy()
@@ -1442,7 +1390,6 @@ def join_trades_to_residual(t: pd.DataFrame, res: pd.DataFrame, min_age: int) ->
     j['mark_revision_bp'] = 100.0 * (j['y_close_trade_date'] - j['y_prior_mark'])
     return j.reset_index(drop=True)
 
-
 def block_bootstrap_t(slopes: np.ndarray, block: int = 5, n_boot: int = 500, seed: int = 0) -> float:
     """Moving-block bootstrap over the daily slopes: the FM t assumes independent dates, but the 125 trade dates share
     27 Gammas and the daily slopes are autocorrelated within a month. Returns mean / bootstrap sd of the mean."""
@@ -1454,7 +1401,6 @@ def block_bootstrap_t(slopes: np.ndarray, block: int = 5, n_boot: int = 500, see
         starts = rng.integers(0, n - block + 1, nb); idx = (starts[:, None] + np.arange(block)[None, :]).ravel()[:n]; means[i] = slopes[idx].mean()
     sd = means.std()
     return float(slopes.mean() / sd) if sd > 0 else np.nan
-
 
 def fm_slope(frame: pd.DataFrame, y: str, x: str, controls: list[str], date_col: str = 'trade_date', min_n: int = 30) -> dict:
     """Pooled OLS (descriptive) and Fama-MacBeth over dates (inference) for the slope on x."""
@@ -1476,7 +1422,6 @@ def fm_slope(frame: pd.DataFrame, y: str, x: str, controls: list[str], date_col:
             'fm_beta': slopes.mean() if len(slopes) else np.nan, 'fm_t': np.sqrt(len(slopes)) * slopes.mean() / slopes.std() if len(slopes) > 2 and slopes.std() > 0 else np.nan, 'fm_dates': len(slopes),
             'boot_t': block_bootstrap_t(slopes, CFG.block_days, CFG.n_boot, CFG.seed)}
 
-
 def fm_multi(frame: pd.DataFrame, y: str, xs: list[str], controls: list[str], date_col: str = 'trade_date', min_n: int = 30) -> pd.DataFrame:
     """Fama-MacBeth with several scores entered jointly: one row per score with the FM beta and t."""
     f = frame.dropna(subset=[y] + xs).copy()
@@ -1491,7 +1436,6 @@ def fm_multi(frame: pd.DataFrame, y: str, xs: list[str], controls: list[str], da
         return pd.DataFrame({'score': xs, 'fm_beta': np.nan, 'fm_t': np.nan, 'boot_t': np.nan, 'fm_dates': len(slopes), 'n': len(f)})
     S = np.array(slopes)
     return pd.DataFrame({'score': xs, 'fm_beta': S.mean(axis=0), 'fm_t': np.sqrt(len(S)) * S.mean(axis=0) / S.std(axis=0), 'boot_t': [block_bootstrap_t(S[:, j], CFG.block_days, CFG.n_boot, CFG.seed) for j in range(S.shape[1])], 'fm_dates': len(S), 'n': len(f)})
-
 
 def neutralised_fm(frame: pd.DataFrame, y: str, x: str, cells: list[str], date_col: str = 'trade_date') -> dict:
     f = frame.dropna(subset=[y, x]).copy()
