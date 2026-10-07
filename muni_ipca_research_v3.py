@@ -1913,7 +1913,13 @@ else:
 
 # %%
 if HAS_TRADES and 'bk' in globals() and 'msrb_price' in bk.columns:
-    bk['dollar_per_bp'] = (bk['msrb_quantity'].clip(lower=0).fillna(0) * bk['msrb_price'].fillna(100) / 100.0 * bk['modified_duration_lag1'].clip(lower=0).fillna(0) * 1e-4)
+    # par must be finite and plausible: the raw MSRB quantity field carries a few inf / absurd values that would swamp every sum
+    _q = pd.to_numeric(bk['msrb_quantity'], errors='coerce').replace([np.inf, -np.inf], np.nan)
+    _bad = _q.isna() | (_q <= 0) | (_q > 1e8)
+    print(f'par filter for the dollar view: {int(_bad.sum()):,} of {len(bk):,} trades dropped (non-finite, non-positive or above $100mm par)')
+    bk = bk[~_bad].copy(); bk['msrb_quantity'] = _q[~_bad].astype(float)
+    _px = pd.to_numeric(bk['msrb_price'], errors='coerce').replace([np.inf, -np.inf], np.nan).clip(1, 300).fillna(100.0)
+    bk['dollar_per_bp'] = (bk['msrb_quantity'] * _px / 100.0 * bk['modified_duration_lag1'].clip(lower=0).fillna(0) * 1e-4)
     DOL = {'C EWMA rule': 'e_C_bp', 'F revised third term': 'e_F_bp', 'G factor-beta correction': 'e_G_bp', 'D level model': 'e_D_bp'}
     for k, c in DOL.items():
         bk[f'$ removed [{k}]'] = (bk['e_algo_bp'].abs() - bk[c].abs()) * bk['dollar_per_bp']
