@@ -42,7 +42,7 @@
 # 9. Transaction validation of the signal of record (Fama-MacBeth with block bootstrap)
 # 10. Algo error correction: persistence, point-in-time error features, baselines, level model with and without them
 # 11. Conformal band around the chosen mid: split (monthly) and rolling (10-day) calibration
-# 12. Where the gains live: breakdown by characteristics, factor betas and beta-space clusters
+# 12. Where the gains live: breakdown by characteristics, factor betas and beta-space clusters; 12b what they are worth in dollars
 # 13. Systematic path: factor roll-forward of stale marks, by segment
 # 14. Results registry and summary
 # 15. Robustness: dispersion-day exclusions, bootstrap inference, pre-registered choices
@@ -150,7 +150,7 @@ PRE_REGISTERED = {
     'selected_k': 3, 'record_cadence': 'monthly', 'level_signal_window': 20, 'activity_window': 20,
     'record_signal': 'pooled state-space filter (the by-bucket filter stays as a diagnostic)', 'ewma_half_life_prints': 3,
     'revised_third_term': 'algo + per-side intercept + rho x EWMA(past algo errors), all estimated on prior months',
-    'conformal_rolling_window_days': 10, 'breakdown_axes': 'duration, call structure, rating, state, liquidity, factor-beta terciles, 8 beta-space clusters fitted on the first OOS month',
+    'conformal_rolling_window_days': 10, 'band_benchmark': 'fixed width rescaled on the same rolling window', 'dollar_metric': '(|algo error| - |mid error|) x par x price/100 x modified duration x 1e-4, summed per month', 'breakdown_axes': 'duration, call structure, rating, state, liquidity, factor-beta terciles, 8 beta-space clusters fitted on the first OOS month',
     'dispersion_rule': 'share of |target - median_t| > 10 bp above 10% of bonds -> zero weight in the fit',
     'common_move_rule': '|median_t| > 10 bp -> flagged and kept', 'partial_day_rule': 'bonds priced < 60% of trailing-20-date median -> dropped',
     'date_weighting': 'inverse variance, cap 4x', 'duration_instrument': 'ratio',
@@ -1546,7 +1546,8 @@ else:
 # *Baselines and model, walk-forward by month.* (A) the algo quote; (B) algo + $\rho(\text{age})\times$ last
 # error, with $\rho$ per age bucket estimated on prior months; (C) algo + $\rho \times$ EWMA error; (D) a
 # gradient-boosted level model on the trade's spread to MMD with the algo-derived and print features of v2.3 plus
-# the error features; (D$^-$) the same without the error features. All are scored against the print they were
+# the error features; (D$^-$) the same without the error features; (G) the algo plus a Fama-MacBeth correction on the
+# three factor betas, the direct factor-model baseline; (H) the revised third term plus that factor correction. All are scored against the print they were
 # matched to, by error age and by side, with Fama-MacBeth and block-bootstrap t-statistics.
 
 # %%
@@ -1647,6 +1648,18 @@ if HAS_TRADES and not tv.empty and 'cum_fitted_bp' in tv.columns:
         rho_F = fm_slope(trs, 'e_sd', 'ewm_algo_err_bp', ['log_size'])['fm_beta']
         te['e_F_bp'] = te['e_E_bp'] - (rho_F * te['ewm_algo_err_bp']).fillna(0.0)
         rho_rows[-1]['rho_F'] = rho_F; rho_rows[-1].update({f'side_bias[{s}]': float(v) for s, v in side_med.items()})
+        # (G) the direct factor-model correction: the algo error regressed on the three factor betas (Fama-MacBeth on prior
+        # months, intercept from the training mean). (H) the same on top of F. If the algo mis-prices along a factor axis,
+        # G removes it without any per-bond history; if H adds nothing over F, the error history already carries it.
+        trb = tr.dropna(subset=beta_cols)
+        bG = fm_multi(trb, 'e_algo_bp', beta_cols, ['log_size']).set_index('score')['fm_beta']
+        aG = float((trb['e_algo_bp'] - trb[beta_cols].to_numpy(float) @ bG.reindex(beta_cols).to_numpy(float)).mean())
+        te['e_G_bp'] = te['e_algo_bp'] - (aG + te[beta_cols].fillna(0.0).to_numpy(float) @ bG.reindex(beta_cols).to_numpy(float))
+        trsb = trs.dropna(subset=beta_cols).assign(e_F=lambda d: d['e_sd'] - rho_F * d['ewm_algo_err_bp'])
+        bH = fm_multi(trsb, 'e_F', beta_cols, ['log_size']).set_index('score')['fm_beta']
+        aH = float((trsb['e_F'] - trsb[beta_cols].to_numpy(float) @ bH.reindex(beta_cols).to_numpy(float)).mean())
+        te['e_H_bp'] = te['e_F_bp'] - (aH + te[beta_cols].fillna(0.0).to_numpy(float) @ bH.reindex(beta_cols).to_numpy(float))
+        rho_rows[-1].update({f'bG_{b}': float(bG[b]) for b in beta_cols}); rho_rows[-1].update({f'bH_{b}': float(bH[b]) for b in beta_cols})
         # (D) and (D-) level models on the spread to MMD
         yD, impD = fit_gbm(tr, te, FULL_FEATURES, 'spread_bp', CFG.level_model_trees); te['e_D_bp'] = te['spread_bp'] - yD
         yDm, _ = fit_gbm(tr, te, BASE_FEATURES, 'spread_bp', CFG.level_model_trees); te['e_Dminus_bp'] = te['spread_bp'] - yDm
@@ -1656,7 +1669,7 @@ if HAS_TRADES and not tv.empty and 'cum_fitted_bp' in tv.columns:
         parts.append(te); print(f'  {m}: train {len(tr):,} | test {len(te):,} | rho by age {{{", ".join(f"{k}: {v:+.2f}" for k, v in rho_age.items())}}} | rho_ewm {rho_ewm:+.2f} | {time.perf_counter()-t0:.0f}s')
     ecp = pd.concat(parts, ignore_index=True); rho_path = pd.DataFrame(rho_rows).set_index('month')
     print('Error-correction coefficients by month (estimated on prior months):'); display(rho_path.round(3))
-    PREDS = {'A algo quote': 'e_algo_bp', 'B algo + rho(age) x last error': 'e_B_bp', 'C algo + rho x EWMA error': 'e_C_bp', 'E algo + side intercept': 'e_E_bp', 'F revised third term (side intercept + rho x EWMA)': 'e_F_bp', 'D level model with error features': 'e_D_bp', 'D- level model without error features': 'e_Dminus_bp'}
+    PREDS = {'A algo quote': 'e_algo_bp', 'B algo + rho(age) x last error': 'e_B_bp', 'C algo + rho x EWMA error': 'e_C_bp', 'E algo + side intercept': 'e_E_bp', 'F revised third term (side intercept + rho x EWMA)': 'e_F_bp', 'G algo + factor-beta correction': 'e_G_bp', 'H revised third term + factor-beta correction': 'e_H_bp', 'D level model with error features': 'e_D_bp', 'D- level model without error features': 'e_Dminus_bp'}
 
     def ec_table(frame: pd.DataFrame, by: str) -> pd.DataFrame:
         g = frame.groupby(by, observed=True); out = pd.DataFrame({'n': g.size()})
@@ -1708,7 +1721,8 @@ else:
 # the level model D. The v31 run showed the monthly split-conformal scale cannot follow a regime shift inside the
 # test month (September covered 64%), so a **rolling** variant is added: the scale for each test date is the target
 # quantile of the normalised scores over the previous ten trading days, and the quantile model gets the lagged
-# cross-sectional dispersion of the market as a feature.
+# cross-sectional dispersion of the market as a feature. The fair benchmark for any conditional band is a fixed
+# width rescaled on the same window ("rolling fixed"); the efficiency table reports half-width per point of coverage.
 
 # %%
 if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
@@ -1744,10 +1758,19 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
                 pool = np.concatenate([daily_scores[x] for x in prev]) if prev else np.array([s])
                 s_roll[d] = float(np.quantile(pool, CFG.band_coverage)) if len(pool) > 50 else s
             te['s_rolling'] = te['trade_date'].map(s_roll); te['hw_rolling'] = te['s_rolling'] * q_te
-            bands.append(te[['cusip', 'trade_date', 'side', 'age_bucket', 'recency_bucket', 'month', 'mid', 'abs_err', 'hw_fixed', 'hw_quantile', 'hw_conformal', 'hw_rolling', 's_conformal', 's_rolling']])
+            # the fair benchmark for the conditional band: a FIXED width rescaled on the same rolling window (the target quantile of
+            # |error| over the previous conformal_window_days trading days)
+            daily_abs = {d: g[err_col].abs().to_numpy() for d, g in hist_dates.groupby('trade_date')}
+            hw_rf = {}
+            for d in sorted(te['trade_date'].unique()):
+                prev = [x for x in all_days if x < d][-CFG.conformal_window_days:]
+                pool = np.concatenate([daily_abs[x] for x in prev]) if prev else np.array([fixed])
+                hw_rf[d] = float(np.quantile(pool, CFG.band_coverage)) if len(pool) > 50 else fixed
+            te['hw_rolling_fixed'] = te['trade_date'].map(hw_rf)
+            bands.append(te[['cusip', 'trade_date', 'side', 'age_bucket', 'recency_bucket', 'month', 'mid', 'abs_err', 'hw_fixed', 'hw_rolling_fixed', 'hw_quantile', 'hw_conformal', 'hw_rolling', 's_conformal', 's_rolling']])
     if bands:
         bd = pd.concat(bands, ignore_index=True); bd['month'] = bd['month'].astype(str)
-        BANDS = ['fixed', 'quantile', 'conformal', 'rolling']
+        BANDS = ['fixed', 'rolling_fixed', 'quantile', 'conformal', 'rolling']
         for k in BANDS:
             bd[f'cov_{k}'] = (bd['abs_err'] <= bd[f'hw_{k}']).astype(float)
 
@@ -1760,22 +1783,26 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
             display(band_table(g.assign(all='ALL'), 'all').round(3)); display(band_table(g, 'month').round(3)); display(band_table(g, 'side').round(3))
         gD = bd[bd['mid'] == 'level model D'].copy(); gD['width_decile'] = pd.qcut(gD['hw_rolling'].rank(method='first'), 10, labels=False) + 1
         dec = band_table(gD, 'width_decile')
-        print('Calibration by rolling-conformal width decile, level model D mid (flat at the target = calibrated):'); display(dec[['n', 'coverage fixed', 'coverage quantile', 'coverage conformal', 'coverage rolling', 'half-width rolling (bp)']].round(3))
+        print('Calibration by rolling-conformal width decile, level model D mid (flat at the target = calibrated):'); display(dec[['n', 'coverage fixed', 'coverage rolling_fixed', 'coverage quantile', 'coverage conformal', 'coverage rolling', 'half-width rolling_fixed (bp)', 'half-width rolling (bp)']].round(3))
+        _eff = bd.groupby('mid')[[f'cov_{k}' for k in BANDS] + [f'hw_{k}' for k in BANDS]].mean()
+        eff = pd.DataFrame({k: {'coverage': _eff[f'cov_{k}'], 'half-width (bp)': _eff[f'hw_{k}']} for k in BANDS}).T if False else pd.concat({k: pd.DataFrame({'coverage': _eff[f'cov_{k}'], 'half-width (bp)': _eff[f'hw_{k}']}) for k in BANDS}, names=['band', 'mid'])
+        eff['width per point of coverage'] = eff['half-width (bp)'] / (100 * eff['coverage'])
+        print('Band efficiency by mid: half-width per point of coverage (lower is better; the rolling fixed band is the fair benchmark for the conditional bands)'); display(eff.round(3))
         s_path = bd[bd['mid'] == 'level model D'].groupby('trade_date')[['s_conformal', 's_rolling']].first()
         fig, ax = plt.subplots(1, 3, figsize=(19, 4.3))
-        for k, st in [('fixed', 's--'), ('quantile', '^-.'), ('conformal', 'o-'), ('rolling', 'D-')]:
-            ax[0].plot(dec.index, dec[f'coverage {k}'], st, label=k)
+        for k, st in [('fixed', 's--'), ('rolling_fixed', 'x--'), ('quantile', '^-.'), ('conformal', 'o-'), ('rolling', 'D-')]:
+            ax[0].plot(dec.index, dec[f'coverage {k}'], st, label=k.replace('_', ' '))
         ax[0].axhline(CFG.band_coverage, color='k', ls='--', lw=0.8); ax[0].set_ylim(0.4, 1.0); ax[0].set_xlabel('rolling-conformal half-width decile'); ax[0].legend(fontsize=8); ax[0].set_title('Coverage by predicted-width decile (level model D mid)', fontsize=10)
-        dcov = bd[bd['mid'] == 'level model D'].groupby('trade_date')[['cov_fixed', 'cov_conformal', 'cov_rolling']].mean().rolling(5).mean()
-        for k, c in [('fixed', 'grey'), ('conformal', '#4C72B0'), ('rolling', '#C44E52')]:
-            ax[1].plot(dcov.index, dcov[f'cov_{k}'], color=c, lw=1.2, label=k)
+        dcov = bd[bd['mid'] == 'level model D'].groupby('trade_date')[['cov_fixed', 'cov_rolling_fixed', 'cov_conformal', 'cov_rolling']].mean().rolling(5).mean()
+        for k, c in [('fixed', 'grey'), ('rolling_fixed', 'k'), ('conformal', '#4C72B0'), ('rolling', '#C44E52')]:
+            ax[1].plot(dcov.index, dcov[f'cov_{k}'], color=c, lw=1.2, label=k.replace('_', ' '))
         ax[1].axhline(CFG.band_coverage, color='k', ls='--', lw=0.8); ax[1].legend(fontsize=8); ax[1].set_title('Daily coverage (5-day mean), level model D mid: monthly vs rolling calibration', fontsize=10)
         ax2 = ax[1].twinx(); ax2.plot(s_path.index, s_path['s_rolling'], color='#C44E52', ls=':', lw=0.8); ax2.set_ylabel('rolling scale s', color='#C44E52')
-        bw = bd.groupby(['mid', 'side'])[['hw_fixed', 'hw_rolling']].mean()
-        bw.plot.bar(ax=ax[2]); ax[2].set_title('Mean half-width by mid and side (bp)', fontsize=10); ax[2].set_xlabel(''); ax[2].legend(['fixed', 'rolling conformal'], fontsize=8); ax[2].tick_params(axis='x', labelsize=7)
+        bw = bd.groupby(['mid', 'side'])[['hw_rolling_fixed', 'hw_rolling']].mean()
+        bw.plot.bar(ax=ax[2]); ax[2].set_title('Mean half-width by mid and side (bp): rolling fixed vs rolling conformal', fontsize=10); ax[2].set_xlabel(''); ax[2].legend(['rolling fixed', 'rolling conformal'], fontsize=8); ax[2].tick_params(axis='x', labelsize=7)
         savefig('11_conformal_band')
         bd.to_parquet(ARTIFACTS / 'conformal_band_v3.parquet', index=False)
-        record('conformal_band', features=BAND_FEATURES, by_mid={mid_name: band_table(g.assign(all='ALL'), 'all').round(4).to_dict(orient='records')[0] for mid_name, g in bd.groupby('mid')}, by_width_decile=dec.round(4).reset_index().to_dict(orient='records'))
+        record('conformal_band', features=BAND_FEATURES, by_mid={mid_name: band_table(g.assign(all='ALL'), 'all').round(4).to_dict(orient='records')[0] for mid_name, g in bd.groupby('mid')}, by_width_decile=dec.round(4).reset_index().to_dict(orient='records'), efficiency=eff.round(4).reset_index().to_dict(orient='records'))
     else:
         print('Section 11: not enough months for train / calibration / test.')
 else:
@@ -1802,7 +1829,7 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
     for j in range(CFG.selected_k):
         bk[f'beta{j+1}_tercile'] = bk.groupby('trade_date', observed=True)[f'beta{j+1}'].transform(lambda s: pd.qcut(s.rank(method='first'), 3, labels=['low', 'mid', 'high']).astype(str) if s.notna().sum() > 30 else 'NA')
     bk['cluster'] = bk['beta_cluster'].map(CLUSTER_LABEL).fillna('NA')
-    MIDS_BK = {'A algo quote': 'e_algo_bp', 'E algo + side intercept': 'e_E_bp', 'F revised third term': 'e_F_bp', 'D level model': 'e_D_bp'}
+    MIDS_BK = {'A algo quote': 'e_algo_bp', 'E algo + side intercept': 'e_E_bp', 'F revised third term': 'e_F_bp', 'G factor-beta correction': 'e_G_bp', 'D level model': 'e_D_bp'}
 
     def gain_table(frame: pd.DataFrame, by: str, n_min: int) -> pd.DataFrame:
         g = frame.groupby(by, observed=True); out = pd.DataFrame({'n': g.size()})
@@ -1872,6 +1899,56 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
     record('breakdown', segments={k: v.round(4).reset_index().to_dict(orient='records') for k, v in seg_tables.items()}, top_cells=cells.head(10).round(4).reset_index().to_dict(orient='records'), beta_loading=beta_loading.round(4).to_dict(orient='records'), signal_by_cluster=sig_cluster.round(4).reset_index().to_dict(orient='records'))
 else:
     print('Section 12 skipped: needs Section 10.')
+
+# %% [markdown]
+# ### 12b. What the gains are worth: par- and DV01-weighted error removed
+#
+# A basis point of yield error is not a dollar until it is multiplied by the trade's par and the bond's dollar
+# duration. For every held-out trade the dollar value of one basis point is par x price / 100 x modified duration
+# x 0.0001, and the dollar error removed by a mid is (|algo error| - |mid error|) x that value. Summed by month and
+# by segment this is the mis-pricing the correction removes, in dollars, on the trades that actually printed. It is
+# an accuracy measure, not a P&L: how much of it a desk captures depends on which quotes are hit, which is the
+# fill model this notebook does not have. The par-weighted gain in bp is reported next to it so the two views can
+# be compared.
+
+# %%
+if HAS_TRADES and 'bk' in globals() and 'msrb_price' in bk.columns:
+    bk['dollar_per_bp'] = (bk['msrb_quantity'].clip(lower=0).fillna(0) * bk['msrb_price'].fillna(100) / 100.0 * bk['modified_duration_lag1'].clip(lower=0).fillna(0) * 1e-4)
+    DOL = {'C EWMA rule': 'e_C_bp', 'F revised third term': 'e_F_bp', 'G factor-beta correction': 'e_G_bp', 'D level model': 'e_D_bp'}
+    for k, c in DOL.items():
+        bk[f'$ removed [{k}]'] = (bk['e_algo_bp'].abs() - bk[c].abs()) * bk['dollar_per_bp']
+        bk[f'par-bp [{k}]'] = (bk['e_algo_bp'].abs() - bk[c].abs()) * bk['msrb_quantity'].clip(lower=0).fillna(0)
+    months_held = bk['month'].nunique()
+
+    def dollar_table(frame: pd.DataFrame, by: str, n_min: int = 0) -> pd.DataFrame:
+        g = frame.groupby(by, observed=True)
+        out = pd.DataFrame({'trades': g.size(), 'par traded ($mm)': g['msrb_quantity'].sum() / 1e6, 'algo |error| ($k)': (frame['e_algo_bp'].abs() * frame['dollar_per_bp']).groupby(frame[by], observed=True).sum() / 1e3})
+        for k in DOL:
+            out[f'$ removed per month ($k) [{k}]'] = g[f'$ removed [{k}]'].sum() / 1e3 / months_held
+            out[f'par-weighted gain (bp) [{k}]'] = g[f'par-bp [{k}]'].sum() / g['msrb_quantity'].sum().replace(0, np.nan)
+        return out[out['trades'] >= n_min]
+
+    dol_month = dollar_table(bk, 'month'); dol_month.index = dol_month.index.astype(str)
+    dol_all = dollar_table(bk.assign(all='ALL'), 'all')
+    print(f'Dollar error removed on held-out trades ({months_held} months, {len(bk):,} trades, {bk["msrb_quantity"].sum()/1e9:.1f} bn par):'); display(dol_all.T.round(2))
+    print('By month:'); display(dol_month[['trades', 'par traded ($mm)'] + [c for c in dol_month.columns if c.startswith('$ removed')]].round(1))
+    dol_seg = {name: dollar_table(bk, col, CFG.n_min_cell) for name, col in [('rating bucket', 'rating_bucket'), ('duration bucket', 'dur_bucket'), ('call structure', 'call_structure'), ('beta-space cluster', 'cluster')]}
+    for name, tbl in dol_seg.items():
+        print(f'By {name}:'); display(tbl[['trades', 'par traded ($mm)', 'algo |error| ($k)'] + [c for c in tbl.columns if '$ removed' in c]].round(1))
+    dol_cells = dollar_table(bk, 'cell', CFG.n_min_cell).sort_values('$ removed per month ($k) [F revised third term]', ascending=False)
+    print('Top characteristic cells by dollars removed per month, revised third term:'); display(dol_cells.head(10)[['trades', 'par traded ($mm)', 'algo |error| ($k)', '$ removed per month ($k) [F revised third term]', 'par-weighted gain (bp) [F revised third term]', '$ removed per month ($k) [D level model]']].round(1))
+    _pos = bk.groupby('cell', observed=True)['$ removed [F revised third term]'].sum(); _parc = bk.groupby('cell', observed=True)['msrb_quantity'].sum()
+    print(f'share of par traded in cells where the revised third term removes error: {_parc[_pos > 0].sum() / _parc.sum():.1%} | share of dollars removed coming from the top 10 cells: {dol_cells.head(10)["$ removed per month ($k) [F revised third term]"].sum() / max(dol_cells["$ removed per month ($k) [F revised third term]"].clip(lower=0).sum(), 1e-9):.1%}')
+    fig, ax = plt.subplots(1, 3, figsize=(19, 4.8))
+    dol_month[[c for c in dol_month.columns if c.startswith('$ removed')]].rename(columns=lambda c: c.split('[')[1].rstrip(']')).plot.bar(ax=ax[0]); ax[0].axhline(0, color='k', lw=0.6); ax[0].set_title('Dollar error removed per month ($k), by mid', fontsize=10); ax[0].set_xlabel(''); ax[0].legend(fontsize=8)
+    _dc = dol_seg['beta-space cluster'][[c for c in dol_seg['beta-space cluster'].columns if c.startswith('$ removed')]].rename(columns=lambda c: c.split('[')[1].rstrip(']'))
+    _dc.plot.barh(ax=ax[1]); ax[1].axvline(0, color='k', lw=0.6); ax[1].set_title('Dollar error removed per month ($k) by beta-space cluster', fontsize=10); ax[1].set_ylabel(''); ax[1].legend(fontsize=7); ax[1].tick_params(axis='y', labelsize=8)
+    _tc = dol_cells.head(10)['$ removed per month ($k) [F revised third term]'][::-1]
+    _tc.plot.barh(ax=ax[2], color='#55A868'); ax[2].set_title('Top 10 characteristic cells: $k removed per month, revised third term', fontsize=10); ax[2].set_ylabel(''); ax[2].tick_params(axis='y', labelsize=7)
+    savefig('12b_dollars_removed')
+    record('dollars', months=months_held, overall=dol_all.round(3).to_dict(orient='records'), by_month=dol_month.round(3).reset_index().to_dict(orient='records'), by_segment={k: v.round(3).reset_index().to_dict(orient='records') for k, v in dol_seg.items()}, top_cells=dol_cells.head(10).round(3).reset_index().to_dict(orient='records'))
+else:
+    print('Section 12b skipped: needs trade par and price.')
 
 # %% [markdown]
 # ## 13. Systematic path: factor roll-forward of stale marks, by segment
@@ -1949,7 +2026,7 @@ if HAS_TRADES and not tv.empty:
 if 'error_correction' in REGISTRY:
     _p = pers.set_index('score'); _o = ec_all.iloc[0]
     summary_rows.append(('Algo error persistence print to print', f"{_p.loc['e_algo_bp_0', 'fm_beta']:+.3f} (t {_p.loc['e_algo_bp_0', 'fm_t']:+.1f}, boot {_p.loc['e_algo_bp_0', 'boot_t']:+.1f})"))
-    summary_rows.append(('Held-out MAE vs print: A | B | C | E | F | D | D-', ' | '.join(f"{_o[f'MAE {k}']:.2f}" for k in PREDS) + ' bp'))
+    summary_rows.append(('Held-out MAE vs print: A | B | C | E | F | G | H | D | D-', ' | '.join(f"{_o[f'MAE {k}']:.2f}" for k in PREDS) + ' bp'))
     if 'last_value_diagnostic' in REGISTRY['error_correction']:
         _lvd = pd.DataFrame(REGISTRY['error_correction']['last_value_diagnostic']).set_index('bucket')
         summary_rows.append(("Algo error on its own last-value adjustment (ALL)", f"{_lvd.loc['ALL', 'fm_beta']:+.3f} (t {_lvd.loc['ALL', 'fm_t']:+.1f}); corr(last error, adjustment) {REGISTRY['error_correction']['corr_last_err_last_value']:+.2f}"))
@@ -1963,6 +2040,15 @@ if 'breakdown' in REGISTRY:
     _tc = pd.DataFrame(REGISTRY['breakdown']['top_cells'])
     if len(_tc):
         summary_rows.append(('Top characteristic cell by gain of the revised third term', f"{_tc.iloc[0]['cell']}: {_tc.iloc[0]['gain F (bp)']:+.2f} bp over {int(_tc.iloc[0]['n']):,} trades"))
+if 'error_correction' in REGISTRY and 'ecp' in globals():
+    _ex = ecp[ecp['modified_duration_lag1'] >= 1.0]
+    summary_rows.append(('Headline MAE excluding duration < 1y: algo | C | F | G | D', ' | '.join(f"{_ex[c].abs().mean():.2f}" for c in ['e_algo_bp', 'e_C_bp', 'e_F_bp', 'e_G_bp', 'e_D_bp']) + f' bp ({len(_ex):,} trades, {len(_ex)/len(ecp):.0%})'))
+if 'conformal_band' in REGISTRY and 'efficiency' in REGISTRY['conformal_band']:
+    _ef = pd.DataFrame(REGISTRY['conformal_band']['efficiency']); _efD = _ef[_ef['mid'] == 'level model D'].set_index('band')
+    summary_rows.append(('Band efficiency, level model D mid (half-width bp per coverage point)', '; '.join(f"{b}: {_efD.loc[b, 'width per point of coverage']:.3f} ({_efD.loc[b, 'coverage']:.0%} at {_efD.loc[b, 'half-width (bp)']:.1f} bp)" for b in ['rolling_fixed', 'rolling'] if b in _efD.index)))
+if 'dollars' in REGISTRY:
+    _d = REGISTRY['dollars']['overall'][0]
+    summary_rows.append(('Dollar error removed per month on held-out prints ($k): C | F | G | D', ' | '.join(f"{_d[f'$ removed per month ($k) [{k}]']:,.0f}" for k in ['C EWMA rule', 'F revised third term', 'G factor-beta correction', 'D level model']) + f" of {_d['algo |error| ($k)'] / REGISTRY['dollars']['months']:,.0f} algo error per month"))
 summary_rows.append(('Roll-forward RMSE reduction, h=1 / h=10', f"{rollf.loc[1, 'rmse_reduction']:.0%} / {rollf.loc[10, 'rmse_reduction']:.0%}"))
 summary = pd.DataFrame(summary_rows, columns=['item', 'result']).set_index('item')
 display(summary)
