@@ -2,7 +2,7 @@
 
 **Yield-space IPCA K=3 v3 factor model of record, state-space residual signal, and print-level error-correction validation | Research decision note for management, quantitative researchers and traders**
 
-*Jer-Shen Chen · v3.6 · run `muni_ipca_research_v41` on data 2026-01-05 to 2026-09-30 · October 2026*
+*Jer-Shen Chen · v3.8 · run `muni_ipca_research_v5` (v3.8 notebook) on data 2026-01-05 to 2026-09-30 · October 2026*
 
 ---
 
@@ -10,7 +10,7 @@
 
 We estimate a three-factor, yield-space Instrumented Principal Components model in which municipal-bond factor loadings are functions of thirteen observable characteristics, and we carry the model through to the quoting engine. On the covered closing-mark panel (1.77 million bond-days, 53,408 CUSIPs, 181 dates), the walk-forward model explains 35.6% of out-of-sample daily yield-change variance with a monthly refit and leaves a point-in-time residual with standard deviation 5.28 bp. Two data rules remove the evaluator artefacts that distorted earlier versions, and the refit-cadence question is closed: monthly, quarterly and frozen Gamma are within 0.3 percentage points of each other. The residual is best described by a pooled state-space filter (near-random-walk drift plus mark noise plus white noise). The filtered drift has daily rank IC +0.083 and a vol-scaled hedged paper Sharpe of 6.8, and the filtered mark noise is a strong mark-quality score (+41.7 bp of trade-versus-mark error per unit, t = 14.9). The residual signal predicts where evaluated marks go; it does not predict where trades print relative to the algo quote (−0.14 bp per rank unit, t = −0.18).
 
-The deployable result sits one layer down. The algo quote's own pricing error persists from one matched print to the next with coefficient +0.59 (t = 22.9), the quote's existing last-value adjustment is already right-sized (−0.037, so there is no mis-scaled term to fix), and a one-coefficient rule that adds 0.9 × EWMA of the bond's past errors on the same side of the market (half-life three prints) lowers held-out MAE against the print from 12.95 to 11.60 bp (+1.36 bp, Fama–MacBeth t = 16.3, block-bootstrap t = 11.7) on 537,845 held-out trades. The side-pooled version of the same rule gains +0.68 bp; keeping the memory on the bond's own side doubles it and turns the short end from a loss into a +2.6 bp gain. The gain is concentrated where the factor framework says it should be: single-A callables (+18 to +22 bp in two cells), 4–6 year bonds (+2.0 bp), short bullets (+1.8 bp) and the high slope-beta tercile (+1.5 bp); it is zero or negative in AAA and in the 6–8 year belly. In dollars of price the rule removes about $2.5 million a month of the quote's $30 million a month of absolute error on the held-out prints, nine tenths of it in single-A callables. The same-side rule gains on all three sides (+2.9 bp on dealer purchases, +1.1 bp on dealer sales, +0.4 bp inter-dealer). Four attempts to bring the correction inside the factor framework, a state-space memory on the print clock, point-in-time pooling of neighbours' errors in beta space, within-cluster relative value from the residual filter and a per-cluster factor loading, were run under the same protocol and all lose to the same-side memory; the reasons are diagnostic and point to a side-specific state-space memory as the next test. The algo's error loads on the slope factor (−30.8 bp per unit beta<sub>2</sub>, t = −4.2) and the correction removes that loading; a direct factor-beta correction does not work on its own (−0.29 bp). A LightGBM level model reaches +1.55 bp but is not yet an object we would deploy. For the quote band, a fixed width rescaled on a ten-day window covers 78% at 11.2 bp and is more efficient than every conditional band we tried. The recommended stack is therefore the factor model as the common-risk layer, the state-space residual filter as the marks-and-risk layer, and the same-side error memory as the quote layer, gated by the beta-space cells the factor model identifies. The evidence supports deploying that memory behind a shadow period and keeping the level model and conditional bands as challengers.
+The deployable result sits one layer down. The algo quote's own pricing error persists from one matched print to the next with coefficient +0.59 (t = 22.9), the quote's existing last-value adjustment is already right-sized (−0.037, so there is no mis-scaled term to fix), and a one-coefficient rule that adds 0.9 × EWMA of the bond's past errors on the same side of the market (half-life three prints) lowers held-out MAE against the print from 12.95 to 11.60 bp (+1.35 bp, Fama–MacBeth t = 16.1, block-bootstrap t = 11.6) on 537,845 held-out trades. The side-pooled version of the same rule gains +0.73 bp; keeping the memory on the bond's own side nearly doubles it and turns the short end from a loss into a +2.6 bp gain. A per-side state-space memory, the same rule with the gain and the gap decay learned by maximum likelihood, reaches +0.79 bp, so the fixed three-print half-life is the right object. The gain is concentrated where the factor framework says it should be: single-A callables (+18 to +22 bp in two cells), 4–6 year bonds (+2.0 bp), short bullets (+1.8 bp) and the high slope-beta tercile (+1.5 bp); it is zero or negative in AAA and in the 6–8 year belly. In dollars of price the same-side rule removes about $2.8 million a month of the quote's $30 million a month of absolute error on the held-out prints, more than the level model, and $2.4 million of it in single-A bonds. The same-side rule gains on all three sides (+2.9 bp on dealer purchases, +1.1 bp on dealer sales, +0.4 bp inter-dealer). Five attempts to bring the correction inside the factor framework, a state-space memory on the print clock with and without a per-side state, point-in-time pooling of neighbours' errors in beta space, within-cluster relative value from the residual filter and a per-cluster factor loading, were run under the same protocol and all lose to the same-side memory; the reasons are diagnostic. The algo's error loads on the slope factor (−30.8 bp per unit beta<sub>2</sub>, t = −4.2) and the correction removes that loading; a direct factor-beta correction does not work on its own (−0.29 bp). A LightGBM level model reaches +1.55 bp but is not yet an object we would deploy. For the quote band, a fixed width rescaled on a ten-day window covers 78% at 11.2 bp and is more efficient than every conditional band we tried. The recommended stack is therefore the factor model as the common-risk layer, the state-space residual filter as the marks-and-risk layer, and the same-side error memory as the quote layer, gated by the beta-space cells the factor model identifies. The evidence supports deploying that memory behind a shadow period and keeping the level model and conditional bands as challengers.
 
 # 1. Motivation and Research Question
 
@@ -212,7 +212,9 @@ and the state-space memory is the filter
 
 $$ m<sub>i,k</sub> = φ<sup>Δd</sup> m<sub>i,k−1</sub> + ξ<sub>i,k</sub>, &nbsp;&nbsp; Var(ξ<sub>i,k</sub>) = q · Δd, &nbsp;&nbsp;&nbsp; e<sup>algo</sup><sub>i,k</sub> − b<sub>side</sub> = m<sub>i,k</sub> + ε<sub>i,k</sub>, &nbsp;&nbsp; Var(ε<sub>i,k</sub>) = r, <span class="eqn">(8)</span> $$
 
-with k indexing the bond's prints and Δd the days between them; (φ, q, r) are maximum-likelihood on prints before the test month and the EWMA is its steady-state special case with φ = 1.
+with k indexing the bond's prints and Δd the days between them; (φ, q, r) are maximum-likelihood on prints before the test month and the EWMA is its steady-state special case with φ = 1. The v3.6 version of K carried one state per bond with a universe side offset; the v3.8 version carries one state per bond **and side**, so the side bias is absorbed by the state itself.
+
+> **Reading guide for the letters.** The two tables above are the full glossary. From here on the text narrows to four mids and names them at every mention: **C** the side-pooled EWMA, kept as the reference; **S** the same-side EWMA, the rule of record; **K** the per-side state-space memory; **D** the gradient-boosted level model, the ceiling. **F**, the side intercept plus side-pooled EWMA, was the rule of record in v3.3 to v3.5 and appears only in the historical tables. Every table and figure in Sections 5.4 to 6 carries a one-line legend so no reader has to return here.
 
 ## 4.9 The quote band
 
@@ -389,6 +391,8 @@ The universe MAE hides the structure the factor model is built to see. Every hel
 | D− level model without error features | 11.76 | +1.26 | 15.8 | 10.1 |
 | **Headline excluding duration < 1 year (474,662 trades)** | A 8.76 · C 7.77 · F 7.84 · G 9.00 · D 7.55 | | | |
 
+*Mids: **C** side-pooled EWMA (reference) · **S** same-side EWMA (rule of record) · **K** per-side state-space memory · **D** gradient-boosted level model · **F** side intercept + side-pooled EWMA (historical) · **A** the algo quote.*
+
 | **Table 10. Gain of the pooled EWMA rule C and the same-side rule S by residual age and MSRB side (bp)** | | | | |
 |---|---|---|---|---|
 | **Bucket** | **n** | **Gain C** | **t (C)** | **Gain S** |
@@ -401,15 +405,17 @@ The universe MAE hides the structure the factor model is built to see. Every hel
 | side P (dealer buys) | 154,995 | +1.61 | 17.9 | +2.93 |
 | side S (dealer sells) | 180,615 | +0.55 | 5.6 | +1.10 |
 
-**Finding 8 — The algo's error is persistent and a two-parameter smoothed memory removes a reliable part of it.** The EWMA coefficient estimated on prior months rises from 0.77 in May to 0.84 in September as the training set grows; the age-bucket coefficients for the single-print rule rise in parallel from 0.3–0.56 to 0.44–0.58. The single-print rule B hurts (−0.23 bp) because one print is noisy; the EWMA rule C gains +0.68 bp with bootstrap t 6.1 and is positive in every age bucket below 21 days and on both customer sides. The side intercepts add nothing on top (F is C with noise added: side biases are P +2 to +4 bp, D −1, S +0.5, and they shrink over the sample). The deployable object is C: algo quote + 0.8 × EWMA of past algo errors with a three-print half-life.
+*Mids: **C** side-pooled EWMA (reference) · **S** same-side EWMA (rule of record) · **K** per-side state-space memory · **D** gradient-boosted level model · **F** side intercept + side-pooled EWMA (historical) · **A** the algo quote.*
 
-**Finding 9 — Correcting the factor exposure directly does not work; correcting the error history does, and it also fixes the factor exposure.** The direct factor-beta correction G is worse than the algo quote (−0.29 bp, t −19) in every segment; added to F it adds 0.07 bp (H). Yet the algo quote's error loads on the slope factor: Fama–MacBeth of the error on the betas gives +12.5 bp per unit β<sub>1</sub> (t 2.7), −30.8 per unit β<sub>2</sub> (t −4.2) and zero on β<sub>3</sub>. Under the revised third term the β<sub>2</sub> loading is +0.8 (t 0.1) and β<sub>1</sub> falls to 8.8. Under the level model it flips to +17.6 (t 3.0), an over-correction. The reading is that the quote mis-prices along the term axis in a way that is bond-specific and persistent; the per-bond error history carries it, a universe-wide beta coefficient cannot.
+**Finding 8 — The algo's error is persistent and a smoothed memory removes a reliable part of it.** The coefficient on the side-pooled EWMA estimated on prior months rises from 0.77 in May to 0.84 in September as the training set grows; the age-bucket coefficients for the single-print rule B (last error × ρ by age) rise in parallel from 0.3–0.56 to 0.44–0.58. B hurts (−0.23 bp) because one print is noisy; C (side-pooled EWMA) gains +0.68 bp with bootstrap t 6.1 and is positive in every age bucket below 21 days and on both customer sides. The side intercepts add nothing on top: F (side intercept + side-pooled EWMA) is C with noise added, the side biases are P +2 to +4 bp, D −1, S +0.5, and they shrink over the sample. This was the v3.3 result; Finding 11 shows the same memory kept on the bond's own side (S) is the deployable object.
 
-**Finding 10 — The level model shows how much is there, not what to deploy.** The LightGBM level model reaches +1.55 bp, of which 0.3 bp comes from the error features (D− is +1.26). The v5 ablation showed the model depends on the side-specific MMD spread change, and its error loading on β<sub>2</sub> is wrong-signed. It is the ceiling against which the two-parameter rule is measured, and the rule gets 44% of the way there with two numbers.
+**Finding 9 — Correcting the factor exposure directly does not work; correcting the error history does, and it also fixes the factor exposure.** G (universe factor-beta correction) is worse than the algo quote (−0.29 bp, t −19) in every segment; added to F (side intercept + side-pooled EWMA) it adds 0.07 bp (H). Yet the algo quote's error loads on the slope factor: Fama–MacBeth of the error on the betas gives +12.5 bp per unit β<sub>1</sub> (t 2.7), −30.8 per unit β<sub>2</sub> (t −4.2) and zero on β<sub>3</sub>. Under F the β<sub>2</sub> loading is +0.8 (t 0.1) and β<sub>1</sub> falls to 8.8; under S (same-side EWMA) it is +4.8 (t 0.8). Under D (level model) it flips to +17.6 (t 3.0), an over-correction. The reading is that the quote mis-prices along the term axis in a way that is bond-specific and persistent; the per-bond error history carries it, a universe-wide beta coefficient cannot.
 
-![Figure 14. Error correction: held-out MAE against the print by residual age for every mid (left); mean algo error at the current print by decile of the last error, by side, against the 45-degree line (centre); the single-print correction coefficient by age of the last print (right).](figures_v33/fig_22.png)
+**Finding 10 — The level model shows how much is there, not what to deploy.** D (gradient-boosted level model) reaches +1.55 bp in the v3.3 run and +1.57 bp once the same-side memory is one of its features, of which 0.5 bp comes from the error features (D− without them is +1.06). The v5 ablation showed the model depends on the side-specific MMD spread change, and its error loading on β<sub>2</sub> is wrong-signed. It is the ceiling against which the one-coefficient rule is measured, and S (same-side EWMA) gets 86% of the way there with one number.
 
-![Figure 15. Held-out MAE by month for every mid (left) and level-model feature importance, with the error features in the list (right).](figures_v33/fig_23.png)
+![Figure 14. Error correction, v3.3 run: held-out MAE against the print by residual age for A (algo quote), B (single-print rule), C (side-pooled EWMA), E (side intercept), F (side intercept + EWMA), G, H, D (level model) and D− (left); mean algo error at the current print by decile of the last error, by side (centre); the single-print coefficient by age of the last print (right).](figures_v33/fig_22.png)
+
+![Figure 15. Held-out MAE by month for every mid of the v3.3 run, same letters as Figure 14 (left), and feature importance of D, the level model, with the error features in the list (right).](figures_v33/fig_23.png)
 
 **Notebook evidence — memories inside the framework.** All fourteen mids are scored on the same 537,845 held-out trades.
 
@@ -432,6 +438,8 @@ The universe MAE hides the structure the factor model is built to see. Every hel
 | G universe factor loading | 13.23 | 9.00 | −0.29 | −19.1 | −13.5 | +0.22 | −0.53 | −0.44 | −0.52 |
 | D level model | 11.44 | 7.55 | +1.55 | 21.2 | 13.7 | +2.46 | +1.27 | +1.14 | +3.99 |
 
+*Mids of the v3.6 run: C side-pooled EWMA · F side intercept + side-pooled EWMA · S same-side EWMA · S2 side bias + side-adjusted EWMA · K state-space memory with a universe side offset · P/PS cluster and cluster × side pooling · CP, KP combinations · RV/CRV within-cluster relative value · Gc per-cluster factor loading · G universe factor loading · D level model.*
+
 | **Table 9c. State-space and pooling parameters by month, estimated on prior months** | | | | | | | |
 |---|---|---|---|---|---|---|---|
 | **Test month** | **ρ (pooled EWMA)** | **ρ<sub>s</sub> (same side)** | **φ per day** | **implied half-life (days)** | **q** | **r** | **ρ<sub>PS</sub> (cluster × side)** |
@@ -441,97 +449,120 @@ The universe MAE hides the structure the factor model is built to see. Every hel
 | 2026-08 | 0.82 | 0.90 | 1.000 | 2,193 | 1.00 | 468 | 0.80 |
 | 2026-09 | 0.84 | 0.92 | 1.000 | ∞ | 18.4 | 326 | 0.80 |
 
-**Finding 11 — The memory is side-specific, and keeping it on the bond's own side doubles the gain and repairs the short end.** The same-side EWMA gains +1.36 bp against +0.68 for the side-pooled version, with bootstrap t 11.7, and the coefficient rises from 0.87 to 0.92 as the training window grows. It is positive on every side (+2.9 bp on the bid, +1.1 on the offer, +0.4 inter-dealer), in every age bucket below 21 days, and in the sub-one-year bucket (+2.6 bp, where the pooled rule lost 1.4 bp). The universe side intercept (S2) does not reproduce this: the round trip that flips the sign is cell-specific and the only object that carries it is the bond's own error on that side. The headline MAE excluding sub-one-year bonds falls from 8.76 to 7.52 bp; the level model, with its full feature set, reaches 7.55 on the same rows. One coefficient on the bond's own same-side history captures what the gradient-boosted model captures.
+| **Table 9d. The v3.8 run: the four mids kept, on the same 537,845 held-out trades (bp)** | | | | | | | | | |
+|---|---|---|---|---|---|---|---|---|---|
+| **Mid** | **MAE** | **MAE ex < 1 y** | **Gain** | **FM t** | **Boot t** | **P bid** | **S offer** | **D inter-dealer** | **< 1 y** |
+| A algo quote | 12.95 | 8.76 | | | | | | | |
+| C side-pooled EWMA (reference) | 12.21 | 7.74 | +0.73 | 8.7 | 6.4 | +1.67 | +0.61 | +0.15 | −1.04 |
+| **S same-side EWMA (rule of record)** | **11.60** | **7.53** | **+1.35** | **16.1** | **11.6** | **+2.93** | **+1.10** | **+0.39** | **+2.60** |
+| K per-side state-space memory | 12.17 | 7.99 | +0.79 | 8.8 | 5.6 | +2.53 | +0.41 | −0.17 | +1.17 |
+| D level model, with the same-side memory as a feature | 11.42 | 7.55 | +1.57 | 20.1 | 12.9 | +2.44 | +1.35 | +1.14 | +4.19 |
+| D− level model without the error features | 11.96 | 7.99 | +1.06 | 12.6 | 8.0 | +1.94 | +0.93 | +0.52 | +2.79 |
+| **Per-side state-space parameters by test month** | φ per day 0.997, 0.996, 0.998, 0.998, 0.994 | half-life 212, 172, 406, 383, 108 days | q 1.0, 1.0, 1.5, 1.0, 10.4 | r 285, 305, 333, 337, 239 | ρ<sub>K</sub> 1.52, 1.47, 1.34, 1.38, 1.20 | | | | |
 
-**Finding 12 — The factor-integrated memories all lose to the same-side memory, for reasons that are diagnostic.** The state-space memory K is worse than the quote (−0.87 bp). Its parameters say why: φ is estimated at 1.000 and r at 450 bp² against q near 1, so the filter is a very slow random-walk level under heavy observation noise, which is the pooled EWMA with a longer window and the same side-mixing defect, and the shrinkage coefficient of 1.1 to 1.4 says it under-reacts. Cluster pooling adds nothing (P −0.03): the neighbours' trailing error is contemporaneously correlated with the bond's error (the cluster × side coefficient is a stable 0.67 to 0.80) but it does not predict it a day later, because the cell-level component of the error moves with the factors between prints; only the bid and the sub-one-year bucket gain from it (+0.67, +0.84). Within-cluster relative value from the residual filter is wrong-signed (b = −2.5 to −6.0, gain −0.04), consistent with Finding 7: the residual knows about marks, not prints. The factor loading estimated per cluster is the worst mid (−2.05 bp): the slope-factor loading of the error is real at the universe level but too noisy to estimate locally. The two layers therefore divide the work. The factor model and its residual filter own common risk, marks and the map of where the quote is wrong; the quote's own same-side error history owns the correction.
+*Mids: **C** side-pooled EWMA (reference) · **S** same-side EWMA (rule of record) · **K** per-side state-space memory · **D** gradient-boosted level model · **F** side intercept + side-pooled EWMA (historical) · **A** the algo quote.*
 
-![Figure 16. Memories inside the framework: gain over the algo quote with a 95% band for every mid (left) and the gain by MSRB side (right).](figures_v41/fig_24.png)
+**Finding 11 — The memory is side-specific, and keeping it on the bond's own side doubles the gain and repairs the short end.** S (same-side EWMA) gains +1.36 bp against +0.68 for C (side-pooled EWMA) in the v3.6 run, and +1.35 against +0.73 in the v3.8 rerun of Table 9d, with bootstrap t 11.7, and the coefficient rises from 0.87 to 0.92 as the training window grows. It is positive on every side (+2.9 bp on the bid, +1.1 on the offer, +0.4 inter-dealer), in every age bucket below 21 days, and in the sub-one-year bucket (+2.6 bp, where the pooled rule lost 1.4 bp). The universe side intercept (S2) does not reproduce this: the round trip that flips the sign is cell-specific and the only object that carries it is the bond's own error on that side. The headline MAE excluding sub-one-year bonds falls from 8.76 to 7.52 bp; the level model, with its full feature set, reaches 7.55 on the same rows. One coefficient on the bond's own same-side history captures what the gradient-boosted model captures.
 
-![Figure 17. Gain by duration bucket and MSRB side for F, S2, K, PS and KP: only a side-specific memory repairs the short end (the same-side rule S was added to this exhibit in v3.7).](figures_v41/fig_25.png)
+**Finding 12 — The factor-integrated memories all lose to the same-side memory, for reasons that are diagnostic.** The v3.6 state-space memory K, one state per bond with a universe side offset, is worse than the quote (−0.87 bp). Its parameters say why: φ is estimated at 1.000 and r at 450 bp² against q near 1, so the filter is a very slow random-walk level under heavy observation noise, which is the pooled EWMA with a longer window and the same side-mixing defect, and the shrinkage coefficient of 1.1 to 1.4 says it under-reacts. The v3.8 version with one state per bond and side (Table 9d) repairs the sign on the bid and in the short end and reaches +0.79 bp, above C (side-pooled EWMA, +0.73) but well below S (same-side EWMA, +1.35): the learned half-life of 100 to 400 days is far longer than the three-print memory the data reward, and the shrinkage coefficient of 1.2 to 1.5 again says the filter under-reacts. The fixed short memory is the right object and K is retired. Cluster pooling adds nothing (P −0.03): the neighbours' trailing error is contemporaneously correlated with the bond's error (the cluster × side coefficient is a stable 0.67 to 0.80) but it does not predict it a day later, because the cell-level component of the error moves with the factors between prints; only the bid and the sub-one-year bucket gain from it (+0.67, +0.84). Within-cluster relative value from the residual filter is wrong-signed (b = −2.5 to −6.0, gain −0.04), consistent with Finding 7: the residual knows about marks, not prints. The factor loading estimated per cluster is the worst mid (−2.05 bp): the slope-factor loading of the error is real at the universe level but too noisy to estimate locally. The two layers therefore divide the work. The factor model and its residual filter own common risk, marks and the map of where the quote is wrong; the quote's own same-side error history owns the correction.
+
+![Figure 16. Memories inside the framework, v3.6 run: gain over the algo quote with a 95% band for every mid in Table 9b (left) and the gain by MSRB side (right).](figures_v41/fig_24.png)
+
+![Figure 17. Gain by duration bucket and MSRB side, v3.6 run, for F (side intercept + side-pooled EWMA), S2 (side bias + side-adjusted EWMA), K (state-space memory with a universe side offset), PS (cluster × side pooling) and KP: only a side-specific memory repairs the short end.](figures_v41/fig_25.png)
+
+![Figure 17b. Gain by duration bucket and MSRB side, v3.8 run, for C (side-pooled EWMA), S (same-side EWMA), K (per-side state-space memory) and D (level model). S is positive on the bid and the offer in every bucket from 1 to 11 years; the inter-dealer short end is the one cell it still loses.](figures_v38/fig_24.png)
 
 ## 5.5 Where the Gains Live
 
 The universe gain of +0.68 bp hides a very uneven map, and the unevenness is the point: the factor framework identifies the cells where the quote is wrong in a persistent way.
 
-| **Table 11. Gain over the algo quote by segment (bp, FM t), revised third term F and level model D** | | | | | |
+| **Table 11. Gain over the algo quote by segment (bp, FM t), S same-side EWMA and D level model, v3.8 run** | | | | | |
 |---|---|---|---|---|---|
-| **Segment** | **Share of trades** | **Algo MAE** | **Gain F** | **t** | **Gain D** |
-| Rating A | 14% | 18.8 | **+4.02** | 9.0 | +4.16 |
-| Rating AA | 72% | 12.6 | +0.22 | 2.6 | +1.36 |
-| Rating AAA | 12% | 8.7 | −0.45 | −5.3 | +0.16 |
-| Bullets | 37% | 8.6 | **+1.40** | 10.5 | +1.63 |
-| Callable, priced to maturity | 9% | 11.5 | +0.65 | 1.3 | +0.83 |
-| Priced to call | 55% | 16.1 | +0.13 | 1.2 | +1.64 |
-| Duration 1–2.5 y | 24% | 11.4 | +0.87 | 5.8 | +1.32 |
-| Duration 2.5–4 y | 15% | 8.0 | +0.87 | 7.0 | +1.37 |
-| Duration 4–6 y | 20% | 9.3 | **+2.01** | 12.2 | +2.26 |
-| Duration 6–8 y | 24% | 5.8 | −0.28 | −4.4 | +0.01 |
-| Duration 8–11 y | 4% | 12.6 | **+2.88** | 2.7 | +3.20 |
-| Duration < 1 y | 12% | 44.4 | −1.15 | −2.6 | +3.99 |
-| Liquidity Q2 | 20% | 14.2 | +1.44 | 7.8 | +2.18 |
-| β<sub>3</sub> tercile high | 33% | 10.6 | **+1.50** | 11.5 | +1.93 |
-| β<sub>3</sub> tercile low | 33% | 14.1 | +0.07 | 0.5 | +1.43 |
-| β<sub>2</sub> tercile high | 33% | 7.6 | +0.93 | 6.6 | +1.26 |
-| Cluster C0 (1.1 y bullets) | 13% | 13.9 | +2.04 | 2.4 | +1.81 |
-| Cluster C4 (1.5 y bullets) | 12% | 9.1 | +1.30 | 7.7 | +1.78 |
-| Cluster C1 (7 y callables) | 33% | 7.5 | +0.62 | 4.1 | +0.91 |
-| Cluster C7 (1.4 y callables, extension 5.9) | 6% | 45.7 | −1.88 | −4.1 | +2.20 |
-| Side P, dealer buys (bid) | 29% | 12.7 | **+1.43** | 10.8 | +2.46 |
-| Side S, dealer sells (offer) | 34% | 13.0 | +0.46 | 4.6 | +1.27 |
-| Side D, inter-dealer | 38% | 13.1 | +0.20 | 1.8 | +1.14 |
+| **Segment** | **Share of trades** | **Algo MAE** | **Gain S (same-side EWMA)** | **t** | **Gain D (level model)** |
+| Rating A | 14% | 18.8 | **+5.05** | 11.0 | +4.19 |
+| Rating AA | 72% | 12.6 | +0.95 | 13.0 | +1.38 |
+| Rating AAA | 12% | 8.7 | −0.06 | −0.7 | +0.15 |
+| Bullets | 37% | 8.6 | **+1.75** | 12.8 | +1.67 |
+| Callable, priced to maturity | 9% | 11.5 | +1.11 | 2.6 | +0.79 |
+| Priced to call | 55% | 16.1 | +1.13 | 11.3 | +1.66 |
+| Duration 1–2.5 y | 24% | 11.4 | +1.19 | 7.2 | +1.33 |
+| Duration 2.5–4 y | 15% | 8.0 | +1.13 | 8.7 | +1.38 |
+| Duration 4–6 y | 20% | 9.3 | **+2.42** | 14.4 | +2.28 |
+| Duration 6–8 y | 24% | 5.8 | +0.00 | 0.0 | +0.01 |
+| Duration 8–11 y | 4% | 12.6 | **+3.56** | 3.9 | +3.09 |
+| Duration < 1 y | 12% | 44.4 | +2.60 | 6.4 | +4.19 |
+| Liquidity Q2 | 20% | 14.2 | +2.22 | 10.7 | +2.21 |
+| State CA | 17% | 14.6 | +1.63 | 10.1 | +2.05 |
+| β<sub>3</sub> tercile high | 33% | 10.6 | **+1.86** | 14.0 | +1.95 |
+| β<sub>3</sub> tercile low | 33% | 14.1 | +1.00 | 6.9 | +1.47 |
+| β<sub>1</sub> tercile low | 33% | 22.6 | +1.93 | 10.5 | +2.56 |
+| Cluster C0 (1.1 y bullets) | 13% | 13.9 | +2.78 | 2.8 | +1.85 |
+| Cluster C4 (1.5 y bullets) | 12% | 9.1 | +1.60 | 9.3 | +1.77 |
+| Cluster C1 (7 y callables) | 33% | 7.5 | +0.93 | 6.3 | +0.89 |
+| Cluster C7 (1.4 y callables, extension 5.9) | 6% | 45.7 | +1.34 | 3.5 | +2.43 |
+| Side P, dealer buys (bid) | 29% | 12.7 | **+2.93** | 26.7 | +2.44 |
+| Side S, dealer sells (offer) | 34% | 13.0 | +1.10 | 11.0 | +1.35 |
+| Side D, inter-dealer | 38% | 13.1 | +0.39 | 3.3 | +1.14 |
 
-| **Table 12. Top and bottom duration × call × rating cells by the gain of F (cells with at least 2,000 trades)** | | | | | |
-|---|---|---|---|---|---|
-| **Cell** | **n** | **Algo MAE** | **MAE F** | **Gain F (bp)** | **t** |
-| 8–11 y, callable to maturity, A | 3,129 | 39.2 | 15.3 | **+22.1** | 6.1 |
-| 4–6 y, priced to call, A | 7,357 | 32.6 | 12.0 | **+18.4** | 11.5 |
-| 1–2.5 y, bullet, A | 11,169 | 17.1 | 12.9 | +4.1 | 3.1 |
-| 2.5–4 y, priced to call, A | 3,958 | 12.1 | 9.3 | +2.8 | 3.5 |
-| 1–2.5 y, bullet, AA | 60,085 | 10.6 | 8.8 | +1.8 | 11.2 |
-| 2.5–4 y, bullet, AA | 35,009 | 8.2 | 6.6 | +1.7 | 7.2 |
-| 4–6 y, priced to call, AA | 47,766 | 8.8 | 7.5 | +1.2 | 6.1 |
-| 4–6 y, callable to maturity, AA | 2,533 | 10.6 | 11.8 | −1.3 | −6.1 |
-| < 1 y, priced to call, AA | 46,527 | 45.0 | 46.8 | −1.8 | −6.2 |
-| 8–11 y, callable to maturity, AA | 8,417 | 8.4 | 10.9 | −2.7 | −1.6 |
-| < 1 y, priced to call, A | 8,038 | 50.3 | 53.7 | −3.5 | −2.5 |
+*Mids: **C** side-pooled EWMA (reference) · **S** same-side EWMA (rule of record) · **K** per-side state-space memory · **D** gradient-boosted level model · **F** side intercept + side-pooled EWMA (historical) · **A** the algo quote.*
 
-**Finding 13 — The gains sit in single-A callables, intermediate bonds and short bullets, and the quote is already right in AAA and the 6–8 year belly.** In two A-rated callable cells the quote's MAE falls from 33 to 39 bp to 12 to 15 bp, a gain of 18 to 22 bp on 2% of trades. Single-A bonds as a group gain 4.0 bp (t 9.0), 4 to 6 year bonds 2.0 bp (t 12.2), bullets 1.4 bp (t 10.5) and the high yield-tilt tercile 1.5 bp (t 11.5). In AAA (−0.45 bp) and the 6 to 8 year belly (−0.28 bp) the quote is already well behaved and a correction only adds noise. The sub-one-year and near-call segments have quote MAEs of 40 to 120 bp, which is yield-space noise on bonds whose yield is barely defined; even there the split is by call structure, with sub-one-year bullets gaining 14 bp and sub-one-year priced-to-call bonds losing 2 bp (Figure 18). They dominate the universe MAE and should be reported separately, which is why the headline excluding duration below one year (8.76 to 7.77 bp) is the number to quote.
+| **Table 12. Top and bottom duration × call × rating cells by the gain of S, same-side EWMA (cells with at least 2,000 trades), v3.8 run** | | | | | | |
+|---|---|---|---|---|---|---|
+| **Cell** | **n** | **Algo MAE** | **MAE S** | **Gain S (same-side EWMA)** | **t** | **Gain D (level model)** |
+| 8–11 y, callable to maturity, A | 3,129 | 39.2 | 15.6 | **+23.6** | 5.9 | +18.5 |
+| 4–6 y, priced to call, A | 7,357 | 32.6 | 12.7 | **+19.9** | 11.7 | +17.5 |
+| 1–2.5 y, bullet, A | 11,169 | 17.1 | 12.2 | +4.9 | 3.3 | +2.6 |
+| 2.5–4 y, priced to call, A | 3,958 | 12.1 | 9.0 | +3.1 | 3.5 | +3.2 |
+| 2.5–4 y, bullet, AA | 35,009 | 8.2 | 6.1 | +2.1 | 8.3 | +2.4 |
+| 1–2.5 y, bullet, AA | 60,085 | 10.6 | 8.5 | +2.1 | 12.3 | +2.4 |
+| < 1 y, priced to call, AA | 46,527 | 45.0 | 43.1 | +1.9 | 6.8 | +4.2 |
+| 4–6 y, priced to call, AA | 47,766 | 8.8 | 7.2 | +1.6 | 8.0 | +1.6 |
+| 1–2.5 y, priced to call, AAA | 4,323 | 10.4 | 11.1 | −0.7 | −5.7 | −0.6 |
+| 1–2.5 y, priced to call, AA | 28,978 | 11.6 | 12.6 | −0.9 | −9.0 | −0.7 |
+| 4–6 y, callable to maturity, AA | 2,533 | 10.6 | 11.7 | −1.0 | −5.0 | −1.1 |
+| 8–11 y, callable to maturity, AA | 8,417 | 8.4 | 10.5 | −2.1 | −2.2 | −1.0 |
+
+*Mids: **C** side-pooled EWMA (reference) · **S** same-side EWMA (rule of record) · **K** per-side state-space memory · **D** gradient-boosted level model · **F** side intercept + side-pooled EWMA (historical) · **A** the algo quote.*
+
+**Finding 13 — The gains sit in single-A callables, intermediate bonds and short bullets, and the quote is already right in AAA and the 6–8 year belly.** Under S (same-side EWMA) the two A-rated callable cells see the quote's MAE fall from 33 to 39 bp to 13 to 16 bp, a gain of 20 to 24 bp on 2% of trades. Single-A bonds as a group gain 5.1 bp (t 11.0), 4 to 6 year bonds 2.4 bp (t 14.4), bullets 1.8 bp (t 12.8) and the high yield-tilt tercile 1.9 bp (t 14.0). In AAA (−0.06 bp) and the 6 to 8 year belly (0.00 bp) the quote is already well behaved and the correction is neutral; the two 8 to 11 year callable-to-maturity AA cells and the 1 to 2.5 year priced-to-call cells are the places it hurts. The sub-one-year and near-call segments have quote MAEs of 40 to 120 bp, yield-space noise on bonds whose yield is barely defined; the same-side memory gains 2.6 bp there where the side-pooled C lost 1.0 bp. They dominate the universe MAE and should be reported separately, which is why the headline excluding duration below one year (8.76 to 7.53 bp) is the number to quote.
 
 **Finding 14 — The residual signal's information is also concentrated, in the short end.** Within clusters the record signal's rank IC is 0.10 to 0.15 in the two sub-one-year clusters and 0.07 in the short callables, against 0.01 to 0.05 elsewhere, and the within-cluster hedged Sharpe is highest in the short callables C7 (4.9) and the 4 year callables C3 (3.7). Against prints the within-cluster slopes are small and mixed. The two layers divide the map: the residual layer knows most about the short idiosyncratic end, where the quote's own error is noise; the error-correction layer works in the intermediate and single-A cells, where the quote's error is persistent.
 
-![Figure 18. Where the gains live: gain of the revised third term by duration × call structure (left); gain by beta-space cluster for F and D (centre); Fama–MacBeth loading of each mid's pricing error on the three factor betas (right).](figures_v33/fig_25.png)
+![Figure 18. Where the gains live, v3.8 run: gain of S (same-side EWMA) by duration × call structure (left); gain by beta-space cluster for S and D, the level model (centre); Fama–MacBeth loading of each mid's pricing error on the three factor betas, A algo quote, S, D (right).](figures_v38/fig_26.png)
 
-![Figure 19. The achievement map: the ten best segments across every axis (left) and the ten best and five worst duration × call × rating cells with the MAE before and after (right). Bars are the revised third term with a 95% band from the Fama–MacBeth t; the diamond is the level model.](figures_v35/fig_27.png)
+![Figure 19. The achievement map, v3.8 run: the ten best segments across every axis (left) and the ten best and five worst duration × call × rating cells with the MAE before and after (right). Bars are S, the same-side EWMA, with a 95% band from the Fama–MacBeth t; the diamond is D, the level model.](figures_v38/fig_28.png)
 
-![Figure 20. Gain of the revised third term by characteristic, one panel per axis: duration, call structure, rating, MSRB side, state, liquidity and beta-space cluster.](figures_v35/fig_28.png)
+![Figure 20. Gain of S (same-side EWMA, bars) and D (level model, diamond) by characteristic, one panel per axis: duration, call structure, rating, MSRB side, state, liquidity and beta-space cluster. v3.8 run.](figures_v38/fig_29.png)
 
-![Figure 21. Gains in factor coordinates: level, slope and yield-tilt beta terciles, point-in-time within each trade date, with the algo MAE and the share of trades under each tick.](figures_v35/fig_29.png)
+![Figure 21. Gains in factor coordinates for S (same-side EWMA, green) and D (level model, grey): level, slope and yield-tilt beta terciles, point-in-time within each trade date, with the algo MAE and the share of trades under each tick. v3.8 run.](figures_v38/fig_30.png)
 
 **Notebook evidence — by MSRB side.** The same gains split by the side of the print, P a dealer purchase from a customer (the bid), S a dealer sale (the offer), D inter-dealer.
 
-| **Table 12a. Gain of the revised third term by characteristic and side (bp; * marks \|FM t\| ≥ 2)** | | | |
+| **Table 12a. Gain of S, same-side EWMA, by characteristic and side (bp; * marks \|FM t\| ≥ 2; D, the level model, in brackets), v3.8 run** | | | |
 |---|---|---|---|
 | **Segment** | **P bid** | **S offer** | **D inter-dealer** |
-| All trades | +1.43* | +0.46* | +0.20 |
-| Rating A | +4.75* | +3.57* | +3.88* |
-| Rating AA | +1.17* | +0.05 | −0.38* |
-| Rating AAA | −0.18 | −0.48* | −0.63* |
-| Bullets | +1.49* | +1.32* | +1.38* |
-| Callable to maturity | +1.04* | +0.73 | +0.43 |
-| Priced to call | +1.39* | −0.21 | −0.44* |
-| Duration 4–6 y | +1.67* | +2.00* | +2.32* |
-| Duration 8–11 y | +3.11* | +2.90* | +2.80* |
-| Duration 6–8 y | −0.78* | −0.01 | −0.18* |
-| Duration < 1 y | +5.25* | −2.66* | −3.36* |
-| Cluster C5 (0.3 y bullets) | +6.86* | −7.52* | −4.89* |
-| Cluster C7 (1.4 y callables) | +3.99* | −3.84* | −3.56* |
-| Liquidity Q2 | +2.17* | +1.17* | +1.14* |
+| All trades | +2.93* (D +2.44) | +1.10* (D +1.35) | +0.39* (D +1.14) |
+| Rating A | +6.67* (D +5.05) | +4.59* (D +3.67) | +4.33* (D +4.05) |
+| Rating AA | +2.70* (D +2.39) | +0.71* (D +1.18) | −0.22* (D +0.79) |
+| Rating AAA | +0.85* (D +0.35) | −0.24 (D +0.06) | −0.58* (D +0.09) |
+| Bullets | +2.34* (D +1.72) | +1.61* (D +1.50) | +1.31* (D +1.83) |
+| Callable to maturity | +2.00* (D +0.52) | +1.14* (D +1.05) | +0.71 (D +0.75) |
+| Priced to call | +3.49* (D +3.24) | +0.77* (D +1.34) | −0.13 (D +0.88) |
+| Duration 4–6 y | +2.89* (D +2.33) | +1.90* (D +2.10) | +2.53* (D +2.45) |
+| Duration 8–11 y | +3.98* (D +2.55) | +3.69* (D +3.23) | +3.30* (D +3.26) |
+| Duration 6–8 y | +0.25* (D −0.04) | −0.15* (D +0.04) | −0.12 (D −0.06) |
+| Duration < 1 y | +12.37* (D +12.3) | +2.81* (D +2.80) | −2.66* (D +0.97) |
+| Cluster C5 (0.3 y bullets) | +18.67* (D +19.5) | +0.70 (D +0.80) | −4.25* (D −0.13) |
+| Cluster C7 (1.4 y callables) | +9.98* (D +8.84) | +0.44 (D +1.02) | −2.62* (D +0.04) |
+| Liquidity Q2 | +3.78* (D +3.17) | +1.86* (D +1.84) | +1.37* (D +1.84) |
 
-**Finding 15 — Outside bullets and single-A, the correction is a bid-side result, and in the short end it flips sign with the side.** Single-A bonds, bullets and the 4 to 11 year callable cells gain on all three sides, so there the quote's error is a level the bond carries whichever way it trades. AA, priced-to-call and the liquidity quintiles gain on the bid and not on the offer. The sub-one-year bucket and the two short clusters gain 4 to 7 bp on the bid and lose 3 to 8 bp on the offer and inter-dealer. The reason is mechanical: the EWMA pools prints from both sides, and in the short end the dealer round trip is large relative to the yield, so the last error from a sale is applied with the wrong sign to the next purchase. The universe side intercept in F cannot fix a cell-specific round trip. The deployable rule therefore needs a side-aware error memory, and Finding 11 shows the same-side EWMA is that rule: it turns the sub-one-year loss into a +2.6 bp gain. Its cell-level map is produced by the v3.7 notebook; until it is in hand the cell gating uses the F map here.
+*Mids: **C** side-pooled EWMA (reference) · **S** same-side EWMA (rule of record) · **K** per-side state-space memory · **D** gradient-boosted level model · **F** side intercept + side-pooled EWMA (historical) · **A** the algo quote.*
 
-![Figure 22. Gain of the revised third term by characteristic and MSRB side: duration, call structure, rating and beta-space cluster against P, S and D, with an asterisk at \|FM t\| ≥ 2.](figures_v35/fig_30.png)
+**Finding 15 — With the same-side memory the correction is positive on the bid and the offer almost everywhere; the inter-dealer short end is the one cell it still loses.** Under F (side intercept + side-pooled EWMA, v3.5) the sub-one-year bucket and the two short clusters gained 4 to 7 bp on the bid and lost 3 to 8 bp on the offer and inter-dealer, because a pooled memory applies a sale's error with the wrong sign to the next purchase. Under S (same-side EWMA, Table 12a) the offer side is repaired: +2.8 bp in the sub-one-year bucket, +0.7 and +0.4 in the two short clusters, and the bid gains 12 to 19 bp there. Single-A, bullets and the 4 to 11 year callables gain on all three sides. The residual losses are inter-dealer prints in the short end (−2.7 bp below one year, −4.3 and −2.6 in the short clusters), AAA inter-dealer (−0.6) and the belly on the offer (−0.15): an inter-dealer print has no customer side, so a same-side memory has less to say about it. The shadow gating is therefore by cell and by side, with inter-dealer excluded below one year.
 
-![Figure 23. The five best duration × call × rating cells on each side, with the MAE before and after.](figures_v35/fig_31.png)
+![Figure 22. Gain of S (same-side EWMA) by characteristic and MSRB side, v3.8 run: duration, call structure, rating and beta-space cluster against P bid, S offer and D inter-dealer, with an asterisk at \|FM t\| ≥ 2.](figures_v38/fig_31.png)
+
+![Figure 23. The five best duration × call × rating cells on each side under S (same-side EWMA, bars) with D (level model, diamond), with the MAE before and after. v3.8 run.](figures_v38/fig_32.png)
 
 
 ![Figure 24. The record residual signal within beta-space clusters: within-cluster hedged Sharpe (left) and next-day rank IC (right).](figures_v33/fig_26.png)
@@ -548,9 +579,13 @@ The universe gain of +0.68 bp hides a very uneven map, and the unevenness is the
 | Rolling conformal (trailing 10 days) | 77.3% | 18.1 | 0.234 |
 | Around the level model D, rolling fixed | 78.1% | 11.4 | 0.146 |
 | Around the level model D, rolling conformal | 77.9% | 15.9 | 0.204 |
-| Around the revised third term F, rolling fixed | 78.4% | 12.0 | 0.152 |
+| Around S (same-side EWMA), fixed | 76.5% | 11.5 | 0.150 |
+| Around S (same-side EWMA), rolling fixed | 78.5% | 11.8 | 0.150 |
+| Around S (same-side EWMA), rolling conformal | 77.9% | 15.6 | 0.200 |
 
-**Finding 16 — A rescaled fixed band beats every conditional band we tried.** The fixed band collapses in September (63.8% coverage) because the training months were calmer. Rolling conformal recovers coverage to 77% and is flat across width deciles (0.73 to 0.83), which is what conformal is for, but its mean half-width is 16 to 18 bp and its top width decile averages 70 bp. The fair benchmark, a fixed width rescaled on the same ten-day window, covers 78% at 11.2 bp with no model at all. On efficiency the rolling fixed band is 0.143 to 0.152 against 0.204 to 0.234 for rolling conformal around every mid. The conditional band's shape is right and its level is too wide; until the quantile model is sharper, current practice (a fixed width, now rescaled on a short window) is the right band.
+*Mids: **C** side-pooled EWMA (reference) · **S** same-side EWMA (rule of record) · **K** per-side state-space memory · **D** gradient-boosted level model · **F** side intercept + side-pooled EWMA (historical) · **A** the algo quote.*
+
+**Finding 16 — A rescaled fixed band beats every conditional band we tried, around every mid.** The fixed band collapses in September (63.8% coverage) because the training months were calmer. Rolling conformal recovers coverage to 77% and is flat across width deciles (0.73 to 0.83), which is what conformal is for, but its mean half-width is 16 to 18 bp and its top width decile averages 70 bp. The fair benchmark, a fixed width rescaled on the same ten-day window, covers 78% at 11.2 bp with no model at all. On efficiency the rolling fixed band is 0.143 to 0.150 against 0.200 to 0.235 for rolling conformal around every mid, including S (same-side EWMA), where the conditional band is at its best (0.200) and still loses. The conditional band's shape is right and its level is too wide; until the quantile model is sharper, current practice (a fixed width, now rescaled on a short window) is the right band.
 
 ![Figure 25. The quote band around the level model: coverage by predicted-width decile for the five bands (left); daily coverage under monthly and rolling calibration, with the rolling conformal scale (centre); mean half-width by mid and side, rolling fixed against rolling conformal (right).](figures_v33/fig_24.png)
 
@@ -592,23 +627,23 @@ The universe gain of +0.68 bp hides a very uneven map, and the unevenness is the
 
 1. **The factor model of record** (K = 3, 13 instruments, monthly refit, two data rules) is stable across versions and cadences and explains the common move in the months when there is one. It is ready as the common-risk layer.
 2. **The residual layer** is a marks-and-risk object: the pooled state-space filter predicts the next mark (IC 0.083, hedged Sharpe 6.8), the mark-noise estimate predicts how far prints land from the mark (bootstrap t 11.7), and the factor roll-forward removes 56 to 71% of stale-mark RMSE for 1 to 11 year bonds. It does not predict prints relative to the quote and should not be used as a quote charge.
-3. **The algo error correction** S (quote + 0.9 × EWMA of the bond's past errors on the same side, half-life three prints) lowers held-out MAE by 1.36 bp universe-wide with bootstrap t 11.7, is positive on all three sides and in the short end, and the side-pooled version of it gains 2 to 22 bp in identified single-A, 4 to 6 year and short-bullet cells while removing the quote's slope-factor loading. It is ready for a bounded shadow deployment in those cells. The factor-integrated memories (state-space, cluster pooling, relative value, local loading) were tested under the same protocol and lose to it.
+3. **The algo error correction** S (same-side EWMA: quote + 0.9 × EWMA of the bond's past errors on the same side, half-life three prints) lowers held-out MAE by 1.35 bp universe-wide with bootstrap t 11.6, is positive on all three sides and in the short end, gains 20 to 24 bp in the two single-A callable cells, 5 bp in single-A overall and 2.4 bp in 4 to 6 year bonds, and removes the quote's slope-factor loading. It removes $2.8 million a month of pricing error on the matched prints. It is ready for a bounded shadow deployment in those cells. The factor-integrated memories (state-space with and without a per-side state, cluster pooling, relative value, local loading) were tested under the same protocol and lose to it.
 4. **The conditional band** is well shaped and too wide; the rescaled fixed band is current best practice. The level model (+1.55 bp) remains a challenger.
 
-**Decision.** Deploy S, the same-side error memory, as a shadow third term in the cells of Table 12 with positive, significant gain (rating A; duration 4 to 6 and 8 to 11 years; bullets 1 to 4 years; the high yield-tilt tercile), with the correction capped and logged. Because S is positive on every side and in the short end, the side gating that the pooled rule needed is lifted once the v3.7 cell map confirms it; until then, all sides in bullets, single-A and the 4 to 11 year callable cells, bid only elsewhere. The recommended stack is the factor model (common risk), the state-space residual filter (marks and risk) and the same-side memory (quote), with the factor model's beta-space cells as the gate. Promote the state-space outputs (filtered drift, mark-noise score, factor roll-forward, beta-space comparables) as research and desk tooling with no pricing impact. Keep the level model and the conditional band as challengers behind the same gates. Do not use the residual signal as a quote adjustment.
+**Decision.** Deploy S, the same-side EWMA, as a shadow third term in the cells of Table 12 with positive, significant gain (rating A; duration 1 to 6 and 8 to 11 years; bullets; the high yield-tilt tercile), with the correction capped and logged. Table 12a sets the side gate: all three sides in single-A, bullets and the 4 to 11 year callables; bid and offer but not inter-dealer below one year and in the two short clusters; nothing in the 6 to 8 year belly, AAA inter-dealer, the 1 to 2.5 year priced-to-call cells and the 8 to 11 year callable-to-maturity AA cell. The recommended stack is the factor model (common risk), the state-space residual filter (marks and risk) and the same-side memory (quote), with the factor model's beta-space cells as the gate. Promote the state-space outputs (filtered drift, mark-noise score, factor roll-forward, beta-space comparables) as research and desk tooling with no pricing impact. Keep the level model and the conditional band as challengers behind the same gates. Do not use the residual signal as a quote adjustment.
 
 ## 6.1 Market-Making Evaluation Gates
 
-| **Gate** | **Question** | **Required evidence** | **Status for the EWMA rule C** |
+| **Gate** | **Question** | **Required evidence** | **Status for S, the same-side EWMA** |
 |---|---|---|---|
-| **1. Signal validity** | Is the error memory stable? | Persistence by gap and side pair; coefficient path over months; FM and block-bootstrap t | Passed: persistence 0.31 to 0.58 in every gap bucket and both side pairs; ρ<sub>s</sub> rises monotonically from 0.87 to 0.92; bootstrap t 11.7 |
-| **2. Incremental fair value** | Does it beat the quote on the print? | Held-out MAE by age, side, segment and cell against A; the quote's own last-value term checked; factor loading of the error | Passed: +1.36 bp universe-wide, positive on all sides and in every age bucket below 21 days; neutral to negative in AAA and 6 to 8 years for the pooled rule; the quote's own term is right-sized (−0.037); cell map for S pending v3.7 |
+| **1. Signal validity** | Is the error memory stable? | Persistence by gap and side pair; coefficient path over months; FM and block-bootstrap t | Passed: persistence 0.31 to 0.58 in every gap bucket and both side pairs; ρ<sub>s</sub> rises monotonically from 0.87 to 0.92; bootstrap t 11.6 |
+| **2. Incremental fair value** | Does it beat the quote on the print? | Held-out MAE by age, side, segment and cell against A; the quote's own last-value term checked; factor loading of the error | Passed: +1.35 bp universe-wide, positive on all sides and in every age bucket below 21 days; neutral in AAA and the 6 to 8 year belly; the quote's own term is right-sized (−0.037); the cell and side map is Tables 12 and 12a |
 | **3. Execution utility** | Does bounded use improve quoting? | RFQ replay with fills, adverse selection, inventory, turnover and tail loss, in the shadow cells | Not yet run: the shadow deployment is the test |
-| **4. Economic size** | What is it worth? | Par- and duration-weighted dollars of error removed per month, by cell | Measured for the pooled rule: $2.5 million a month, 8% of the quote's absolute error, nine tenths in single-A callables (Section 6.3); S pending v3.7, expected higher |
+| **4. Economic size** | What is it worth? | Par- and duration-weighted dollars of error removed per month, by cell | Measured: $2.8 million a month, 9% of the quote's absolute error, $2.4 million of it in single-A bonds (Section 6.3) |
 
 ## 6.2 Controlled Integration Path
 
-1. **Shadow third term.** Compute C alongside the live quote for every trade; log the correction, the EWMA state, the age and the cell; no pricing impact.
+1. **Shadow third term.** Compute S (same-side EWMA) alongside the live quote for every trade; log the correction, the same-side EWMA state, the age and the cell; no pricing impact.
 2. **Cell gating.** Apply the correction only in cells where the trailing-quarter gain is positive and significant, re-evaluated monthly on the same held-out protocol; start with the cells in Table 12.
 3. **Bounded challenger.** Cap the correction at a multiple of the cell's recent error sd; exclude sub-one-year and near-call bonds; carry the rolling fixed band as the width.
 4. **Production gate.** Require sustained net utility in the RFQ replay, stable calibration of the band, and no deterioration of the factor loading of the corrected error before the term enters the quoting model.
@@ -623,34 +658,35 @@ where C* is the set of validated characteristic cells, ρ<sub>s</sub> is estimat
 
 The error removed on each held-out trade is converted into dollars of price with par × price/100 × modified duration × 10<sup>−4</sup>. The par filter drops 1,392 of 537,845 trades with non-finite, non-positive or implausible par; the remaining trades carry $45.5 billion of par over five months.
 
-| **Table 15. Dollar error removed on held-out prints (five months, 536,453 trades)** | | |
+| **Table 15. Dollar error removed on held-out prints (five months, 536,453 trades, $45.5 billion par), v3.8 run** | | |
 |---|---|---|
 | **Mid** | **$ removed per month ($k)** | **Par-weighted gain (bp)** |
 | Algo quote absolute error, for scale | 30,254 per month | |
-| C algo + ρ × EWMA error | **+2,481** | **+0.54** |
-| F revised third term | +1,581 | +0.37 |
-| G factor-beta correction | −1,353 | −0.34 |
-| D level model | +2,693 | +0.97 |
-| S2, K, PS, KP (framework memories, Section 10b) | −2,601, −6,718, −2,447, −6,286 | −0.48 to −1.72 |
-| S same-side EWMA | pending the v3.7 run | |
-| **By segment, C rule** | | |
-| Rating A (14% of trades, $6.3 bn par) | +2,216 | |
-| Rating AA (72%, $32.5 bn) | +357 | |
-| Rating AAA | −112 | |
-| Duration 4–6 y | +1,727 | |
-| Duration 8–11 y | +619 | |
-| Duration 6–8 y | −13 | |
-| Priced to call | +1,694 | |
-| Bullets | +447 | |
-| **Top cells, F rule** | | |
-| 4–6 y, priced to call, A (7,356 trades, $469 mm) | +1,407 | +26.7 |
-| 8–11 y, callable to maturity, A (3,125 trades, $173 mm) | +922 | +26.7 |
-| 4–6 y, priced to call, AA (47,715 trades, $3.1 bn) | +304 | +1.0 |
-| 2.5–4 y, bullet, AA | +215 | +1.4 |
+| C side-pooled EWMA (reference) | +2,565 | +0.56 |
+| **S same-side EWMA (rule of record)** | **+2,844** | **+0.48** |
+| K per-side state-space memory | +836 | −0.20 |
+| D level model | +2,571 | +0.92 |
+| **By segment, S** | | |
+| Rating A (14% of trades, $6.3 bn par) | +2,402 | |
+| Rating AA (72%, $32.5 bn) | +572 | |
+| Rating AAA | −139 | |
+| Duration 4–6 y | +1,923 | |
+| Duration 8–11 y | +748 | |
+| Duration 6–8 y | +17 | |
+| Priced to call | +1,870 | |
+| Bullets | +541 | |
+| **Top cells, S** | | |
+| 4–6 y, priced to call, A (7,356 trades, $469 mm) | +1,505 | +28.5 |
+| 8–11 y, callable to maturity, A (3,125 trades, $173 mm) | +997 | +28.9 |
+| 4–6 y, priced to call, AA (47,715 trades, $3.1 bn) | +432 | +1.4 |
+| 6–8 y, priced to call, AA (72,940 trades, $8.0 bn) | +365 | +0.3 |
+| 2.5–4 y, bullet, AA | +286 | +1.8 |
 
-**Audited result.** The EWMA rule removes about $2.5 million a month of the quote's $30 million a month of absolute pricing error on the prints that matched, 8% of the total, with a par-weighted gain of 0.54 bp. The level model removes $2.7 million, so the two-parameter rule captures most of the ceiling in dollars even though it captures less than half in bp, because its gains sit in the long-duration cells. The dollars are concentrated: single-A bonds account for $2.2 million of the $2.5 million, and the two single-A callable cells alone remove $2.3 million a month on $640 million of par, a par-weighted gain of 27 bp. The 6 to 8 year belly, which carries the most par ($15 billion) and the most absolute error ($59 million), gains nothing. By month the rule is negative in May, when the coefficient was estimated on one month of data, and reaches $1.1 million in August. This is an accuracy measure, not a P&L: how much of it a desk captures depends on which quotes are hit, which is the fill model the RFQ replay in Gate 3 supplies.
+*Mids: **C** side-pooled EWMA (reference) · **S** same-side EWMA (rule of record) · **K** per-side state-space memory · **D** gradient-boosted level model · **F** side intercept + side-pooled EWMA (historical) · **A** the algo quote.*
 
-![Figure 28. Dollar error removed per month by mid (left), by beta-space cluster (centre), and the ten cells that remove the most dollars under the revised third term (right).](figures_v35/fig_32.png)
+**Audited result.** S (same-side EWMA) removes about $2.8 million a month of the quote's $30 million a month of absolute pricing error on the prints that matched, 9% of the total, more than D (level model, $2.6 million) and C (side-pooled EWMA, $2.6 million); K (per-side state-space memory) removes $0.8 million. The par-weighted gain of S (0.48 bp) is below C's (0.56) because S's extra gains sit in short, low-duration bonds that carry little dollar duration, while its dollar total is higher because it also gains in the 4 to 11 year callables. The dollars are concentrated: single-A bonds account for $2.4 million of the $2.8 million, and the two single-A callable cells alone remove $2.5 million a month on $640 million of par, a par-weighted gain of 29 bp. The 6 to 8 year belly, which carries the most par ($15 billion) and the most absolute error ($59 million), is flat. By month the rule is slightly negative in May, when the coefficient was estimated on one month of data, and reaches $1.3 million in August. This is an accuracy measure, not a P&L: how much of it a desk captures depends on which quotes are hit, which is the fill model the RFQ replay in Gate 3 supplies.
+
+![Figure 28. Dollar error removed per month by mid, C side-pooled EWMA, S same-side EWMA, K per-side state-space memory, D level model (left), by beta-space cluster (centre), and the ten cells that remove the most dollars under S (right). v3.8 run.](figures_v38/fig_33.png)
 
 # 7. Limitations and Next Steps
 
@@ -661,17 +697,17 @@ The error removed on each held-out trade is converted into dollars of price with
 - The universe MAE is dominated by sub-one-year and near-call bonds with 40 to 120 bp errors. All headline numbers should be quoted excluding duration below one year, and the cell view is the honest view.
 - The level model depends on the side-specific MMD spread change and over-corrects the slope loading; it is a ceiling, not a candidate.
 - The conformal band's coverage guarantee assumes exchangeability, which September violated; the rolling version restores coverage at the cost of width.
-- The same-side memory's gains by cell and in dollars come from the v3.7 run and are not yet in this note; the cell map shown is the pooled rule's.
-- The state-space memory was specified with a universe side offset; its failure is a failure of that specification, not of the model class, and a per-side version has not been run.
+- Every gain in this note is an absolute distance to the print. It does not distinguish a mid that moves toward the print from one that crosses through it by a smaller amount, and the two are not worth the same to a dealer. A signed decomposition (toward, crossed by less, crossed by more), a crossing rate by side and an asymmetric loss are the first additions for the next version.
+- The inter-dealer short end is the one segment where the same-side memory loses; inter-dealer prints have no customer side, so the gate excludes them below one year.
 - The dollar view is an accuracy measure on matched prints, not a P&L.
 
-**Next quarter.** Run the shadow same-side memory in the identified cells and collect the RFQ replay evidence for Gate 3; rerun the notebook monthly so the coefficient path and the cell map are refreshed; sharpen the quantile model (print features at signal time, cell indicators) so that the conditional band can compete with the rescaled fixed band on efficiency; add a point-in-time rating history; and extend the out-of-sample window through the next dispersion cycle.
+**Next quarter.** Add the direction-aware view of the gain (signed decomposition, crossing rate by side, asymmetric loss); run the shadow same-side memory in the identified cells and collect the RFQ replay evidence for Gate 3; rerun the notebook monthly so the coefficient path and the cell map are refreshed; sharpen the quantile model (print features at signal time, cell indicators) so that the conditional band can compete with the rescaled fixed band on efficiency; add a point-in-time rating history; and extend the out-of-sample window through the next dispersion cycle.
 
 ## 7.1 Bringing the correction back inside the factor framework: what was tried and what is next
 
 The v3.6 notebook ran the three extensions proposed after v35 under the Section 10 protocol. The results (Table 9b) settle two of them and reshape the third.
 
-1. **State-space error memory.** Specified as a local level on the side-adjusted error with a universe side offset, it loses to the quote (−0.87 bp). The estimated parameters (φ = 1.000, r ≈ 450, q ≈ 1) make it a slow random-walk level under heavy observation noise, so it inherits the side-mixing defect of the pooled EWMA with a longer effective window. The same-side result says the state variable must be per bond and per side. A per-side local level, with the side offset estimated by cell, is the natural next specification; its steady state is the same-side EWMA, so it can only add by learning the gain and the gap decay.
+1. **State-space error memory.** Specified as a local level on the side-adjusted error with a universe side offset (v3.6), it loses to the quote (−0.87 bp): φ = 1.000, r ≈ 450, q ≈ 1 make it a slow random-walk level under heavy observation noise with the side-mixing defect of the pooled EWMA. Specified per bond and side (v3.8, K in Table 9d) it reaches +0.79 bp, above C (side-pooled EWMA) and well below S (same-side EWMA). Its steady state is S, so it could only add by learning the gain and the gap decay, and it learns a half-life of 100 to 400 days where three prints is what the data reward. Closed.
 2. **Cluster-level pooling.** Neighbours' trailing errors are strongly correlated with a bond's error on the same day (coefficient 0.67 to 0.80, stable) but do not predict it across days (P −0.03 bp), because the cell-level component moves with the factors between prints. Pooling helps only where the own history is thin or noisy: the bid (+0.67) and the sub-one-year bucket (+0.84). It remains the only correction available for a bond with no print history and is worth keeping as the fallback in that case.
 3. **Within-cluster relative value.** Wrong-signed and closed (b = −2.5 to −6.0; gain −0.04). The residual layer's rich/cheap state is about marks, not prints, exactly as Finding 7 found at the universe level.
 4. **Local factor loading.** The worst mid (−2.05 bp). The slope-factor loading of the quote's error is a universe-level fact that a per-bond memory removes; estimating it per cluster adds noise.
@@ -699,7 +735,8 @@ Each line is a hypothesis that was tested in an earlier version with a pre-state
 | Direct factor-beta correction G | v3.3 | −0.29 bp (t −19) | The mis-pricing is bond-specific; the error history carries it |
 | Joint regression of the three residual scores | v3.1 | Collinear (coefficients +6.5, −11.1, +7.2) | Not reported |
 | Side bias + side-adjusted EWMA (S2) | v3.6 | +0.06 bp | A universe side offset does not carry the cell-specific round trip; the same-side memory does |
-| State-space error memory with universe side offset (K, KP) | v3.6 | −0.87, −0.48 bp; φ = 1.000, r/q ≈ 450 | Slow random-walk level with side mixing; per-side version not yet run |
+| State-space error memory with universe side offset (K, KP) | v3.6 | −0.87, −0.48 bp; φ = 1.000, r/q ≈ 450 | Slow random-walk level with side mixing |
+| Per-side state-space error memory (K, v3.8) | v3.8 | +0.79 bp against +1.35 for the same-side EWMA; half-life 100 to 400 days, ρ<sub>K</sub> 1.2 to 1.5 | Its steady state is the same-side EWMA; learning the decay only adds noise |
 | Cluster pooling of neighbours' errors (P, PS, CP) | v3.6 | −0.03, −0.20, +0.68 (= C) | Contemporaneous, not predictive across days; kept as the no-history fallback |
 | Within-cluster relative value from the residual filter (RV, CRV) | v3.6 | −0.04 bp, b = −2.5 to −6.0 | Residual knows marks, not prints |
 | Per-cluster factor loading (Gc) | v3.6 | −2.05 bp | Universe-level fact, too noisy locally |
@@ -744,7 +781,8 @@ Fixed on 2026-10-07 (v3.1, after the v31 review) and not changed by the v32 or v
 | v3.4 | Section 12a achievement map: top segments, per-axis grid, factor terciles, scorecard | The "where it works" exhibits come straight from the notebook |
 | v3.5 | MSRB side as a breakdown axis; side × characteristic; top cells per side; dollar view on real data | Bid-side result outside bullets and single-A; short end flips sign by side; $2.5 million a month removed, 90% single-A callables |
 | v3.6 | Section 10b: same-side and side-adjusted EWMAs, state-space memory, cluster pooling, within-cluster relative value, per-cluster loading | Same-side memory +1.36 bp, positive on all sides and in the short end; every factor-integrated memory loses to it |
-| v3.7 | The same-side memory carried into the breakdowns, the side heatmaps and the dollar view | Pending run |
+| v3.7 | The same-side memory carried into the breakdowns, the side heatmaps and the dollar view | Superseded by v3.8 before a run |
+| v3.8 | Closed mids and the by-bucket and LongConv forecasters removed; per-side state-space memory; same-side memory as the mid of record in Sections 11 and 12; stage cache keyed on config, data fingerprints and code; vectorised print-history memories | S +1.35 bp, $2.8 million a month, positive on bid and offer almost everywhere; per-side K +0.79, retired; a cold run computes six cached stages in about six and a half minutes and a warm run reuses them |
 
 ---
 
