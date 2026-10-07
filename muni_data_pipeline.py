@@ -82,7 +82,7 @@ class Config:
     dh_env: str = 'FICC'
     dh_heap_gb: int = 16
     pit_ratings: bool = True             # rating as of partition end instead of latest
-    sources: tuple[str, ...] = ('panel', 'closing_marks', 'msrb', 'algosignal_msrb')
+    sources: tuple[str, ...] = ('panel', 'closing_marks', 'msrb', 'algosignal_msrb', 'track_static')
 
     # OneTick
     ot_context: str = 'MUNI_PROD'
@@ -302,6 +302,10 @@ ALGOSIGNAL_WANT = ['date', 'msrb_trade_id', 'cusip', 'msrb_quantity', 'size_bin'
                    'msrb_tradetime', 'msrb_price', 'msrb_yield', 'has_algosignal_match', 'signal_ts',
                    'MinuteFromSignal', 'MmdYld', 'dMmdSprdSide', 'last_value', 'algo_signal_yield',
                    'algo_minus_msrb_yield_bp', 'Flg']
+# Static per-CUSIP fields from muni_algo_trade_track (last row per cusip). Only the columns that exist are kept.
+TRACK_STATIC_WANT = ['cusip', 'issuer_industry', 'industry', 'sector', 'issuer', 'state', 'tax_status', 'coupon_type',
+                     'issue_size', 'amount_outstanding', 'outstanding_amount', 'final_comp_rating', 'comp_rating']
+STATIC_SOURCES = {'track_static'}          # pulled once (first partition key), not per month
 
 DH_PRELUDE = r"""
 # ---- muni_data_pipeline prelude: built once per session, reused by every partition ----
@@ -360,6 +364,13 @@ _mdp_keep = [c for c in {want} if c in _mdp_mcols] or ['date', 'cusip', 'quantit
 mdp_msrb_part = _mdp_m.view(_mdp_keep)
 """
 
+DH_TRACK_STATIC_PARTITION = r"""
+# ---- track_static (one pull): last row per cusip of muni_algo_trade_track, static columns only ----
+_mdp_tcols = _mdp_cols(_mdp_track)
+_mdp_tkeep = [c for c in {want} if c in _mdp_tcols] or ['cusip']
+mdp_track_static_part = _mdp_track.last_by(['cusip']).view(_mdp_tkeep)
+"""
+
 DH_ALGOSIGNAL_PARTITION = r"""
 # ---- algosignal partition {key}: [{a}, {b}) ----
 _mdp_s = db.historical_table('muni_offline', 'algosignal_msrb_match').where(['date >= `{a}`', 'date < `{b}`'])
@@ -414,6 +425,8 @@ class DeephavenClient:
             script, name = DH_MSRB_PARTITION.format(key=part.key, a=part.start_str, b=part.end_str, want=MSRB_WANT), 'mdp_msrb_part'
         elif source == 'algosignal_msrb':
             script, name = DH_ALGOSIGNAL_PARTITION.format(key=part.key, a=part.start_str, b=part.end_str, want=ALGOSIGNAL_WANT), 'mdp_algosignal_part'
+        elif source == 'track_static':
+            script, name = DH_TRACK_STATIC_PARTITION.format(want=TRACK_STATIC_WANT), 'mdp_track_static_part'
         else:
             raise KeyError(source)
         self.run(script)
@@ -464,7 +477,19 @@ def normalize_algosignal(table: pa.Table) -> pd.DataFrame:
     return df.drop_duplicates().reset_index(drop=True)
 
 
-NORMALIZERS = {'panel': normalize_panel, 'msrb': normalize_msrb, 'algosignal_msrb': normalize_algosignal}
+def normalize_track_static(table: pa.Table) -> pd.DataFrame:
+    df = table.to_pandas(self_destruct=True)
+    df.columns = [str(c) for c in df.columns]
+    if 'cusip' in df.columns:
+        df['cusip'] = df['cusip'].astype('string')
+        df = df.dropna(subset=['cusip']).drop_duplicates('cusip', keep='last')
+    for col in df.columns:
+        if col != 'cusip' and (df[col].dtype == object or str(df[col].dtype).startswith('string')):
+            df[col] = df[col].astype('string')
+    return df.reset_index(drop=True)
+
+
+NORMALIZERS = {'panel': normalize_panel, 'msrb': normalize_msrb, 'algosignal_msrb': normalize_algosignal, 'track_static': normalize_track_static}
 
 
 def pull_deephaven(cfg: Config, sources: Sequence[str], force: bool = False, dry_run: bool = False) -> dict[str, Any]:
@@ -473,7 +498,8 @@ def pull_deephaven(cfg: Config, sources: Sequence[str], force: bool = False, dry
     client = DeephavenClient(cfg)
     for source in sources:
         store = cfg.store(source)
-        todo = store.plan(cfg.partitions(), force=force)
+        parts = cfg.partitions()[:1] if source in STATIC_SOURCES else cfg.partitions()
+        todo = store.plan(parts, force=force)
         report[source] = {'planned': [p.key for p in todo], 'done': [], 'failed': []}
         LOG.info('deephaven/%s: %d of %d partitions to pull: %s', source, len(todo), len(cfg.partitions()), [p.key for p in todo])
         if dry_run:
@@ -871,7 +897,7 @@ def validate(cfg: Config) -> dict[str, Any]:
         store = cfg.store(source)
         m = store.manifest()['partitions']
         checks = []
-        for part in cfg.partitions():
+        for part in (cfg.partitions()[:1] if source in STATIC_SOURCES else cfg.partitions()):
             meta = m.get(part.key)
             if meta is None:
                 checks.append({'partition': part.key, 'status': 'missing'})
@@ -894,7 +920,7 @@ def plan(cfg: Config, force: bool = False) -> pd.DataFrame:
     rows = []
     for source in cfg.sources:
         store = cfg.store(source)
-        for part in cfg.partitions():
+        for part in (cfg.partitions()[:1] if source in STATIC_SOURCES else cfg.partitions()):
             rows.append({'source': source, 'partition': part.key, 'window': f'[{part.start_str}, {part.end_str})',
                          'exists': store.has(part.key), 'complete': store.is_complete(part.key),
                          'will_pull': force or not store.is_complete(part.key)})
