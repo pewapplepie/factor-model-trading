@@ -1,6 +1,13 @@
 # %% [markdown]
 # # Muni IPCA v4 — From Fair Mid to Markout: the Factor Model as Risk Layer, the Quote Judged in Dollars
 #
+# **v4.2.** The v4.1 run answered the trend question (the hedge removed it) and left two open ones. First, the edge is
+# measured against evaluations, which in munis sit near the bid, so the side split of the P&L may be a convention: a
+# realised round trip (exit at the next opposite-side print in the same bond) is added as the evaluation-free check.
+# Second, the bid concession optimum sat on the edge of the grid, so the grid runs to 25 bp. Two residual-side tests
+# close the "thoughts 3" questions with pre-registered bars: the state-space forecast as a predictor of hedged
+# markout and as a concession modifier, and the mark-noise estimate as a width scalar on the quantile grid.
+#
 # **v4.1.** The v4.0 run showed the raw mark-to-evaluation markout is dominated by the sample's common yield move
 # (the mark moved 8 bp against bid fills and 6 bp against bid misses over five days, and 7 bp in favour of offers
 # whether filled or not). v4.1 hedges it with the factor model: the mark move after a fill is replaced by the
@@ -52,7 +59,7 @@
 # 9. Transaction join (PIT-safe) and mark quality; 9b trade size and side; 9c where prints sit relative to our quote and to the evaluation
 # 10. Quote rules: the same-side memory, the interaction ladder, the re-opened legacy trials, the side x size intercepts, the level model; the direction-aware view
 # 11. Markout: would-have-filled P&L, edge and adverse selection, fill and P&L curves, the re-ranking in dollars, the cell-optimal concession
-# 12. Quantile grid: the conditional distribution of the oriented error for the optimizer, with its calibration
+# 12. Quantile grid: the conditional distribution of the oriented error for the optimizer, with its calibration; 12b the residual side: forecast as concession modifier, mark noise as width scalar
 # 13. Where the P&L lives: markout by characteristic, factor beta, cluster, side and size; the side heatmaps; the cells that carry the dollars
 # 14. Systematic path: factor roll-forward of stale marks
 # 15. Results registry and summary
@@ -168,7 +175,11 @@ class RunConfig:
     # v4.0 markout and quantile grid
     markout_horizons: tuple[int, ...] = (0, 1, 5, 10)   # business days after the trade at which a would-be fill is marked (0 = the trade date's close)
     markout_record_h: int = 5                            # the marking horizon of record for the re-ranking and the concession choice
-    concession_grid_bp: tuple[float, float, float] = (-10.0, 15.0, 1.0)   # concession grid (start, stop, step) in bp of yield; negative = more aggressive than the mid
+    concession_grid_bp: tuple[float, float, float] = (-10.0, 26.0, 1.0)   # concession grid (start, stop, step) in bp of yield; negative = more aggressive than the mid (v4.2: to 25 bp, the v4.1 bid optimum sat on the 14 bp edge)
+    rt_max_days: int = 10                                # v4.2 realised round trip: exit at the next opposite-side print in the same bond within this many calendar days
+    signal_kappas: tuple[float, ...] = (0.0, 0.25, 0.5, 1.0, 1.5)   # v4.2 residual-signal concession: quote shift = -kappa x oriented forecast (bp), kappa chosen on prior months
+    signal_clip_bp: float = 5.0                          # the signal concession is clipped to +/- this many bp
+    width_scalar_bar: float = 0.01                       # the mark-noise width scalar replaces the pooled grid if the tail calibration error falls by this much on both sides
     cell_min_trades: int = 500                           # a side x size cell intercept / concession needs this many training trades, else the side value
     grid_taus: tuple[float, ...] = (0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95)
     grid_shrink_k: float = 500.0                         # a cell's quantiles shrink toward the side x size marginal with weight n / (n + k)
@@ -200,6 +211,9 @@ PRE_REGISTERED = {
     'v40_rerank_bar': 'a rule replaces S only if its dollars per month at h = 5 exceed S with bootstrap t of the daily difference > 3 and a positive difference in >= 4 of 5 months',
     'v40_size_intercept': 'side x quantity-bin FM mean of the error on prior months, shrunk to the side mean with weight n / (n + 500); AQ on the algo quote, SQ on the error the same-side memory leaves',
     'v41_hedged_markout': 'the mark move after a fill is the cumulative point-in-time residual of record between the trade date and the horizon (factor-implied move removed); raw and date-demeaned moves reported as checks',
+    'v42_round_trip': 'realised round trip: a would-be fill exits at the next opposite-side print in the same bond within 10 days, at that print\'s yield, factor-hedged over the holding period; the evaluation-independent check of the side split',
+    'v42_signal_test': 'the state-space forecast, oriented by side and ranked within date x beta cluster, is tested as a predictor of the hedged markout and as a concession modifier (shift = -kappa x forecast, kappa on prior months); bar = +0.10 bp per print over S with its side concession, bootstrap t > 3, 4 of 5 months',
+    'v42_width_scalar': 'quantile grid split by mark-noise tercile replaces the pooled grid if the mean absolute tail calibration error (tau 0.05, 0.10, 0.90, 0.95) falls by >= 0.01 on both sides',
     'v41_median_intercept': 'side x quantity-bin intercepts are medians of the error on prior months, shrunk to the side median with weight n / (n + 500)',
     'v40_quantile_grid': 'quantiles 5..95 of the oriented error of S by side x quantity bin x beta-space cluster, shrunk to the side x size marginal with weight n / (n + 500), on prior held-out months',
     'v39_direction': 'signed decomposition (toward / crossed by less / crossed by more / away), crossing rate by side, asymmetric pinball loss with tau 0.65 on the aggressive side',
@@ -2354,6 +2368,13 @@ else:
 # SQ. (4) The cell-optimal concession: $\delta^*$ per side x quantity bin chosen on prior months and applied
 # forward, the first output the optimizer would actually consume.
 #
+# **Round trip (v4.2).** Edge against the evaluation depends on where the evaluator sits; in munis that is near the
+# bid, which flatters offers and penalises bids. The evaluation-free version exits each would-be fill at the next
+# opposite-side print in the same bond within `rt_max_days`, at that print's yield, hedged for the factor move over
+# the holding period: a bid fill is sold where the next customer bought, an offer fill is covered where the next
+# customer sold. Its coverage is lower (both sides must print) and it assumes we would have been the dealer on the
+# exit print, so it is an upper bound of a different kind; what it is free of is the evaluator's convention.
+#
 # **Two caveats, stated once.** The fill proxy is optimistic: every print that crossed our quote counts as a fill,
 # which ignores that the customer may have traded elsewhere and carries the winner's curse. Marks are evaluations,
 # not executable prices. Both biases apply identically to every rule, so the ranking and the shape of the curves
@@ -2480,9 +2501,44 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
     print('Concession that maximises P&L per print on the full held-out window (in-sample on the curve; the walk-forward version is below):'); display(best_delta.round(3))
 
     # ---- (4) the cell-optimal concession, walk-forward: delta* per side x quantity bin on prior months, applied to the test month, on the S quote
-    def best_delta_for(frame_mask: np.ndarray, err: np.ndarray) -> float:
-        """The concession that maximises mean fill x P&L on the masked rows (P&L at the record horizon)."""
-        o = S_ARR[frame_mask] * err[frame_mask]; base = S_ARR[frame_mask] * PM[H0][frame_mask] - o + HD[HR][frame_mask]; ok = np.isfinite(base) & np.isfinite(o)
+    # ---- realised round trip (v4.2): exit at the next opposite-side print in the same bond, hedged over the holding period
+    _pr = trades_all[['cusip', 'side', 'trade_ts', 'trade_date', 'msrb_yield']].dropna().copy(); _pr['cusip'] = _pr['cusip'].astype('string'); _pr['trade_ts'] = to_ns(_pr['trade_ts']); _pr['trade_date'] = to_ns(_pr['trade_date'])
+    _pr = _pr[_pr['side'].isin(['P', 'S'])].rename(columns={'side': 'exit_side', 'trade_ts': 'exit_ts', 'trade_date': 'exit_date', 'msrb_yield': 'y_exit'}); _pr['exit_side'] = _pr['exit_side'].astype(str); _pr = _pr.sort_values('exit_ts')
+    _q = mo[['_id', 'cusip', 'trade_ts', 'side']].copy(); _q['trade_ts'] = to_ns(_q['trade_ts']); _q['exit_side'] = pd.Series(np.where(_q['side'] == 'P', 'S', 'P'), index=_q.index).astype(str); _q['cusip'] = _q['cusip'].astype('string'); _q = _q.sort_values('trade_ts')
+    jx = pd.merge_asof(_q, _pr, left_on='trade_ts', right_on='exit_ts', by=['cusip', 'exit_side'], direction='forward', allow_exact_matches=False, tolerance=pd.Timedelta(days=CFG.rt_max_days)).set_index('_id')
+    mo['y_exit'] = jx['y_exit'].reindex(mo['_id']).to_numpy(); mo['exit_date'] = jx['exit_date'].reindex(mo['_id']).to_numpy(); mo['days_to_exit'] = ((jx['exit_ts'] - jx['trade_ts']).dt.total_seconds() / 86400.0).reindex(mo['_id']).to_numpy()
+    _ex = mo[['_id', 'cusip', 'exit_date']].dropna().copy(); _ex['exit_date'] = to_ns(_ex['exit_date']); _ex = _ex.sort_values('exit_date')
+    jf = pd.merge_asof(_ex, rp[['cusip', 'date', 'cum_fit']].rename(columns={'date': 'rdate'}), left_on='exit_date', right_on='rdate', by='cusip', direction='forward', tolerance=pd.Timedelta(days=7)).set_index('_id')
+    mo['cf_exit'] = jf['cum_fit'].reindex(mo['_id']).to_numpy()
+    RT_RAW = S_ARR * 100.0 * (mo['msrb_yield'].to_numpy(float) - mo['y_exit'].to_numpy(float))                    # print-to-exit (bp), mid-independent: round-trip P&L of a mid = RT - o + delta
+    RT_HDG = RT_RAW + S_ARR * (mo['cf_exit'].to_numpy(float) - mo[f'cf_{H0}'].to_numpy(float))                   # factor move over the holding period removed
+    _rt_ok = np.isfinite(RT_HDG)
+    print(f'round trip: {np.isfinite(RT_RAW).mean():.1%} of customer prints have an opposite-side print in the same bond within {CFG.rt_max_days} days ({_rt_ok.mean():.1%} with the factor path); median days to exit {np.nanmedian(mo["days_to_exit"]):.1f}')
+    BASE_EVAL = S_ARR * PM[H0] + HD[HR]                                                                            # evaluation markout base: P&L of a mid = BASE - o + delta
+    BASE_RT = RT_HDG
+
+    def rt_table(mask: np.ndarray, base: np.ndarray, mids: dict) -> pd.DataFrame:
+        rows = []
+        for k_, c in mids.items():
+            o = S_ARR * mo[c].to_numpy(float); fill = o >= 0; pnl = base - o; ok = mask & np.isfinite(pnl); f_ok = fill & ok
+            rows.append({'mid': k_, 'prints with exit': int(ok.sum()), 'fill share': f_ok.sum() / max(ok.sum(), 1), 'P&L | fill (bp)': pnl[f_ok].mean() if f_ok.any() else np.nan,
+                         'P&L per print (bp)': float(np.where(f_ok, pnl, 0.0)[ok].mean()) if ok.any() else np.nan, '$ per month ($k)': float((pnl[f_ok] * DPB[f_ok]).sum() / 1e3 / months_mo)})
+        return pd.DataFrame(rows).set_index('mid')
+
+    RT_MIDS = {k_: PREDS[k_] for k_ in PREDS if MID_LETTER[k_] in ('A', 'S', 'SQ', 'F', 'D')}
+    rt_all = rt_table(ALL, BASE_RT, RT_MIDS); rt_P = rt_table(IS_P, BASE_RT, RT_MIDS); rt_S = rt_table(IS_S, BASE_RT, RT_MIDS)
+    ev_P = rt_table(IS_P & _rt_ok, BASE_EVAL, RT_MIDS); ev_S = rt_table(IS_S & _rt_ok, BASE_EVAL, RT_MIDS)   # the evaluation markout on the SAME prints, for a like-for-like side split
+    print('Realised round trip (factor-hedged, exit at the next opposite-side print), all customer prints with an exit:'); display(rt_all.round(3))
+    side_cmp = pd.concat({'round trip, bid (P)': rt_P['P&L per print (bp)'], 'evaluation markout, bid, same prints': ev_P['P&L per print (bp)'], 'round trip, offer (S)': rt_S['P&L per print (bp)'], 'evaluation markout, offer, same prints': ev_S['P&L per print (bp)']}, axis=1)
+    print('The side split under the two metrics, P&L per print (bp) on the same prints. If the evaluation sits near the bid, the bid looks worse and the offer better under the evaluation metric than under the round trip:'); display(side_cmp.round(2))
+    rt_side_dollars = pd.DataFrame({'round trip $/mo ($k)': {'P dealer buys (bid)': rt_P.loc['S same-side EWMA', '$ per month ($k)'], 'S dealer sells (offer)': rt_S.loc['S same-side EWMA', '$ per month ($k)']},
+                                    'evaluation $/mo ($k), same prints': {'P dealer buys (bid)': ev_P.loc['S same-side EWMA', '$ per month ($k)'], 'S dealer sells (offer)': ev_S.loc['S same-side EWMA', '$ per month ($k)']}})
+    print('S same-side EWMA, dollars per month by side under the two metrics (same prints):'); display(rt_side_dollars.round(0))
+
+    def best_delta_for(frame_mask: np.ndarray, err: np.ndarray, base_arr: np.ndarray | None = None) -> float:
+        """The concession that maximises mean fill x P&L on the masked rows (evaluation markout at the record horizon by default; pass BASE_RT for the round trip)."""
+        base_arr = BASE_EVAL if base_arr is None else base_arr
+        o = S_ARR[frame_mask] * err[frame_mask]; base = base_arr[frame_mask] - o; ok = np.isfinite(base) & np.isfinite(o)
         if not ok.any():
             return 0.0
         o, base = o[ok], base[ok]
@@ -2491,11 +2547,12 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
 
     MONTH_ARR = mo['month'].to_numpy(); QTY_ARR = mo['qty_group'].astype(str).to_numpy(); SIDE_ARR = mo['side'].astype(str).to_numpy()
     errS = mo['e_S_bp'].to_numpy(float); errA = mo['e_algo_bp'].to_numpy(float); errSQ = mo['e_SQ_bp'].to_numpy(float)
-    delta_cell = np.zeros(len(mo)); delta_side = np.zeros(len(mo)); dstar_rows = []
+    delta_cell = np.zeros(len(mo)); delta_side = np.zeros(len(mo)); delta_side_rt = np.zeros(len(mo)); dstar_rows = []
     for m in sorted(mo['month'].unique())[1:]:
         trm = MONTH_ARR < m; tem = MONTH_ARR == m
         for sd_ in ['P', 'S']:
             d_side = best_delta_for(trm & (SIDE_ARR == sd_), errS); delta_side[tem & (SIDE_ARR == sd_)] = d_side
+            delta_side_rt[tem & (SIDE_ARR == sd_)] = best_delta_for(trm & (SIDE_ARR == sd_), errS, BASE_RT)
             for q_ in QTY_LABELS:
                 cm = trm & (SIDE_ARR == sd_) & (QTY_ARR == q_)
                 d_cell = best_delta_for(cm, errS) if cm.sum() >= CFG.cell_min_trades else d_side
@@ -2503,8 +2560,9 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
                 dstar_rows.append({'month': str(m), 'side': sd_, 'qty_group': q_, 'delta* (bp)': d_cell, 'training trades': int(cm.sum())})
     dstar = pd.DataFrame(dstar_rows)
     tested = MONTH_ARR > sorted(mo['month'].unique())[0]
-    def pnl_with(err: np.ndarray, dlt: np.ndarray | float, mask: np.ndarray) -> dict:
-        o = S_ARR * err; fill = o >= dlt; pnl = S_ARR * PM[H0] - o + dlt + HD[HR]; ok = mask & np.isfinite(pnl); f_ok = fill & ok
+    def pnl_with(err: np.ndarray, dlt: np.ndarray | float, mask: np.ndarray, base_arr: np.ndarray | None = None) -> dict:
+        base_arr = BASE_EVAL if base_arr is None else base_arr
+        o = S_ARR * err; fill = o >= dlt; pnl = base_arr - o + dlt; ok = mask & np.isfinite(pnl); f_ok = fill & ok
         d_ = pd.Series(np.where(f_ok, pnl, 0.0)[ok]).groupby(mo['trade_date'].to_numpy()[ok]).mean()
         return {'fill share': f_ok.sum() / max(ok.sum(), 1), 'P&L | fill (bp)': pnl[f_ok].mean() if f_ok.any() else np.nan, 'P&L per print (bp)': float(d_.mean()), '$ per month ($k)': float((pnl[f_ok] * DPB[f_ok]).sum() / 1e3 / max(int(pd.Series(MONTH_ARR[ok]).nunique()), 1)), '_daily': d_}
     conc_rows = {'A algo quote, delta 0': pnl_with(errA, 0.0, tested), 'S same-side EWMA, delta 0': pnl_with(errS, 0.0, tested), 'SQ same-side EWMA + size intercept, delta 0': pnl_with(errSQ, 0.0, tested),
@@ -2516,6 +2574,14 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
     print(f'The cell-optimal concession, walk-forward (delta* chosen on prior months, applied to the next; months after the first held-out month, h = {HR}):'); display(concession.round(3))
     dstar_last = dstar[dstar['month'] == dstar['month'].max()].pivot(index='qty_group', columns='side', values='delta* (bp)').reindex(QTY_LABELS)
     print(f'delta* by side x quantity bin for {dstar["month"].max()} (bp; positive = quote less aggressive than S by that much):'); display(dstar_last.round(1))
+    # the same concession policy judged on the round trip, with delta* chosen on the round trip too
+    rt_conc = {'S, delta 0': pnl_with(errS, 0.0, tested, BASE_RT), 'S + delta* per side chosen on the evaluation markout': pnl_with(errS, delta_side, tested, BASE_RT), 'S + delta* per side chosen on the round trip': pnl_with(errS, delta_side_rt, tested, BASE_RT)}
+    rt_conc_daily = {k_: v.pop('_daily') for k_, v in rt_conc.items()}
+    rt_concession = pd.DataFrame(rt_conc).T; _b0 = rt_conc_daily['S, delta 0']
+    rt_concession['boot t vs S at delta 0'] = [block_bootstrap_t((rt_conc_daily[k_] - _b0).dropna().to_numpy(), CFG.block_days, CFG.n_boot, CFG.seed) if k_ != 'S, delta 0' else np.nan for k_ in rt_concession.index]
+    _dsr = pd.Series(delta_side_rt[tested]).groupby([pd.Series(SIDE_ARR[tested]), pd.Series(MONTH_ARR[tested]).astype(str)]).first().unstack(0)
+    print('The side concession judged on the realised round trip (walk-forward):'); display(rt_concession.round(3))
+    print('delta* per side by test month, chosen on the round trip (bp):'); display(_dsr)
 
     # ---- (5) size x side markout for S and the algo quote at delta 0
     def cell_markout(err: np.ndarray) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -2577,8 +2643,26 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
     dstar_last.plot.bar(ax=ax[2], color=['#4C72B0', '#DD8452']); ax[2].axhline(0, color='k', lw=0.6); ax[2].set_title(f'delta* per side x quantity bin, {dstar["month"].max()} (bp)', fontsize=10); ax[2].set_xlabel(''); ax[2].legend(['P bid', 'S offer'], fontsize=8); ax[2].tick_params(axis='x', rotation=30, labelsize=8)
     plt.tight_layout(); savefig('11_markout_size_side')
 
-    mo[['_id', 'cusip', 'trade_date', 'side', 'qty_group', 'par', 'dollar_per_bp'] + [f'pm_{h}' for h in CFG.markout_horizons] + [f'y_mark_{h}' for h in CFG.markout_horizons] + [f'cr_{h}' for h in CFG.markout_horizons] + [f'cf_{h}' for h in CFG.markout_horizons] + list(PREDS.values())].to_parquet(ARTIFACTS / 'markout_v4.parquet', index=False)
+    fig, ax = plt.subplots(1, 3, figsize=(19, 5))
+    _sc = side_cmp.reindex([k_ for k_ in RT_MIDS]); x = np.arange(len(_sc)); w = 0.2
+    for i_, (col, c_) in enumerate(zip(_sc.columns, ['#2E8B57', '#9ACD32', '#4C72B0', '#9FB6D9'])):
+        ax[0].bar(x + (i_ - 1.5) * w, _sc[col], w, color=c_, label=col)
+    ax[0].axhline(0, color='k', lw=0.6); ax[0].set_xticks(x); ax[0].set_xticklabels([MID_LETTER[k_] for k_ in _sc.index]); ax[0].set_ylabel('P&L per print (bp)'); ax[0].legend(fontsize=7); ax[0].set_title('Side split: round trip vs evaluation markout, same prints', fontsize=10)
+    for sd_, msk, c_ in [('P bid', IS_P, '#4C72B0'), ('S offer', IS_S, '#DD8452')]:
+        vals_e, vals_r = [], []
+        for dlt in DELTAS:
+            o = S_ARR * errS; fill = o >= dlt
+            pe = BASE_EVAL - o + dlt; oke = msk & _rt_ok & np.isfinite(pe); vals_e.append(float(np.where(fill & oke, pe, 0.0)[oke].mean()))
+            pr_ = BASE_RT - o + dlt; okr = msk & np.isfinite(pr_); vals_r.append(float(np.where(fill & okr, pr_, 0.0)[okr].mean()))
+        ax[1].plot(DELTAS, vals_e, color=c_, ls='--', marker='.', label=f'{sd_}: evaluation markout'); ax[1].plot(DELTAS, vals_r, color=c_, marker='.', label=f'{sd_}: round trip')
+    ax[1].axvline(0, color='k', lw=0.6); ax[1].axhline(0, color='k', lw=0.4); ax[1].set_xlabel('concession on S (bp)'); ax[1].set_ylabel('P&L per print (bp)'); ax[1].legend(fontsize=7); ax[1].set_title('Concession curve of S under both metrics (prints with an exit)', fontsize=10)
+    _dte = pd.Series(mo['days_to_exit']).dropna()
+    ax[2].hist(_dte.clip(0, CFG.rt_max_days), bins=40, color='#8172B2'); ax[2].set_title(f'Days to the exit print (median {_dte.median():.1f}; {_rt_ok.mean():.0%} of prints have one)', fontsize=10); ax[2].set_xlabel('days')
+    plt.tight_layout(); savefig('11_markout_round_trip')
+
+    mo[['_id', 'cusip', 'trade_date', 'side', 'qty_group', 'par', 'dollar_per_bp', 'y_exit', 'days_to_exit', 'cf_exit'] + [f'pm_{h}' for h in CFG.markout_horizons] + [f'y_mark_{h}' for h in CFG.markout_horizons] + [f'cr_{h}' for h in CFG.markout_horizons] + [f'cf_{h}' for h in CFG.markout_horizons] + list(PREDS.values())].to_parquet(ARTIFACTS / 'markout_v4.parquet', index=False)
     record('markout', horizons=list(CFG.markout_horizons), record_h=HR, months=months_mo, prints=int(len(mo)), hedged=True, adverse_selection=flat_records(adverse.reset_index()), trend_check=flat_records(trend_check.reset_index()), rerank=rr_all.round(4).reset_index().to_dict(orient='records'),
+           round_trip={'coverage': float(_rt_ok.mean()), 'median_days_to_exit': float(np.nanmedian(mo['days_to_exit'])), 'all': rt_all.round(4).reset_index().to_dict(orient='records'), 'side_split': flat_records(side_cmp.reset_index()), 'side_dollars_S': flat_records(rt_side_dollars.reset_index()), 'concession': rt_concession.round(4).reset_index().to_dict(orient='records'), 'delta_star_by_month': flat_records(_dsr.reset_index())},
            rerank_by_side={'P': rr_P.round(4).reset_index().to_dict(orient='records'), 'S': rr_S.round(4).reset_index().to_dict(orient='records')}, curves=curves.round(4).to_dict(orient='records'),
            best_delta_full_window=best_delta.round(4).reset_index().to_dict(orient='records'), concession=concession.round(4).reset_index().to_dict(orient='records'), delta_star=dstar.round(4).to_dict(orient='records'),
            size_side={'S': flat_records(cmS.reset_index()), 'A': flat_records(cmA.reset_index()), 'fill_S': flat_records(cfS.reset_index())})
@@ -2679,6 +2763,130 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty:
            marginal_median=flat_records(med.reset_index()), marginal_iqr=flat_records(iqr.reset_index()))
 else:
     print('Section 12 skipped: needs Section 11.')
+
+# %% [markdown]
+# ### 12b. The residual side: the forecast as a concession modifier, the mark noise as a width scalar
+#
+# Two pre-registered tests close the questions in "thoughts 3". **(a) Does the state-space forecast predict the
+# hedged markout, and can it size a concession?** The forecast of the next residual is extended to the record
+# horizon ($\hat f_h = \hat y_{t+1} + \hat m \sum_{k=2}^{h} \bar\phi^k$), oriented so that positive is favourable to
+# the dealer's position ($-s\,\hat f_h$), and ranked within date x beta-space cluster. If it carries information, the
+# hedged move after the print should rise across its quintiles, separately on bids and offers, and a quote shift of
+# $-\kappa$ times the oriented forecast (clipped) with $\kappa$ chosen on prior months should raise fill-weighted
+# P&L over S with its side concession. The bar is the usual one: +0.10 bp per print, bootstrap t > 3, four of five
+# months. Three inputs are tried, as proposed: the full forecast, the drift alone, and the mark-noise magnitude as a
+# pure widening. **(b) Does the mark-noise estimate scale the width of the error distribution?** The quantile grid is
+# rebuilt by mark-noise tercile; if the pooled grid under-covers the tails on noisy bonds and the split grid fixes it
+# by at least 0.01 of coverage on both sides, the scalar is adopted into the grid. The prior for (a) is low: the
+# hedged residual move after a fill is a fraction of a basis point and the signal's rank IC is 0.08. The prior for
+# (b) is higher: the mark-noise estimate explains how far prints sit from the evaluation (Section 9).
+
+# %%
+if HAS_TRADES and 'mo' in globals() and not mo.empty and 'ssm_signal' in mo.columns and mo['ssm_signal'].notna().mean() > 0.3:
+    phi_bar = float(ssm_params['phi'].iloc[-1]) if 'ssm_params' in globals() and not ssm_params.empty and 'phi' in ssm_params.columns else 0.99
+    _mult = sum(phi_bar ** k for k in range(2, HR + 1))
+    mo['f_h'] = mo['ssm_signal'].astype(float) + mo['ssm_drift'].astype(float).fillna(0.0) * _mult      # cumulative residual forecast over the record horizon (bp)
+    mo['f_or'] = -S_ARR * mo['f_h']                                                                     # oriented: positive = favourable to the dealer's position
+    mo['f_or_drift'] = -S_ARR * mo['ssm_drift'].astype(float) * (phi_bar + _mult)
+    mo['cl_key'] = mo['beta_cluster'].astype('Int64').astype(str)
+    mo['f_rank'] = mo.groupby(['residual_date', 'cl_key'], observed=True)['f_or'].rank(pct=True)
+    HDR = HD[HR]; fillS = (S_ARR * errS) >= 0
+    # (a1) does the oriented forecast predict the hedged move? quintiles within date x cluster, by side; FM slope in bp per bp
+    q_rows = []
+    for sd_, msk in [('P dealer buys (bid)', IS_P), ('S dealer sells (offer)', IS_S)]:
+        ok = msk & np.isfinite(HDR) & mo['f_rank'].notna().to_numpy()
+        qb = pd.cut(mo.loc[ok, 'f_rank'], bins=[0, 0.2, 0.4, 0.6, 0.8, 1.0], labels=['Q1 most adverse', 'Q2', 'Q3', 'Q4', 'Q5 most favourable'], include_lowest=True)
+        g = pd.DataFrame({'q': qb.astype(str), 'f': mo.loc[ok, 'f_or'].to_numpy(), 'hd': HDR[ok], 'fillS': fillS[ok]}).groupby('q', observed=True)
+        t_ = pd.DataFrame({'forecast, oriented (bp)': g['f'].mean(), 'hedged move after, all prints (bp)': g['hd'].mean(), 'hedged move after, S fills (bp)': g.apply(lambda d: d.loc[d['fillS'], 'hd'].mean()), 'S fill share': g['fillS'].mean(), 'n': g.size()})
+        t_['side'] = sd_; q_rows.append(t_.reset_index())
+    sig_q = pd.concat(q_rows, ignore_index=True).set_index(['side', 'q'])
+    print(f'Does the oriented state-space forecast predict the hedged move after the print (h = {HR})? Quintiles of its rank within date x beta cluster:'); display(sig_q.round(3))
+    _fr = mo.assign(hd=HDR)
+    sig_slope = pd.concat([fm_multi(_fr[IS_P & np.isfinite(HDR)], 'hd', ['f_or'], ['log_size']).assign(side='P', input='full forecast'), fm_multi(_fr[IS_S & np.isfinite(HDR)], 'hd', ['f_or'], ['log_size']).assign(side='S', input='full forecast'),
+                           fm_multi(_fr[IS_P & np.isfinite(HDR)], 'hd', ['f_or_drift'], ['log_size']).assign(side='P', input='drift only'), fm_multi(_fr[IS_S & np.isfinite(HDR)], 'hd', ['f_or_drift'], ['log_size']).assign(side='S', input='drift only')], ignore_index=True)
+    print('Fama-MacBeth slope of the hedged move after the print on the oriented forecast (bp of realised move per bp of forecast; 1.0 = the forecast is right on average):'); display(sig_slope[['side', 'input', 'fm_beta', 'fm_t', 'boot_t', 'fm_dates', 'n']].round(3))
+    # (a2) the concession policy, walk-forward: quote shift = -kappa x oriented forecast (clipped), kappa on prior months, on top of S and its side concession
+    def policy_pnl(shift: np.ndarray, mask: np.ndarray) -> tuple[float, pd.Series]:
+        o = S_ARR * errS; dl = delta_side + shift; fill = o >= dl; pnl = BASE_EVAL - o + dl; ok = mask & np.isfinite(pnl); f_ok = fill & ok
+        d_ = pd.Series(np.where(f_ok, pnl, 0.0)[ok]).groupby(mo['trade_date'].to_numpy()[ok]).mean()
+        return float(d_.mean()), d_
+    inputs = {'full forecast': mo['f_or'].to_numpy(float), 'drift only': mo['f_or_drift'].to_numpy(float), 'mark noise |eta| (widening)': -mo['eta_abs'].astype(float).to_numpy()}
+    pol_rows, pol_daily = [], {}
+    base_pnl, base_daily = policy_pnl(np.zeros(len(mo)), tested); pol_daily['S + side concession'] = base_daily
+    for name, x in inputs.items():
+        x = np.where(np.isfinite(x), x, 0.0); shift_wf = np.zeros(len(mo)); kap_path = {}
+        for m in sorted(mo['month'].unique())[1:]:
+            trm = MONTH_ARR < m; tem = MONTH_ARR == m
+            best_k, best_v = 0.0, -np.inf
+            for kap in CFG.signal_kappas:
+                v, _ = policy_pnl(np.clip(-kap * x, -CFG.signal_clip_bp, CFG.signal_clip_bp), trm)
+                if v > best_v:
+                    best_k, best_v = kap, v
+            kap_path[str(m)] = best_k; shift_wf[tem] = np.clip(-best_k * x[tem], -CFG.signal_clip_bp, CFG.signal_clip_bp)
+        v, d_ = policy_pnl(shift_wf, tested); pol_daily[name] = d_
+        dv = (d_ - base_daily).dropna(); dm = dv.groupby(pd.DatetimeIndex(dv.index).to_period('M')).mean()
+        bt = block_bootstrap_t(dv.to_numpy(), CFG.block_days, CFG.n_boot, CFG.seed)
+        pol_rows.append({'input': name, 'P&L per print (bp)': v, 'baseline S + side concession (bp)': base_pnl, 'delta (bp)': v - base_pnl, 'boot t of delta': bt, 'months positive': int((dm > 0).sum()), 'months': int(len(dm)), 'kappa by month': kap_path,
+                         'passes bar': bool((v - base_pnl) >= CFG.interaction_bar_bp and bt > 3 and (dm > 0).sum() >= min(4, len(dm)))})
+    sig_policy = pd.DataFrame(pol_rows).set_index('input')
+    print(f'The signal as a concession modifier on top of S and its side concession (walk-forward kappa; bar: +{CFG.interaction_bar_bp:.2f} bp per print, bootstrap t > 3, positive in >= 4 months):'); display(sig_policy.round(3))
+    # (b) the mark-noise width scalar on the quantile grid: pooled vs split by |eta| tercile, tail calibration on the next month
+    TAILS = [t_ for t_ in TAUS if t_ <= 0.10 or t_ >= 0.90]
+    w_rows = []
+    for m in months_g[1:]:
+        tr, te = mo[mo['month'] < m].copy(), mo[mo['month'] == m].copy()
+        if len(tr) < 5_000 or te.empty or tr['eta_abs'].notna().mean() < 0.3:
+            continue
+        cuts = tr['eta_abs'].quantile([1 / 3, 2 / 3]).to_numpy()
+        for fr_ in (tr, te):
+            fr_['eta_t'] = pd.cut(fr_['eta_abs'].astype(float), bins=[-np.inf, cuts[0], cuts[1], np.inf], labels=['low noise', 'mid', 'high noise']).astype(str)
+        g_pool, marg_pool = build_grid(tr, 'o_S'); q_pool = lookup(g_pool, marg_pool, te)
+        q_split = np.full_like(q_pool, np.nan)
+        for lvl in ['low noise', 'mid', 'high noise']:
+            trl, tel = tr[tr['eta_t'] == lvl], te['eta_t'] == lvl
+            if len(trl) < 2_000 or not tel.any():
+                continue
+            g_l, m_l = build_grid(trl, 'o_S'); q_split[tel.to_numpy()] = lookup(g_l, m_l, te[tel])
+        o = te['o_S'].to_numpy(float)
+        for lvl in ['low noise', 'mid', 'high noise']:
+            for sd_ in ['P', 'S']:
+                msk = ((te['eta_t'] == lvl) & (te['side'] == sd_)).to_numpy() & np.isfinite(o)
+                for j, tau in enumerate(TAUS):
+                    if tau not in TAILS or msk.sum() < 200:
+                        continue
+                    for lab, qq in [('pooled', q_pool), ('split by mark noise', q_split)]:
+                        okq = msk & np.isfinite(qq[:, j])
+                        if okq.sum() >= 200:
+                            w_rows.append({'month': str(m), 'side': sd_, 'noise tercile': lvl, 'tau': tau, 'grid': lab, 'realised': float((o[okq] <= qq[okq, j]).mean()), 'abs error': float(abs((o[okq] <= qq[okq, j]).mean() - tau))})
+    width = pd.DataFrame(w_rows)
+    if len(width):
+        w_tab = width.pivot_table(index=['side', 'noise tercile'], columns='grid', values='abs error', aggfunc='mean')
+        w_side = width.groupby(['side', 'grid'])['abs error'].mean().unstack('grid'); w_side['improvement'] = w_side['pooled'] - w_side['split by mark noise']
+        g_all, _ = build_grid(mo.assign(eta_t=pd.cut(mo['eta_abs'].astype(float), bins=[-np.inf, *mo['eta_abs'].quantile([1 / 3, 2 / 3]).to_numpy(), np.inf], labels=['low noise', 'mid', 'high noise']).astype(str)), 'o_S')
+        iqr_by_noise = mo.assign(eta_t=pd.cut(mo['eta_abs'].astype(float), bins=[-np.inf, *mo['eta_abs'].quantile([1 / 3, 2 / 3]).to_numpy(), np.inf], labels=['low noise', 'mid', 'high noise']).astype(str)).groupby(['side', 'eta_t'], observed=True)['o_S'].quantile([0.25, 0.75]).unstack()
+        iqr_by_noise = (iqr_by_noise[0.75] - iqr_by_noise[0.25]).unstack('eta_t')[['low noise', 'mid', 'high noise']]
+        width_pass = bool((w_side['improvement'] >= CFG.width_scalar_bar).all())
+        print('Mark-noise width scalar: mean absolute tail calibration error (tau 0.05/0.10/0.90/0.95) on the next month, pooled grid vs grid split by |eta| tercile:'); display(w_tab.round(4))
+        print(f'By side (bar: improvement >= {CFG.width_scalar_bar:.2f} on both sides) -> {"ADOPT" if width_pass else "keep the pooled grid"}:'); display(w_side.round(4))
+        print('Interquartile width of the oriented error of S by side and mark-noise tercile (bp):'); display(iqr_by_noise.round(2))
+    else:
+        w_tab = w_side = iqr_by_noise = pd.DataFrame(); width_pass = False
+    fig, ax = plt.subplots(1, 3, figsize=(19, 5))
+    for sd_, c_ in [('P dealer buys (bid)', '#4C72B0'), ('S dealer sells (offer)', '#DD8452')]:
+        t_ = sig_q.loc[sd_]
+        ax[0].plot(range(len(t_)), t_['hedged move after, all prints (bp)'], marker='o', color=c_, label=f'{sd_}: all prints'); ax[0].plot(range(len(t_)), t_['hedged move after, S fills (bp)'], marker='s', ls='--', color=c_, label=f'{sd_}: S fills')
+    ax[0].axhline(0, color='k', lw=0.6); ax[0].set_xticks(range(5)); ax[0].set_xticklabels(['Q1\nmost adverse', 'Q2', 'Q3', 'Q4', 'Q5\nmost favourable'], fontsize=8); ax[0].set_ylabel(f'hedged move after the print, h={HR} (bp)'); ax[0].legend(fontsize=7); ax[0].set_title('Does the oriented forecast order the move after the print?', fontsize=10)
+    sp = sig_policy['delta (bp)']; ax[1].barh(range(len(sp)), sp.to_numpy(float), color=['#2E8B57' if p_ else '#8C8C8C' for p_ in sig_policy['passes bar']]); ax[1].set_yticks(range(len(sp))); ax[1].set_yticklabels([f'{i_}  (boot t {b_:+.1f})' for i_, b_ in zip(sp.index, sig_policy['boot t of delta'])], fontsize=8); ax[1].axvline(0, color='k', lw=0.6); ax[1].axvline(CFG.interaction_bar_bp, color='#888888', ls='--', lw=0.8)
+    ax[1].set_xlabel('P&L per print over S + side concession (bp)'); ax[1].set_title('The signal as a concession modifier (dashed = bar)', fontsize=10)
+    if len(width):
+        w_tab.plot.bar(ax=ax[2], color=['#8C8C8C', '#2E8B57']); ax[2].set_title('Tail calibration error by mark-noise tercile: pooled vs split grid', fontsize=10); ax[2].set_xlabel(''); ax[2].tick_params(axis='x', rotation=30, labelsize=7); ax[2].legend(fontsize=8)
+    else:
+        ax[2].text(0.5, 0.5, 'width-scalar test needs at least two held-out months\nbefore the test month', ha='center', va='center', fontsize=10, transform=ax[2].transAxes); ax[2].set_axis_off()
+    plt.tight_layout(); savefig('12b_residual_side')
+    record('residual_side', phi_bar=phi_bar, quintiles=flat_records(sig_q.reset_index()), slopes=sig_slope.round(4).to_dict(orient='records'), policy=sig_policy.drop(columns=['kappa by month']).round(4).reset_index().to_dict(orient='records'),
+           kappa_paths={k_: v_ for k_, v_ in sig_policy['kappa by month'].items()}, width_scalar={'by_side': flat_records(w_side.reset_index()) if len(width) else [], 'by_tercile': flat_records(w_tab.reset_index()) if len(width) else [], 'iqr_by_noise': flat_records(iqr_by_noise.reset_index()) if len(width) else [], 'adopt': width_pass})
+else:
+    print('Section 12b skipped: needs the state-space signal on the trade frame.')
 
 # %% [markdown]
 # ## 13. Where the P&L lives: markout by characteristic, factor coordinate, side and size
@@ -2911,7 +3119,20 @@ if 'markout_breakdown' in REGISTRY:
         _mq = pd.DataFrame(_ms['trade size']).set_index('qty_group')
         summary_rows.append(('Markout by trade size (S P&L per print, bp): smallest bin -> largest bin', ' -> '.join(f"{_mq.loc[q_, 'P&L/print S (bp)']:+.1f}" for q_ in QTY_LABELS if q_ in _mq.index)))
     _cc = pd.DataFrame(REGISTRY['markout']['concession']).set_index('index') if 'index' in pd.DataFrame(REGISTRY['markout']['concession']).columns else pd.DataFrame(REGISTRY['markout']['concession'])
+    if 'round_trip' in REGISTRY['markout']:
+        _rtr = REGISTRY['markout']['round_trip']; _ss = pd.DataFrame(_rtr['side_split']).set_index('mid')
+        summary_rows.append((f"Round trip ({_rtr['coverage']:.0%} of prints have an exit, median {_rtr['median_days_to_exit']:.1f} days): S P&L per print bid | offer, round trip vs evaluation on the same prints (bp)", f"{_ss.loc['S same-side EWMA', 'round trip, bid (P)']:+.1f} vs {_ss.loc['S same-side EWMA', 'evaluation markout, bid, same prints']:+.1f} | {_ss.loc['S same-side EWMA', 'round trip, offer (S)']:+.1f} vs {_ss.loc['S same-side EWMA', 'evaluation markout, offer, same prints']:+.1f}"))
+        _rc = pd.DataFrame(_rtr['concession']).set_index('index') if 'index' in pd.DataFrame(_rtr['concession']).columns else pd.DataFrame(_rtr['concession'])
+        summary_rows.append(('Side concession on the round trip: S at 0 | delta* from evaluation | delta* from round trip (bp per print; boot t)', ' | '.join(f"{_rc.loc[k_, 'P&L per print (bp)']:+.2f}" + (f" (t {_rc.loc[k_, 'boot t vs S at delta 0']:+.1f})" if np.isfinite(_rc.loc[k_, 'boot t vs S at delta 0']) else '') for k_ in _rc.index)))
     summary_rows.append(('Cell-optimal concession, walk-forward: S at 0 | S + delta* per side | S + delta* per side x size ($k/month)', ' | '.join(f"{_cc.loc[k_, '$ per month ($k)']:,.0f}" for k_ in ['S same-side EWMA, delta 0', 'S + delta* per side (walk-forward)', 'S + delta* per side x size cell (walk-forward)'] if k_ in _cc.index)))
+if 'residual_side' in REGISTRY:
+    _sp = pd.DataFrame(REGISTRY['residual_side']['policy']).set_index('input'); _sl = pd.DataFrame(REGISTRY['residual_side']['slopes'])
+    summary_rows.append(('Residual signal as concession modifier (delta bp per print over S + side concession, boot t, bar)', '; '.join(f"{i_}: {r_['delta (bp)']:+.2f} (t {r_['boot t of delta']:+.1f}) {'PASS' if r_['passes bar'] else 'no'}" for i_, r_ in _sp.iterrows())))
+    summary_rows.append(('FM slope of the hedged move on the oriented forecast, full forecast P / S (bp per bp, t)', ' / '.join(f"{r_['fm_beta']:+.2f} (t {r_['fm_t']:+.1f})" for _, r_ in _sl[_sl['input'] == 'full forecast'].iterrows())))
+    _ws = REGISTRY['residual_side']['width_scalar']
+    if _ws['by_side']:
+        _wsd = pd.DataFrame(_ws['by_side']).set_index('side')
+        summary_rows.append(('Mark-noise width scalar on the grid (tail calibration error pooled -> split, P / S; adopted?)', ' / '.join(f"{_wsd.loc[s_, 'pooled']:.3f} -> {_wsd.loc[s_, 'split by mark noise']:.3f}" for s_ in _wsd.index) + f"; {'ADOPT' if _ws['adopt'] else 'keep pooled'}"))
 if 'quantile_grid' in REGISTRY and REGISTRY['quantile_grid']['calibration']:
     _cg = pd.DataFrame(REGISTRY['quantile_grid']['calibration']).set_index('side')
     summary_rows.append(('Quantile grid calibration (realised share below q at tau 0.10 / 0.50 / 0.90, P then S)', '; '.join(f"{s_}: {_cg.loc[s_, 'tau 0.10']:.2f} / {_cg.loc[s_, 'tau 0.50']:.2f} / {_cg.loc[s_, 'tau 0.90']:.2f}" for s_ in _cg.index)))
