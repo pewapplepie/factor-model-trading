@@ -1,6 +1,15 @@
 # %% [markdown]
 # # Muni IPCA v4 — From Fair Mid to Markout: the Factor Model as Risk Layer, the Quote Judged in Dollars
 #
+# **v4.3.** The desk's fill-probability curve, a trailing 100-day empirical CDF of the basis between the quote and the
+# print by side, is built inside the notebook and tested for what conditioning adds (size, beta-space cluster, then a
+# gradient-boosted model with and without IPCA and state-space features). The level model's target moves from fair
+# price to the two quantities a quote engine consumes: fill probability at a concession and the expected edge of a
+# fill. Those two feed a reduced-form engine (concession per print = argmax of pfill x (edge + concession)), judged
+# against S at zero on both markout metrics with the usual bar. The beta-space map gains trade size, side mix, print
+# frequency and industry, and Section 13 colours it by markout. The round trip uses the raw exit where the factor
+# path is missing, since exits are mostly within a day.
+#
 # **v4.2.** The v4.1 run answered the trend question (the hedge removed it) and left two open ones. First, the edge is
 # measured against evaluations, which in munis sit near the bid, so the side split of the P&L may be a convention: a
 # realised round trip (exit at the next opposite-side print in the same bond) is added as the evaluation-free check.
@@ -58,7 +67,7 @@
 # 8. Risk model snapshot: betas, factor covariance, idiosyncratic and mark-noise variance per bond
 # 9. Transaction join (PIT-safe) and mark quality; 9b trade size and side; 9c where prints sit relative to our quote and to the evaluation
 # 10. Quote rules: the same-side memory, the interaction ladder, the re-opened legacy trials, the side x size intercepts, the level model; the direction-aware view
-# 11. Markout: would-have-filled P&L, edge and adverse selection, fill and P&L curves, the re-ranking in dollars, the cell-optimal concession
+# 11. Markout: would-have-filled P&L, edge and adverse selection, fill and P&L curves, the re-ranking in dollars, the cell-optimal concession, the realised round trip; 11b fill probability (the desk's curve, conditioned, modelled), the edge model, the quote engine in reduced form
 # 12. Quantile grid: the conditional distribution of the oriented error for the optimizer, with its calibration; 12b the residual side: forecast as concession modifier, mark noise as width scalar
 # 13. Where the P&L lives: markout by characteristic, factor beta, cluster, side and size; the side heatmaps; the cells that carry the dollars
 # 14. Systematic path: factor roll-forward of stale marks
@@ -180,6 +189,12 @@ class RunConfig:
     signal_kappas: tuple[float, ...] = (0.0, 0.25, 0.5, 1.0, 1.5)   # v4.2 residual-signal concession: quote shift = -kappa x oriented forecast (bp), kappa chosen on prior months
     signal_clip_bp: float = 5.0                          # the signal concession is clipped to +/- this many bp
     width_scalar_bar: float = 0.01                       # the mark-noise width scalar replaces the pooled grid if the tail calibration error falls by this much on both sides
+    # v4.3 fill probability and the reduced-form quote engine
+    pfill_window_days: int = 100                         # the desk's curve: trailing window of the empirical CDF of the basis, by side
+    pfill_deltas: tuple[float, ...] = (-3.0, 0.0, 3.0, 6.0, 10.0)   # concessions at which fill probability is modelled and scored
+    pfill_trees: int = 150                               # gradient-boosted fill and edge models per fold
+    pfill_max_train: int = 200_000                       # training rows per fold are subsampled to this many for speed
+    pfill_min_train: int = 5_000                         # a fold needs this many training prints for the fill and edge models
     cell_min_trades: int = 500                           # a side x size cell intercept / concession needs this many training trades, else the side value
     grid_taus: tuple[float, ...] = (0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95)
     grid_shrink_k: float = 500.0                         # a cell's quantiles shrink toward the side x size marginal with weight n / (n + k)
@@ -211,6 +226,9 @@ PRE_REGISTERED = {
     'v40_rerank_bar': 'a rule replaces S only if its dollars per month at h = 5 exceed S with bootstrap t of the daily difference > 3 and a positive difference in >= 4 of 5 months',
     'v40_size_intercept': 'side x quantity-bin FM mean of the error on prior months, shrunk to the side mean with weight n / (n + 500); AQ on the algo quote, SQ on the error the same-side memory leaves',
     'v41_hedged_markout': 'the mark move after a fill is the cumulative point-in-time residual of record between the trade date and the horizon (factor-implied move removed); raw and date-demeaned moves reported as checks',
+    'v43_pfill': 'fill probability P(o >= delta | x) for the S quote at delta in {-3, 0, 3, 6, 10} bp; four estimators scored by Brier and log-loss on the next month: the desk curve (side, trailing 100-day empirical CDF), a side x size x cluster cell table on prior months (shrunk), a gradient-boosted classifier on trade features, and the same with IPCA and state-space features',
+    'v43_edge_model': 'expected round-trip edge of a fill at delta 0, gradient-boosted on the same two feature sets, walk-forward; scored by out-of-sample R2 and realised edge by predicted decile',
+    'v43_engine_bar': 'the reduced-form engine (concession per print = argmax over the delta grid of pfill(delta | x) x (expected edge + delta)) replaces S at 0 only if its round-trip P&L per print is higher by 0.10 bp with bootstrap t > 3 and positive in 4 of 5 months',
     'v42_round_trip': 'realised round trip: a would-be fill exits at the next opposite-side print in the same bond within 10 days, at that print\'s yield, factor-hedged over the holding period; the evaluation-independent check of the side split',
     'v42_signal_test': 'the state-space forecast, oriented by side and ranked within date x beta cluster, is tested as a predictor of the hedged markout and as a concession modifier (shift = -kappa x forecast, kappa on prior months); bar = +0.10 bp per print over S with its side concession, bootstrap t > 3, 4 of 5 months',
     'v42_width_scalar': 'quantile grid split by mark-noise tercile replaces the pooled grid if the mean absolute tail calibration error (tau 0.05, 0.10, 0.90, 0.95) falls by >= 0.01 on both sides',
@@ -1148,6 +1166,36 @@ for a, (col, title, kind) in zip(ax.ravel(), [('rating_bucket', 'by rating', 'ca
         sc = a.scatter(sm['x'], sm['y'], s=6, c=sm[col], cmap='viridis' if col != 'pit_rank' else 'RdYlGn', alpha=0.8); plt.colorbar(sc, ax=a, fraction=0.046)
     a.set_title(f'Beta space ({emb_name}), {last_date.date()}: {title}'); a.set_xticks([]); a.set_yticks([]); a.grid(False)
 savefig('06b_beta_space_map')
+
+# %%
+# v4.3: the same map coloured by how the bond trades: decayed trade size, side mix of its prints, print frequency, industry
+_tc = model[model['date'] == last_date][['cusip'] + [c for c in ['trade_size_lag', 'print_freq_lag', 'industry_bucket'] if c in model.columns]].copy(); _tc['cusip'] = _tc['cusip'].astype('string')
+smt = sm.assign(cusip=sm['cusip'].astype('string')).merge(_tc, on='cusip', how='left')
+if HAS_TRADES and 'msrb_side' in trades_raw.columns:
+    _sd = trades_raw[['cusip', 'msrb_side']].copy(); _sd['cusip'] = _sd['cusip'].astype('string'); _sd['side'] = _sd['msrb_side'].astype('string').str.upper().str[0]
+    _sd = _sd[_sd['side'].isin(['P', 'S'])]
+    _mix = _sd.groupby('cusip', observed=True)['side'].agg(lambda x: float((x == 'P').mean())).rename('p_share')
+    smt = smt.merge(_mix, on='cusip', how='left')
+panels = [(c, t, k, cm) for c, t, k, cm in [('trade_size_lag', 'by trade size (decayed mean log par of the bond\'s prints)', 'num', 'viridis'),
+                                             ('p_share', 'by side mix of the bond\'s prints (share that are dealer buys; 0.5 = balanced)', 'num', 'coolwarm'),
+                                             ('print_freq_lag', 'by print frequency (decayed count of prints)', 'num', 'viridis'),
+                                             ('industry_bucket', 'by issuer industry', 'cat', None)] if c in smt.columns and smt[c].notna().any()]
+if panels:
+    fig, ax = plt.subplots(2, 2, figsize=(14, 11))
+    for a, (col, title, kind, cmap) in zip(ax.ravel(), panels):
+        g0 = smt.dropna(subset=[col])
+        a.scatter(smt['x'], smt['y'], s=4, color='#DDDDDD', alpha=0.5)
+        if kind == 'cat':
+            for j, (lvl, g) in enumerate(g0.groupby(col, observed=True)):
+                a.scatter(g['x'], g['y'], s=6, alpha=0.75, label=f'{lvl} ({len(g)})', color=plt.cm.tab10(j % 10))
+            a.legend(markerscale=3, fontsize=8, loc='best')
+        else:
+            kw = {'vmin': 0.0, 'vmax': 1.0} if col == 'p_share' else {}
+            sc = a.scatter(g0['x'], g0['y'], s=6, c=g0[col], cmap=cmap, alpha=0.85, **kw); plt.colorbar(sc, ax=a, fraction=0.046)
+        a.set_title(f'Beta space ({emb_name}), {last_date.date()}: {title}', fontsize=10); a.set_xticks([]); a.set_yticks([]); a.grid(False)
+    for a in ax.ravel()[len(panels):]:
+        a.set_visible(False)
+    fig.suptitle('How the bonds in beta space trade (grey = no print history)', fontsize=12); plt.tight_layout(); savefig('06b_beta_space_map_trading')
 
 # %%
 # Clusters in beta space: profile and named examples, then rich/cheap ranking inside one cluster
@@ -2512,8 +2560,10 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
     mo['cf_exit'] = jf['cum_fit'].reindex(mo['_id']).to_numpy()
     RT_RAW = S_ARR * 100.0 * (mo['msrb_yield'].to_numpy(float) - mo['y_exit'].to_numpy(float))                    # print-to-exit (bp), mid-independent: round-trip P&L of a mid = RT - o + delta
     RT_HDG = RT_RAW + S_ARR * (mo['cf_exit'].to_numpy(float) - mo[f'cf_{H0}'].to_numpy(float))                   # factor move over the holding period removed
+    _rt_hedged_share = float(np.isfinite(RT_HDG).sum() / max(np.isfinite(RT_RAW).sum(), 1))
+    RT_HDG = np.where(np.isfinite(RT_HDG), RT_HDG, RT_RAW)          # v4.3: exits are mostly within a day, so the raw round trip stands in where the factor path is missing
     _rt_ok = np.isfinite(RT_HDG)
-    print(f'round trip: {np.isfinite(RT_RAW).mean():.1%} of customer prints have an opposite-side print in the same bond within {CFG.rt_max_days} days ({_rt_ok.mean():.1%} with the factor path); median days to exit {np.nanmedian(mo["days_to_exit"]):.1f}')
+    print(f'round trip: {np.isfinite(RT_RAW).mean():.1%} of customer prints have an opposite-side print in the same bond within {CFG.rt_max_days} days; {_rt_hedged_share:.0%} of those carry the factor path and are hedged, the rest use the raw exit; median days to exit {np.nanmedian(mo["days_to_exit"]):.1f}')
     BASE_EVAL = S_ARR * PM[H0] + HD[HR]                                                                            # evaluation markout base: P&L of a mid = BASE - o + delta
     BASE_RT = RT_HDG
 
@@ -2668,6 +2718,284 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
            size_side={'S': flat_records(cmS.reset_index()), 'A': flat_records(cmA.reset_index()), 'fill_S': flat_records(cfS.reset_index())})
 else:
     print('Section 11 skipped: needs Section 10.')
+
+# %% [markdown]
+# ### 11b. Fill probability: the desk's curve, conditioned, modelled; the edge model; the quote engine in reduced form
+#
+# **The desk's fill model.** Production estimates the probability of a fill at a concession $\delta$ as the empirical
+# CDF of the basis between the algo yield and the MSRB yield over the trailing 100 days, by side: a curve of basis
+# against probability. In this notebook's orientation that is $\hat p(\delta) = \Pr(o \ge \delta)$ with $o$ the
+# oriented distance of the print from the quote, estimated on same-side prints strictly before the trade date. It
+# is rebuilt here first as it stands, on the algo quote, and checked for calibration by size bin and beta-space
+# cluster: a curve pooled across bonds predicts the same fill probability for an odd lot and a block, and Section 9c
+# showed the market does not trade that way.
+#
+# **What conditioning adds.** Four estimators of $\Pr(o \ge \delta \mid x)$ for the S quote at $\delta \in \{-3, 0,
+# 3, 6, 10\}$ bp, walk-forward by month and scored on the next month by the Brier score and the log-loss of the fill
+# indicator: (i) the desk curve; (ii) a side x size x cluster table on prior months, shrunk toward side x size;
+# (iii) a gradient-boosted classifier on trade and quote features (side, size, duration, rating, call, recency, the
+# same-side memory); (iv) the same classifier with the factor model added: the three betas, the cluster, the residual
+# of record, the state-space signal, the mark-noise estimate, the trailing residual vol. The gap between (iii) and
+# (iv) is the factor model's contribution to the fill model, which is the second of the two places it can matter.
+#
+# **The edge model, on the new target.** The level model D predicted fair price; here the same machinery predicts
+# what a quote engine needs: the realised round-trip edge of a fill at $\delta = 0$ ($\text{RT} - o$ on the prints S
+# would have won), on the same two feature sets, walk-forward. Scored by out-of-sample $R^2$ and by the realised edge
+# across predicted deciles.
+#
+# **The engine in reduced form.** With $\hat p(\delta \mid x)$ and the expected edge $\hat e(x)$, the concession per
+# print is $\delta^*(x) = \arg\max_\delta\; \hat p(\delta \mid x)\,(\hat e(x) + \delta + a_s(\delta))$ over the grid, where
+# $a_s(\delta)$ is a selection adjustment estimated on prior months by side: the fills kept at a larger concession are
+# the prints that were further through the quote, and their base edge is lower on average. Three versions, differing only in the fill
+# model (desk, cell, GBM with the factor model), are judged on realised P&L per print on both markout metrics against
+# S at zero and the side concession of Section 11, with the usual bar. All model fits are cached on the trade key.
+
+# %%
+if HAS_TRADES and 'mo' in globals() and not mo.empty:
+    from sklearn.ensemble import HistGradientBoostingClassifier  # noqa: E402
+    PF_DELTAS = [float(d) for d in CFG.pfill_deltas]; PFD = np.asarray(PF_DELTAS)
+    O_S = S_ARR * errS; O_A = S_ARR * errA; TD = mo['trade_date'].to_numpy()
+    CL_ARR = mo['beta_cluster'].astype('Int64').astype(str).replace('<NA>', 'NA').to_numpy() if 'beta_cluster' in mo.columns else np.full(len(mo), 'NA')
+    MONTHS_MO = sorted(mo['month'].unique())
+
+    def rolling_ecdf_pfill(h_dates: np.ndarray, h_o: np.ndarray, h_side: np.ndarray, q_dates: np.ndarray, q_side: np.ndarray, deltas: list[float], window_days: int, min_n: int = 500) -> np.ndarray:
+        """The desk's curve: for each query print, the share of same-side history prints in the trailing window (strictly before the date) with o >= delta."""
+        out = np.full((len(q_dates), len(deltas)), np.nan); dl = np.asarray(deltas, float)
+        for sd_ in ['P', 'S']:
+            hm = (h_side == sd_) & np.isfinite(h_o); hd = h_dates[hm]; ho = h_o[hm]; order = np.argsort(hd, kind='stable'); hd = hd[order]; ho = ho[order]
+            qm = np.flatnonzero(q_side == sd_); qd = q_dates[qm]
+            for d in np.unique(qd):
+                lo = np.searchsorted(hd, d - np.timedelta64(window_days, 'D'), 'left'); hi = np.searchsorted(hd, d, 'left')
+                if hi - lo < min_n:
+                    continue
+                w = np.sort(ho[lo:hi]); out[qm[qd == d]] = 1.0 - np.searchsorted(w, dl, 'left') / len(w)
+        return out
+
+    # ---- (1) the production curve on the algo quote, from the full print history, and its calibration at delta = 0
+    _h = trades_all[['side', 'trade_date', 'e_algo_bp']].dropna(); _h = _h[_h['side'].isin(['P', 'S'])]
+    desk_A = rolling_ecdf_pfill(to_ns(_h['trade_date']).to_numpy(), np.where(_h['side'].to_numpy() == 'P', 1.0, -1.0) * _h['e_algo_bp'].to_numpy(float), _h['side'].astype(str).to_numpy(), TD, SIDE_ARR, [0.0], CFG.pfill_window_days)[:, 0]
+    _ok = np.isfinite(desk_A)
+    _cal = pd.DataFrame({'side': SIDE_ARR, 'qty_group': QTY_ARR, 'cluster': CL_ARR, 'pred': desk_A, 'real': (O_A >= 0).astype(float)})[_ok]
+    desk_cal_size = _cal.groupby(['qty_group', 'side'], observed=True).agg(predicted=('pred', 'mean'), realised=('real', 'mean'), n=('real', 'size')).unstack('side').reindex(QTY_LABELS)
+    desk_cal_cl = _cal.groupby(['cluster', 'side'], observed=True).agg(predicted=('pred', 'mean'), realised=('real', 'mean'), n=('real', 'size')).unstack('side')
+    desk_cal_cl.index = [CLUSTER_LABEL.get(int(c_), c_) if str(c_).lstrip('-').isdigit() else c_ for c_ in desk_cal_cl.index]
+    _gap_size = (desk_cal_size['realised'] - desk_cal_size['predicted']); _gap_cl = (desk_cal_cl['realised'] - desk_cal_cl['predicted'])
+    print(f'The desk curve on the algo quote (side, trailing {CFG.pfill_window_days} days) at delta = 0: predicted fill probability vs the realised crossing share, by quantity bin (coverage {_ok.mean():.0%} of customer prints):'); display(desk_cal_size.round(3))
+    print('... and by beta-space cluster:'); display(desk_cal_cl.round(3))
+    print(f'largest absolute calibration gap of the pooled curve: by size {np.nanmax(np.abs(_gap_size.to_numpy(float))):.3f}, by cluster {np.nanmax(np.abs(_gap_cl.to_numpy(float))):.3f} (a pooled curve cannot be off by less than its own cell dispersion)')
+
+    # ---- (2) four estimators of pfill for the S quote, walk-forward, scored on the next month
+    desk_S = rolling_ecdf_pfill(TD, O_S, SIDE_ARR, TD, SIDE_ARR, PF_DELTAS, CFG.pfill_window_days)
+
+    def cell_pfill(tr_mask: np.ndarray, te_mask: np.ndarray) -> np.ndarray:
+        out = np.full((int(te_mask.sum()), len(PF_DELTAS)), np.nan)
+        kdf = pd.DataFrame({'side': SIDE_ARR, 'qty': QTY_ARR, 'cl': CL_ARR}); trk = kdf[tr_mask]; tek = kdf[te_mask]
+        n_cell = trk.groupby(['side', 'qty', 'cl']).size(); w = n_cell / (n_cell + CFG.grid_shrink_k)
+        key3 = pd.MultiIndex.from_frame(tek[['side', 'qty', 'cl']]); key2 = pd.MultiIndex.from_frame(tek[['side', 'qty']])
+        for j, dlt in enumerate(PF_DELTAS):
+            t2 = trk.assign(y=(O_S[tr_mask] >= dlt).astype(float))
+            cell = t2.groupby(['side', 'qty', 'cl'])['y'].mean(); marg = t2.groupby(['side', 'qty'])['y'].mean(); sidem = t2.groupby('side')['y'].mean()
+            c = cell.reindex(key3).to_numpy(float); ww = w.reindex(key3).to_numpy(float); m2 = marg.reindex(key2).to_numpy(float); ms = sidem.reindex(tek['side']).to_numpy(float)
+            m2 = np.where(np.isfinite(m2), m2, ms); c = np.where(np.isfinite(c), c, m2); ww = np.where(np.isfinite(ww), ww, 0.0)
+            out[:, j] = ww * c + (1.0 - ww) * m2
+        return out
+
+    cellp = np.full((len(mo), len(PF_DELTAS)), np.nan)
+    for m in MONTHS_MO[1:]:
+        trm = MONTH_ARR < m; tem = MONTH_ARR == m
+        if trm.sum() >= CFG.pfill_min_train and tem.any():
+            cellp[tem] = cell_pfill(trm, tem)
+    PF_BASE = [c for c in ['side_P', 'log_size', 'modified_duration_lag1', 'rating_score', 'years_to_worst', 'extension', 'is_callable', 'cpn', 'recency_days_c', 'prints_20d', 'last_print_spread_bp', 'MinuteFromSignal', 'dMmdSprdSide', 'ewm_side_err_bp', 'n_side_prints', 'side_err_age_days', 'trade_size_lag', 'print_freq_lag'] if c in mo.columns]
+    PF_IPCA = PF_BASE + [c for c in beta_cols + ['beta_cluster', 'pit_residual', 'abs_resid_z', 'ssm_signal', 'ssm_drift', 'eta_abs', 'target_abs_vol', 'residual_age_days'] if c in mo.columns and c not in PF_BASE]
+
+    def _pfill_models():
+        parts, imps = [], []; rng = np.random.default_rng(CFG.seed)
+        for m in MONTHS_MO[1:]:
+            t0 = time.perf_counter(); trm = MONTH_ARR < m; tem = MONTH_ARR == m
+            tr_idx = np.flatnonzero(trm); te_idx = np.flatnonzero(tem)
+            if len(tr_idx) < CFG.pfill_min_train or not len(te_idx):
+                continue
+            if len(tr_idx) > CFG.pfill_max_train:
+                tr_idx = np.sort(rng.choice(tr_idx, CFG.pfill_max_train, replace=False))
+            out = pd.DataFrame({'_id': mo['_id'].to_numpy()[te_idx]})
+            for fs_name, feats in [('trade', PF_BASE), ('ipca', PF_IPCA)]:
+                feats_u = usable_features(mo.iloc[tr_idx], feats); med = mo.iloc[tr_idx][feats_u].median()
+                Xtr = mo.iloc[tr_idx][feats_u].astype(float).fillna(med); Xte = mo.iloc[te_idx][feats_u].astype(float).fillna(med)
+                for dlt in PF_DELTAS:
+                    ytr = (O_S[tr_idx] >= dlt).astype(int)
+                    if ytr.min() == ytr.max():
+                        out[f'pf_{fs_name}_{dlt:g}'] = float(ytr.mean()); continue
+                    if HAS_LGB:
+                        mdl = lgb.LGBMClassifier(n_estimators=CFG.pfill_trees, learning_rate=0.05, num_leaves=31, min_child_samples=200, subsample=0.8, subsample_freq=1, colsample_bytree=0.8, random_state=CFG.seed, verbose=-1).fit(Xtr, ytr)
+                        imp = pd.Series(mdl.feature_importances_, index=feats_u, dtype=float)
+                    else:
+                        mdl = HistGradientBoostingClassifier(max_iter=max(100, CFG.pfill_trees), learning_rate=0.08, max_leaf_nodes=31, min_samples_leaf=200, random_state=CFG.seed).fit(Xtr, ytr); imp = None
+                    out[f'pf_{fs_name}_{dlt:g}'] = mdl.predict_proba(Xte)[:, 1]
+                    if imp is not None and dlt == 0.0:
+                        imps.append(imp.rename(f'pfill {fs_name}|{m}'))
+                # the edge model: realised round-trip edge of a fill at delta 0 (and the evaluation edge, factor-model set only)
+                fill_tr = tr_idx[O_S[tr_idx] >= 0]
+                for tgt_name, base_arr in [('rt', BASE_RT), ('eval', BASE_EVAL)]:
+                    if tgt_name == 'eval' and fs_name == 'trade':
+                        continue
+                    y_e = (base_arr - O_S)[fill_tr]; okk = np.isfinite(y_e)
+                    if okk.sum() < max(500, CFG.pfill_min_train // 2):
+                        out[f'edge_{fs_name}_{tgt_name}'] = np.nan; continue
+                    yhat, imp_e = fit_gbm(mo.iloc[fill_tr[okk]].assign(_y=y_e[okk]), mo.iloc[te_idx], feats, '_y', CFG.pfill_trees)
+                    out[f'edge_{fs_name}_{tgt_name}'] = yhat
+                    if imp_e is not None and tgt_name == 'rt':
+                        imps.append(imp_e.astype(float).rename(f'edge {fs_name}|{m}'))
+            parts.append(out); print(f'  fill and edge models {m}: train {len(tr_idx):,} | test {len(te_idx):,} | {time.perf_counter() - t0:.0f}s')
+        pred = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=['_id'])
+        imp_df = pd.concat(imps, axis=1).reset_index().rename(columns={'index': 'feature'}) if imps else pd.DataFrame(columns=['feature'])
+        return {'pred': pred, 'imp': imp_df}
+
+    PF = cached('pfill_models', _pfill_models, deps=[EC_FP, PF_BASE, PF_IPCA, PF_DELTAS, CFG.pfill_trees, CFG.pfill_max_train, STAGE_KEYS.get('trades_std')], code=[fit_gbm, usable_features])
+    pred = PF['pred'].set_index('_id').reindex(mo['_id'].to_numpy()) if len(PF['pred']) else pd.DataFrame(index=mo['_id'].to_numpy())
+    def _mat(prefix: str) -> np.ndarray:
+        cols = [f'{prefix}_{d:g}' for d in PF_DELTAS]
+        return pred[cols].to_numpy(float) if all(c in pred.columns for c in cols) else np.full((len(mo), len(PF_DELTAS)), np.nan)
+    METHODS = {'desk: side, trailing window': desk_S, 'cell: side x size x cluster, prior months': cellp, 'GBM: trade and quote features': _mat('pf_trade'), 'GBM: + IPCA and state-space': _mat('pf_ipca')}
+    common = tested.copy()
+    for mt in METHODS.values():
+        common &= np.isfinite(mt).all(axis=1)
+    if common.sum() < 200:
+        print(f'Section 11b: only {int(common.sum())} prints have every fill estimator available; scoring, the edge model and the engine are skipped on this run.')
+        record('pfill', deltas=PF_DELTAS, window_days=CFG.pfill_window_days, desk_calibration_by_size=flat_records(desk_cal_size.reset_index()), desk_calibration_by_cluster=flat_records(desk_cal_cl.reset_index()), scores=[], brier_relative_to_desk=[], edge_model=[], engine=[])
+    else:
+        sc_rows = []
+        for name, mt in METHODS.items():
+            for j, dlt in enumerate(PF_DELTAS):
+                y = (O_S >= dlt).astype(float); p = np.clip(mt[:, j], 1e-4, 1 - 1e-4)
+                for sd_, msk in [('ALL', common), ('P', common & IS_P), ('S', common & IS_S)]:
+                    sc_rows.append({'method': name, 'delta (bp)': dlt, 'side': sd_, 'Brier': float(np.mean((p[msk] - y[msk]) ** 2)), 'log-loss': float(-np.mean(y[msk] * np.log(p[msk]) + (1 - y[msk]) * np.log(1 - p[msk]))), 'mean predicted': float(p[msk].mean()), 'realised': float(y[msk].mean()), 'n': int(msk.sum())})
+        pf_scores = pd.DataFrame(sc_rows)
+        brier_tab = pf_scores[pf_scores['side'] == 'ALL'].pivot(index='method', columns='delta (bp)', values='Brier').reindex(list(METHODS))
+        brier_rel = (1.0 - brier_tab.div(brier_tab.loc['desk: side, trailing window'], axis=1))
+        print(f'Fill probability for the S quote on the next month ({int(common.sum()):,} prints with every estimator available): Brier score by concession (lower is better):'); display(brier_tab.round(4))
+        print('Brier improvement over the desk curve (share of its Brier removed):'); display(brier_rel.round(3))
+        print('By side at delta = 0 (Brier, log-loss, mean predicted vs realised):'); display(pf_scores[(pf_scores['delta (bp)'] == 0.0) & (pf_scores['side'] != 'ALL')].set_index(['method', 'side'])[['Brier', 'log-loss', 'mean predicted', 'realised', 'n']].round(4))
+        # calibration deciles at delta = 0: desk vs the factor-model GBM
+        cal_rows = []
+        for name in ['desk: side, trailing window', 'GBM: + IPCA and state-space']:
+            p0 = METHODS[name][:, PF_DELTAS.index(0.0)]; y0 = (O_S >= 0).astype(float)
+            for sd_, msk in [('P', common & IS_P), ('S', common & IS_S)]:
+                dec = pd.qcut(pd.Series(p0[msk]).rank(method='first'), 10, labels=False) + 1
+                g = pd.DataFrame({'dec': dec.to_numpy(), 'p': p0[msk], 'y': y0[msk]}).groupby('dec').agg(predicted=('p', 'mean'), realised=('y', 'mean'), n=('y', 'size')).reset_index()
+                g['method'] = name; g['side'] = sd_; cal_rows.append(g)
+        pf_cal = pd.concat(cal_rows, ignore_index=True)
+
+        # ---- (3) the edge model: realised round-trip edge of an S fill by predicted decile, out-of-sample R2
+        ed_rows, ed_dec = [], []
+        for col, lab in [('edge_trade_rt', 'round-trip edge, trade features'), ('edge_ipca_rt', 'round-trip edge, + IPCA / state-space'), ('edge_ipca_eval', 'evaluation edge, + IPCA / state-space')]:
+            if col not in pred.columns:
+                continue
+            base_arr = BASE_RT if col.endswith('_rt') else BASE_EVAL
+            y = base_arr - O_S; yhat = pred[col].to_numpy(float); fill0 = O_S >= 0
+            for sd_, msk in [('ALL', tested & fill0), ('P', tested & fill0 & IS_P), ('S', tested & fill0 & IS_S)]:
+                ok = msk & np.isfinite(y) & np.isfinite(yhat)
+                if ok.sum() < 1_000:
+                    continue
+                sse = float(np.sum((y[ok] - yhat[ok]) ** 2)); sst = float(np.sum((y[ok] - y[ok].mean()) ** 2))
+                ic = pd.DataFrame({'d': TD[ok], 'y': y[ok], 'p': yhat[ok]}).groupby('d').apply(lambda g: g['y'].corr(g['p'], method='spearman') if len(g) > 30 else np.nan, include_groups=False).dropna()
+                ed_rows.append({'model': lab, 'side': sd_, 'fills': int(ok.sum()), 'OOS R2': 1.0 - sse / sst if sst > 0 else np.nan, 'MAE (bp)': float(np.mean(np.abs(y[ok] - yhat[ok]))), 'daily rank IC': float(ic.mean()), 'IC t': float(np.sqrt(len(ic)) * ic.mean() / ic.std()) if ic.std() > 0 else np.nan})
+                if sd_ != 'ALL' and col == 'edge_ipca_rt':
+                    dec = pd.qcut(pd.Series(yhat[ok]).rank(method='first'), 10, labels=False) + 1
+                    g = pd.DataFrame({'dec': dec.to_numpy(), 'y': y[ok], 'p': yhat[ok]}).groupby('dec').agg(predicted=('p', 'mean'), realised=('y', 'mean'), n=('y', 'size')).reset_index(); g['side'] = sd_; ed_dec.append(g)
+        edge_scores = pd.DataFrame(ed_rows).set_index(['model', 'side']) if ed_rows else pd.DataFrame()
+        edge_dec = pd.concat(ed_dec, ignore_index=True) if ed_dec else pd.DataFrame()
+        if len(edge_scores):
+            print('The edge model on the new target: realised edge of an S fill at delta 0, out of sample (R2 against the training mean; daily rank IC):'); display(edge_scores.round(3))
+        if len(edge_dec):
+            print('Realised round-trip edge of S fills by predicted decile (bp), factor-model feature set:'); display(edge_dec.pivot(index='dec', columns='side', values=['predicted', 'realised']).round(2))
+
+        # ---- (4) the engine in reduced form: delta per print = argmax pfill(delta | x) x (expected edge + delta)
+        e_hat = pred['edge_ipca_rt'].to_numpy(float) if 'edge_ipca_rt' in pred.columns else np.full(len(mo), np.nan)
+
+        # selection adjustment, by side, on prior months: a larger concession keeps the prints that were further through the quote,
+        # whose base edge (RT - o) is lower on average; ADJ[i, j] = mean base edge of fills kept at delta_j minus at delta 0
+        ADJ = np.zeros((len(mo), len(PF_DELTAS))); _base_e = BASE_RT - O_S
+        for m in MONTHS_MO[1:]:
+            trm = MONTH_ARR < m; tem = MONTH_ARR == m
+            for sd_, msk in [('P', IS_P), ('S', IS_S)]:
+                sel0 = trm & msk & np.isfinite(_base_e)
+                if (sel0 & (O_S >= 0)).sum() < max(200, CFG.pfill_min_train // 10):
+                    continue
+                m0 = float(_base_e[sel0 & (O_S >= 0)].mean())
+                for j, dlt in enumerate(PF_DELTAS):
+                    selj = sel0 & (O_S >= dlt); ADJ[tem & msk, j] = (float(_base_e[selj].mean()) - m0) if selj.sum() >= max(100, CFG.pfill_min_train // 20) else 0.0
+        adj_tab = pd.DataFrame({sd_: ADJ[(MONTH_ARR == MONTHS_MO[-1]) & msk].mean(axis=0) for sd_, msk in [('P', IS_P), ('S', IS_S)]}, index=[f'delta {d:g}' for d in PF_DELTAS])
+        print('Selection adjustment to the expected edge by concession and side (bp; the fills kept at a larger concession carry less base edge), last fold:'); display(adj_tab.round(2))
+
+        def engine_delta(pf_mat: np.ndarray) -> np.ndarray:
+            val = pf_mat * (e_hat[:, None] + PFD[None, :] + ADJ); val = np.where(np.isfinite(val), val, -np.inf)
+            j = np.argmax(val, axis=1); return np.where(np.isfinite(val).any(axis=1), PFD[j], 0.0)
+
+        eng_mask = tested & common & np.isfinite(e_hat)
+        if eng_mask.sum() < 200:
+            print(f'engine: only {int(eng_mask.sum())} prints carry every input (fill models and the edge model); the policy test is skipped on this run.')
+            eng_mask = np.zeros(len(mo), bool)
+        POLICIES = {'S at 0': 0.0, 'S + delta* per side (Section 11, walk-forward)': delta_side,
+                    'engine: desk pfill x edge model': engine_delta(METHODS['desk: side, trailing window']), 'engine: cell pfill x edge model': engine_delta(METHODS['cell: side x size x cluster, prior months']),
+                    'engine: GBM + IPCA pfill x edge model': engine_delta(METHODS['GBM: + IPCA and state-space'])}
+        eng_rows, eng_daily = [], {}
+        for name, dl in POLICIES.items():
+            r_rt = pnl_with(errS, dl, eng_mask, BASE_RT); r_ev = pnl_with(errS, dl, eng_mask, BASE_EVAL)
+            eng_daily[name] = (r_rt.pop('_daily'), r_ev.pop('_daily'))
+            eng_rows.append({'policy': name, 'mean concession (bp)': float(np.mean(np.broadcast_to(dl, len(mo))[eng_mask])) if eng_mask.any() else np.nan, 'fill share': r_rt['fill share'], 'round trip: P&L per print (bp)': r_rt['P&L per print (bp)'], 'round trip: $ per month ($k)': r_rt['$ per month ($k)'],
+                             'evaluation: P&L per print (bp)': r_ev['P&L per print (bp)'], 'evaluation: $ per month ($k)': r_ev['$ per month ($k)']})
+        engine = pd.DataFrame(eng_rows).set_index('policy')
+        _b_rt, _b_ev = eng_daily['S at 0']
+        for name in engine.index:
+            d_rt = (eng_daily[name][0] - _b_rt).dropna(); d_ev = (eng_daily[name][1] - _b_ev).dropna(); dm = d_rt.groupby(pd.DatetimeIndex(d_rt.index).to_period('M')).mean()
+            engine.loc[name, 'round trip: boot t vs S at 0'] = block_bootstrap_t(d_rt.to_numpy(), CFG.block_days, CFG.n_boot, CFG.seed) if name != 'S at 0' else np.nan
+            engine.loc[name, 'evaluation: boot t vs S at 0'] = block_bootstrap_t(d_ev.to_numpy(), CFG.block_days, CFG.n_boot, CFG.seed) if name != 'S at 0' else np.nan
+            engine.loc[name, 'months above S (round trip)'] = int((dm > 0).sum()) if name != 'S at 0' else np.nan
+        engine['beats S (bar, round trip)'] = ((engine['round trip: P&L per print (bp)'] - engine.loc['S at 0', 'round trip: P&L per print (bp)']) >= CFG.interaction_bar_bp) & (engine['round trip: boot t vs S at 0'] > 3) & (engine['months above S (round trip)'] >= min(4, int(pd.Series(MONTH_ARR[eng_mask]).nunique())))
+        print(f'The quote engine in reduced form, walk-forward on {int(eng_mask.sum()):,} prints where every input exists; bar: +{CFG.interaction_bar_bp:.2f} bp per print on the round trip over S at 0, bootstrap t > 3, positive in >= 4 months:'); display(engine.round(3))
+        _dmix = pd.DataFrame({name: pd.Series(np.broadcast_to(dl, len(mo))[eng_mask]).value_counts(normalize=True).sort_index() for name, dl in POLICIES.items() if np.ndim(dl)}).fillna(0.0)
+        print('Mix of concessions chosen by each policy (share of prints):'); display(_dmix.round(3))
+
+        # ---- figures
+        fig, ax = plt.subplots(2, 3, figsize=(20, 10))
+        for sd_, c_ in [('P', '#4C72B0'), ('S', '#DD8452')]:
+            if sd_ in desk_cal_size['predicted'].columns:
+                x = np.arange(len(desk_cal_size)); ax[0, 0].plot(x, desk_cal_size[('predicted', sd_)], ls='--', marker='.', color=c_, label=f'{sd_}: desk curve predicted'); ax[0, 0].plot(x, desk_cal_size[('realised', sd_)], marker='o', color=c_, label=f'{sd_}: realised crossing share')
+            if sd_ in desk_cal_cl['predicted'].columns:
+                x2 = np.arange(len(desk_cal_cl)); ax[0, 1].plot(x2, desk_cal_cl[('predicted', sd_)], ls='--', marker='.', color=c_, label=f'{sd_}: predicted'); ax[0, 1].plot(x2, desk_cal_cl[('realised', sd_)], marker='o', color=c_, label=f'{sd_}: realised')
+        ax[0, 0].set_xticks(np.arange(len(desk_cal_size))); ax[0, 0].set_xticklabels(desk_cal_size.index, rotation=30, fontsize=8); ax[0, 0].set_title('The desk curve on the algo quote at delta 0: pooled prediction vs realised fills, by size', fontsize=10); ax[0, 0].legend(fontsize=7); ax[0, 0].set_ylabel('fill probability')
+        ax[0, 1].set_xticks(np.arange(len(desk_cal_cl))); ax[0, 1].set_xticklabels([str(i_)[:14] for i_ in desk_cal_cl.index], rotation=30, fontsize=7); ax[0, 1].set_title('... by beta-space cluster', fontsize=10); ax[0, 1].legend(fontsize=7)
+        for name, c_ in zip(METHODS, ['#8C8C8C', '#937860', '#4C72B0', '#2E8B57']):
+            ax[0, 2].plot(PF_DELTAS, brier_tab.loc[name], marker='o', color=c_, label=name)
+        ax[0, 2].set_xlabel('concession delta (bp)'); ax[0, 2].set_ylabel('Brier score (next month)'); ax[0, 2].set_title('Fill-probability estimators for the S quote: Brier by concession', fontsize=10); ax[0, 2].legend(fontsize=7)
+        for (name, sd_), g in pf_cal.groupby(['method', 'side']):
+            ax[1, 0].plot(g['predicted'], g['realised'], marker='o', ls='-' if name.startswith('GBM') else '--', color='#4C72B0' if sd_ == 'P' else '#DD8452', label=f'{name.split(":")[0]} {sd_}')
+        ax[1, 0].plot([0, 1], [0, 1], 'k:', lw=0.8); ax[1, 0].set_xlabel('predicted fill probability (decile mean)'); ax[1, 0].set_ylabel('realised'); ax[1, 0].set_title('Calibration at delta 0: desk curve (dashed) vs GBM + IPCA (solid)', fontsize=10); ax[1, 0].legend(fontsize=7)
+        if len(edge_dec):
+            for sd_, g in edge_dec.groupby('side'):
+                ax[1, 1].plot(g['dec'], g['realised'], marker='o', color='#4C72B0' if sd_ == 'P' else '#DD8452', label=f'{sd_}: realised'); ax[1, 1].plot(g['dec'], g['predicted'], ls='--', color='#4C72B0' if sd_ == 'P' else '#DD8452', label=f'{sd_}: predicted')
+            ax[1, 1].set_xlabel('predicted-edge decile'); ax[1, 1].set_ylabel('round-trip edge of S fills (bp)'); ax[1, 1].set_title('The edge model on the new target: realised edge by predicted decile', fontsize=10); ax[1, 1].legend(fontsize=7)
+        else:
+            ax[1, 1].text(0.5, 0.5, 'edge model unavailable', ha='center', va='center', transform=ax[1, 1].transAxes); ax[1, 1].set_axis_off()
+        y_ = np.arange(len(engine)); v_ = np.nan_to_num(engine['round trip: P&L per print (bp)'].to_numpy(float))
+        ax[1, 2].barh(y_, v_, color=['#2E8B57' if b_ else '#8C8C8C' for b_ in engine['beats S (bar, round trip)']]); ax[1, 2].set_yticks(y_); ax[1, 2].set_yticklabels([f'{i_}  (t {t_:+.1f})' if np.isfinite(t_) else i_ for i_, t_ in zip(engine.index, engine['round trip: boot t vs S at 0'])], fontsize=7)
+        ax[1, 2].axvline(np.nan_to_num(engine.loc['S at 0', 'round trip: P&L per print (bp)']), color='k', ls='--', lw=0.8); ax[1, 2].set_xlabel('round-trip P&L per print (bp)'); ax[1, 2].set_title('The engine in reduced form vs S at 0 (green = clears the bar)', fontsize=10)
+        plt.tight_layout(); savefig('11b_pfill_and_engine')
+        if len(PF['imp']):
+            _imp = PF['imp'].set_index('feature'); fig, ax = plt.subplots(1, 2, figsize=(15, 5.5))
+            for a, pre, ttl in zip(ax, ['pfill ipca', 'edge ipca'], ['Fill model (delta 0, + IPCA / state-space): mean importance', 'Edge model (round trip, + IPCA / state-space): mean importance']):
+                cols = [c for c in _imp.columns if c.startswith(pre)]
+                if cols:
+                    _imp[cols].mean(axis=1).sort_values().tail(15).plot.barh(ax=a, color='#4C72B0'); a.set_title(ttl, fontsize=10)
+                else:
+                    a.set_axis_off()
+            plt.tight_layout(); savefig('11b_importances')
+        record('pfill', deltas=PF_DELTAS, window_days=CFG.pfill_window_days, desk_calibration_by_size=flat_records(desk_cal_size.reset_index()), desk_calibration_by_cluster=flat_records(desk_cal_cl.reset_index()), scores=pf_scores.round(5).to_dict(orient='records'),
+               brier_relative_to_desk=flat_records(brier_rel.reset_index()), calibration_deciles=pf_cal.round(4).to_dict(orient='records'), features_trade=PF_BASE, features_ipca=PF_IPCA,
+               edge_model=edge_scores.round(4).reset_index().to_dict(orient='records') if len(edge_scores) else [], edge_deciles=edge_dec.round(4).to_dict(orient='records') if len(edge_dec) else [],
+               engine=engine.round(4).reset_index().to_dict(orient='records'), concession_mix=flat_records(_dmix.reset_index()))
+else:
+    print('Section 11b skipped: needs Section 11.')
 
 # %% [markdown]
 # ## 12. Quantile grid: the conditional distribution the optimizer consumes
@@ -3001,6 +3329,17 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty:
     _cum = _tc.clip(lower=0).sort_values(ascending=False).cumsum() / max(_tc.clip(lower=0).sum(), 1e-9)
     ax[1].plot(np.arange(1, len(_cum) + 1), _cum.to_numpy(float), marker='.', color='#4C72B0'); ax[1].axhline(0.8, color='#888888', lw=0.8, ls='--'); ax[1].set_xlabel('cells, ranked by S dollars'); ax[1].set_ylabel('cumulative share of positive S dollars'); ax[1].set_title('Concentration: how many cells carry the P&L', fontsize=10); ax[1].grid(alpha=0.3)
     plt.tight_layout(); savefig('13_pnl_cells')
+    # v4.3: the beta-space map of Section 6b coloured by markout: where in factor space the money is
+    if 'sm' in globals() and 'v_S' in bk.columns:
+        _bl = bk.groupby('cusip', observed=True).agg(pnl_S=('v_S', 'mean'), fill_S=('f_S', 'mean'), prints=('v_S', 'size')).reset_index(); _bl['cusip'] = _bl['cusip'].astype('string')
+        smm = sm.assign(cusip=sm['cusip'].astype('string')).merge(_bl, on='cusip', how='left')
+        fig, ax = plt.subplots(1, 3, figsize=(19, 5.6))
+        for a, (col, ttl, cmap, lim) in zip(ax, [('pnl_S', 'S factor-hedged P&L per print (bp), bond mean', 'RdYlGn', (-15, 15)), ('fill_S', 'S fill share, bond mean', 'viridis', (0, 1)), ('prints', 'customer prints in the held-out months (log10)', 'magma', None)]):
+            a.scatter(smm['x'], smm['y'], s=4, color='#DDDDDD', alpha=0.5); g0 = smm.dropna(subset=[col])
+            vals = np.log10(g0[col].clip(lower=1)) if col == 'prints' else g0[col]
+            sc = a.scatter(g0['x'], g0['y'], s=7, c=vals, cmap=cmap, alpha=0.85, vmin=lim[0] if lim else None, vmax=lim[1] if lim else None); plt.colorbar(sc, ax=a, fraction=0.046)
+            a.set_title(f'Beta space ({emb_name}): {ttl}', fontsize=10); a.set_xticks([]); a.set_yticks([]); a.grid(False)
+        fig.suptitle(f'Where in factor space the P&L lives ({int(smm["pnl_S"].notna().sum()):,} of {len(smm):,} mapped bonds have customer prints; grey = none)', fontsize=11); plt.tight_layout(); savefig('13_beta_space_markout')
     record('markout_breakdown', record_h=HR, segments={k_: v_.round(4).reset_index().to_dict(orient='records') for k_, v_ in seg_pnl.items()}, cells=cells_pnl.round(4).reset_index().to_dict(orient='records'),
            by_side={k_: {m_: v_[m_].round(4).reset_index().to_dict(orient='records') for m_ in ['pnl', 't', '$', 'fill']} for k_, v_ in side_tabs.items()})
 else:
@@ -3125,6 +3464,20 @@ if 'markout_breakdown' in REGISTRY:
         _rc = pd.DataFrame(_rtr['concession']).set_index('index') if 'index' in pd.DataFrame(_rtr['concession']).columns else pd.DataFrame(_rtr['concession'])
         summary_rows.append(('Side concession on the round trip: S at 0 | delta* from evaluation | delta* from round trip (bp per print; boot t)', ' | '.join(f"{_rc.loc[k_, 'P&L per print (bp)']:+.2f}" + (f" (t {_rc.loc[k_, 'boot t vs S at delta 0']:+.1f})" if np.isfinite(_rc.loc[k_, 'boot t vs S at delta 0']) else '') for k_ in _rc.index)))
     summary_rows.append(('Cell-optimal concession, walk-forward: S at 0 | S + delta* per side | S + delta* per side x size ($k/month)', ' | '.join(f"{_cc.loc[k_, '$ per month ($k)']:,.0f}" for k_ in ['S same-side EWMA, delta 0', 'S + delta* per side (walk-forward)', 'S + delta* per side x size cell (walk-forward)'] if k_ in _cc.index)))
+if 'pfill' in REGISTRY and REGISTRY['pfill']['engine']:
+    _br = pd.DataFrame(REGISTRY['pfill']['brier_relative_to_desk']).set_index('method')
+    summary_rows.append(('Fill model for the S quote: Brier removed vs the desk curve at delta 0 (cell | GBM trade | GBM + IPCA)', ' | '.join(f"{_br.loc[m_, '0']:+.1%}" if '0' in _br.columns else f"{_br.loc[m_, 0.0]:+.1%}" for m_ in ['cell: side x size x cluster, prior months', 'GBM: trade and quote features', 'GBM: + IPCA and state-space'] if m_ in _br.index)))
+    _dc = pd.DataFrame(REGISTRY['pfill']['desk_calibration_by_size']).set_index('qty_group')
+    _gaps = [abs(_dc.loc[q_, f'realised | {s_}'] - _dc.loc[q_, f'predicted | {s_}']) for q_ in _dc.index for s_ in ['P', 'S'] if f'realised | {s_}' in _dc.columns and np.isfinite(_dc.loc[q_, f'realised | {s_}'])]
+    if _gaps:
+        summary_rows.append(('Desk curve on the algo quote: largest calibration gap by size bin at delta 0 (fill probability)', f'{max(_gaps):.3f}'))
+    if REGISTRY['pfill']['edge_model']:
+        _em = pd.DataFrame(REGISTRY['pfill']['edge_model']).set_index(['model', 'side'])
+        _k = ('round-trip edge, + IPCA / state-space', 'ALL')
+        if _k in _em.index:
+            summary_rows.append(('Edge model (round-trip edge of S fills, + IPCA): OOS R2 | daily rank IC (t)', f"{_em.loc[_k, 'OOS R2']:.3f} | {_em.loc[_k, 'daily rank IC']:+.3f} (t {_em.loc[_k, 'IC t']:+.1f})"))
+    _en = pd.DataFrame(REGISTRY['pfill']['engine']).set_index('policy')
+    summary_rows.append(('Engine in reduced form vs S at 0, round-trip P&L per print (bp; boot t; bar): desk | cell | GBM + IPCA', ' | '.join(f"{_en.loc[p_, 'round trip: P&L per print (bp)']:+.2f} (t {_en.loc[p_, 'round trip: boot t vs S at 0']:+.1f}) {'PASS' if bool(_en.loc[p_, 'beats S (bar, round trip)']) else 'no'}" for p_ in ['engine: desk pfill x edge model', 'engine: cell pfill x edge model', 'engine: GBM + IPCA pfill x edge model'] if p_ in _en.index) + f"; S at 0 {_en.loc['S at 0', 'round trip: P&L per print (bp)']:+.2f}"))
 if 'residual_side' in REGISTRY:
     _sp = pd.DataFrame(REGISTRY['residual_side']['policy']).set_index('input'); _sl = pd.DataFrame(REGISTRY['residual_side']['slopes'])
     summary_rows.append(('Residual signal as concession modifier (delta bp per print over S + side concession, boot t, bar)', '; '.join(f"{i_}: {r_['delta (bp)']:+.2f} (t {r_['boot t of delta']:+.1f}) {'PASS' if r_['passes bar'] else 'no'}" for i_, r_ in _sp.iterrows())))
