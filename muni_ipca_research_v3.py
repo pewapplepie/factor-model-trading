@@ -1523,8 +1523,8 @@ def neutralised_fm(frame: pd.DataFrame, y: str, x: str, cells: list[str], date_c
 # %%
 CONTROLS = ['log_size', 'MinuteFromSignal', 'dMmdSprdSide']
 if HAS_TRADES:
-    trades = standardize_trades(trades_raw)
-    trades = trades[(trades['trade_date'] >= pd.Timestamp(CFG.first_oos_date)) & (trades['trade_date'] <= pd.Timestamp(CFG.end_date))]
+    trades_all = standardize_trades(trades_raw)          # full matched print history (used by the Section 10b memories)
+    trades = trades_all[(trades_all['trade_date'] >= pd.Timestamp(CFG.first_oos_date)) & (trades_all['trade_date'] <= pd.Timestamp(CFG.end_date))]
     tv = join_trades_to_residual(trades, resid, CFG.residual_min_age_days)
     print(f'matched trades in OOS window: {len(trades):,} | joined to a prior residual: {len(tv):,} | cusips {tv["cusip"].nunique():,} | trade dates {tv["trade_date"].nunique()} | residual age median {tv["residual_age_days"].median():.0f}d')
     SCORES = [('pit_rank', 'one-day residual rank'), ('level_rank', 'trailing-mean rank'), ('ssm_rank', 'state-space signal rank (record)')]
@@ -1756,6 +1756,319 @@ else:
     print('Section 10 skipped: needs matched trades joined to residuals.')
 
 # %% [markdown]
+# ### 10b. Error correction inside the factor framework: side-aware memory, state-space memory, cluster pooling, relative value
+#
+# The EWMA rule of Section 10 is the simplest object that captures the persistence of the algo's error, and it
+# stands outside the factor model. The v35 side breakdown showed its defect: it pools prints from both sides, and
+# in the short end the dealer round trip is large relative to the yield, so the last error from a sale is applied
+# with the wrong sign to the next purchase. This block keeps the walk-forward protocol of Section 10 (every
+# coefficient and parameter estimated on months strictly before the test month, every feature cut at the algo
+# signal time) and adds four families that bring the correction back inside the framework:
+#
+# * **Side-aware memories.** (S) the EWMA over the bond's prior prints on the *same side*, falling back to the
+#   pooled EWMA when there is none; (S2) the EWMA of errors demeaned by the universe side bias known before the
+#   print's month, plus the side bias itself.
+# * **State-space memory (K).** The Section 7b model applied to the quote's error on the bond's irregular print
+#   clock: the side-adjusted error at a print is a persistent bond-specific mispricing $m$ that decays at
+#   $\phi$ per day and diffuses at $q$ per day, observed under noise $r$. A Kalman filter run over every print of
+#   every bond gives the posterior mispricing after the last print before the signal time, decayed to the trade.
+#   The three parameters are maximum-likelihood on prints before the test month; the EWMA with a fixed half-life
+#   is the steady-state special case with $\phi = 1$.
+# * **Cluster pooling (P, PS).** The point-in-time beta-space cluster is the factor model's own notion of
+#   similarity. The feature is the trade-weighted EWMA (half-life `CLU_HL_DAYS` days) of the algo's errors on
+#   prints of *other* bonds in the same cluster (PS: same cluster and same side) on days strictly before the
+#   trade date. It is exact leave-one-bond-out, so it measures what the neighbours know, and it exists for bonds
+#   with no print history. (CP) own EWMA plus cluster pooling, (KP) state-space memory plus cluster-side pooling,
+#   coefficients jointly by Fama-MacBeth on prior months.
+# * **Within-cluster relative value (RV, CRV).** The bond's filtered residual drift relative to the median drift
+#   of its cluster on the residual date: the rich/cheap state the beta space was built to show, as a feature
+#   on its own and on top of C.
+# * **Local factor loading (Gc).** The direct beta correction G, estimated per cluster rather than universe-wide.
+#
+# All mids are scored against the print, overall, by side, by residual age and by duration band, with
+# Fama-MacBeth and block-bootstrap t, and the best of them are carried into the Section 12 breakdowns and the
+# dollar view.
+
+# %%
+if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
+    from scipy.optimize import minimize  # noqa: E402
+    t0_all = time.perf_counter()
+    HL = CFG.err_halflife_prints; CLU_HL_DAYS = 5.0; KF_MAX_ITER = 80; KF_SUB_BONDS = 4000
+    if isinstance(PRE_REGISTERED, dict):
+        PRE_REGISTERED['v3.6 cluster memory'] = f'trade-weighted EWMA of other bonds\' algo errors in the same PIT beta-space cluster, half-life {CLU_HL_DAYS:.0f} days, days strictly before the trade'
+        PRE_REGISTERED['v3.6 state-space memory'] = 'local level with daily decay phi and diffusion q on the side-adjusted algo error per print, observation noise r; ML on prints before the test month'
+
+    # ---------- own-bond memories on the full print history, cut at the signal time ----------
+    pr = trades_all[['cusip', 'trade_ts', 'trade_date', 'side', 'e_algo_bp']].dropna(subset=['e_algo_bp']).copy()
+    pr['cusip'] = pr['cusip'].astype('string'); pr['trade_ts'] = to_ns(pr['trade_ts']); pr['trade_date'] = to_ns(pr['trade_date'])
+    pr = pr.sort_values(['cusip', 'trade_ts'], kind='stable').reset_index(drop=True)
+    pr['month'] = pr['trade_date'].dt.to_period('M')
+    pr['ewm_side'] = pr.groupby(['cusip', 'side'], observed=True)['e_algo_bp'].transform(lambda s: s.ewm(halflife=HL, min_periods=1).mean())
+    mon_side = pr.groupby(['month', 'side'], observed=True)['e_algo_bp'].agg(['sum', 'count']).reset_index().sort_values(['side', 'month'])
+    mon_side['csum'] = mon_side.groupby('side')['sum'].cumsum() - mon_side['sum']; mon_side['ccount'] = mon_side.groupby('side')['count'].cumsum() - mon_side['count']
+    mon_side['bias_pit'] = (mon_side['csum'] / mon_side['ccount'].replace(0, np.nan)).fillna(0.0)
+    pr = pr.merge(mon_side[['month', 'side', 'bias_pit']], on=['month', 'side'], how='left').sort_values(['cusip', 'trade_ts'], kind='stable').reset_index(drop=True)
+    pr['e_adj'] = pr['e_algo_bp'] - pr['bias_pit'].fillna(0.0)
+    pr['ewm_adj'] = pr.groupby('cusip', observed=True)['e_adj'].transform(lambda s: s.ewm(halflife=HL, min_periods=1).mean())
+    _lo, _hi = pr['e_adj'].quantile([0.005, 0.995]); pr['e_kf'] = pr['e_adj'].clip(_lo, _hi)
+    pr['k'] = pr.groupby('cusip', observed=True).cumcount()
+    pr['gap'] = pr.groupby('cusip', observed=True)['trade_ts'].diff().dt.total_seconds().div(86400.0).fillna(0.0).clip(lower=0.0)
+    bond_id = pr['cusip'].astype('category').cat.codes.to_numpy(); NB = int(bond_id.max()) + 1
+    _ord = np.argsort(pr['k'].to_numpy(), kind='stable'); _ks = pr['k'].to_numpy()[_ord]; _starts = np.searchsorted(_ks, np.arange(_ks.max() + 2))
+    E_KF = pr['e_kf'].to_numpy(float); GAP = pr['gap'].to_numpy(float); PR_MONTH = pr['month'].to_numpy()
+    print(f'print history for the memories: {len(pr):,} prints, {NB:,} bonds, max {int(_ks.max()) + 1:,} prints per bond | {time.perf_counter() - t0_all:.0f}s')
+
+    def layout(mask: np.ndarray | None):
+        """Rows grouped by print order (step k), restricted to a mask: the filter visits each bond's prints in sequence."""
+        o = _ord if mask is None else _ord[mask[_ord]]
+        ks = pr['k'].to_numpy()[o]; st = np.searchsorted(ks, np.arange(ks.max() + 2)) if len(ks) else np.array([0, 0])
+        return o, st
+
+    FULL_LAYOUT = layout(None)
+
+    def kf_pass(theta: np.ndarray, lay=None, want: bool = False):
+        """Vectorised local-level filter across bonds, stepping over print order. theta = (logit phi_daily, log q, log r)."""
+        o, st = FULL_LAYOUT if lay is None else lay
+        phi = 1.0 / (1.0 + np.exp(-theta[0])); q = np.exp(theta[1]); r = np.exp(theta[2])
+        level = np.zeros(NB); var = np.full(NB, 10.0 * r); ll = 0.0
+        post = np.full(len(pr), np.nan) if want else None; postvar = np.full(len(pr), np.nan) if want else None
+        for k in range(len(st) - 1):
+            rows = o[st[k]:st[k + 1]]
+            if not len(rows):
+                continue
+            b = bond_id[rows]; g = GAP[rows]; e = E_KF[rows]; dec = phi ** g
+            m_pred = dec * level[b]; P_pred = dec * dec * var[b] + q * g; S = P_pred + r; v = e - m_pred; K = P_pred / S
+            level[b] = m_pred + K * v; var[b] = (1.0 - K) * P_pred
+            if not want:
+                ll += float(np.sum(-0.5 * (np.log(S) + v * v / S)))
+            if want:
+                post[rows] = level[b]; postvar[rows] = var[b]
+        return (post, postvar) if want else -ll
+
+    def fit_kf(before_month) -> np.ndarray:
+        """ML on a subsample of bonds, prints strictly before the test month. The mask keeps bonds in the subsample AND prints before the month."""
+        rng = np.random.default_rng(CFG.seed)
+        cnt = np.bincount(bond_id, minlength=NB); eligible = np.flatnonzero((cnt >= 5) & (cnt <= 500))
+        sub = np.zeros(NB, bool); sub[rng.choice(eligible, size=min(KF_SUB_BONDS, len(eligible)), replace=False)] = True
+        mask = sub[bond_id] & (PR_MONTH < before_month)
+        x0 = np.array([np.log(0.97 / 0.03), np.log(1.0), np.log(float(np.nanvar(E_KF[mask])) if mask.any() else 50.0)])
+        lay = layout(mask)
+        res = minimize(kf_pass, x0, args=(lay, False), method='Nelder-Mead', options={'maxiter': KF_MAX_ITER, 'xatol': 1e-3, 'fatol': 1e-3})
+        return res.x
+
+    # merge the fold-independent own-bond memories (same-side EWMA, side-adjusted EWMA) at the signal time
+    eck = ec.dropna(subset=['beta_cluster']).copy(); eck['cusip'] = eck['cusip'].astype('string'); eck['beta_cluster'] = eck['beta_cluster'].astype(int)
+    eck['_id'] = np.arange(len(eck)); eck['signal_ts'] = to_ns(eck['signal_ts']); eck['trade_date'] = to_ns(eck['trade_date'])
+    sigk = eck[['_id', 'cusip', 'signal_ts', 'side']].dropna(subset=['signal_ts']).sort_values('signal_ts')
+    _pside = pr[['cusip', 'side', 'trade_ts', 'ewm_side']].sort_values('trade_ts')
+    j_side = pd.merge_asof(sigk, _pside, left_on='signal_ts', right_on='trade_ts', by=['cusip', 'side'], direction='backward', allow_exact_matches=False).set_index('_id')
+    _padj = pr[['cusip', 'trade_ts', 'ewm_adj']].sort_values('trade_ts')
+    j_adj = pd.merge_asof(sigk[['_id', 'cusip', 'signal_ts']], _padj, left_on='signal_ts', right_on='trade_ts', by='cusip', direction='backward', allow_exact_matches=False).set_index('_id')
+    eck = eck.set_index('_id'); eck['ewm_side_err_bp'] = j_side['ewm_side']; eck['ewm_adj_err_bp'] = j_adj['ewm_adj']; eck = eck.reset_index()
+    print(f'same-side memory available for {eck["ewm_side_err_bp"].notna().mean():.1%} of trades; side-adjusted memory for {eck["ewm_adj_err_bp"].notna().mean():.1%}')
+
+    # ---------- cluster pooling: leave-one-bond-out trade-weighted EWMA of neighbours' errors, days strictly before the trade ----------
+    LAM = 0.5 ** (1.0 / CLU_HL_DAYS)
+
+    def decayed_running_sums(frame: pd.DataFrame, keys: list[str], cols: list[str]) -> pd.DataFrame:
+        """Per key group, running sums of cols with decay LAM per calendar day between the group's dates (value up to and including the date)."""
+        f = frame.sort_values(keys + ['trade_date'], kind='stable').reset_index(drop=True)
+        gid = f.groupby(keys, observed=True, sort=False).ngroup().to_numpy(); ng = int(gid.max()) + 1
+        step = f.groupby(keys, observed=True, sort=False).cumcount().to_numpy()
+        gap = f.groupby(keys, observed=True, sort=False)['trade_date'].diff().dt.days.fillna(0).to_numpy(float)
+        order = np.argsort(step, kind='stable'); ks = step[order]; st = np.searchsorted(ks, np.arange(ks.max() + 2))
+        acc = {c: np.zeros(ng) for c in cols}; out = {c: np.empty(len(f)) for c in cols}; vals = {c: f[c].to_numpy(float) for c in cols}
+        for k in range(len(st) - 1):
+            rows = order[st[k]:st[k + 1]]; g = gid[rows]; w = LAM ** gap[rows]
+            for c in cols:
+                acc[c][g] = acc[c][g] * w + vals[c][rows]; out[c][rows] = acc[c][g]
+        for c in cols:
+            f[f'{c}_ewm'] = out[c]
+        return f
+
+    for fname, keys in {'clu': ['beta_cluster'], 'clu_side': ['beta_cluster', 'side']}.items():
+        daily = eck.groupby(keys + ['trade_date'], observed=True)['e_algo_bp'].agg(S='sum', N='count').reset_index()
+        dense = decayed_running_sums(daily, keys, ['S', 'N'])[keys + ['trade_date', 'S_ewm', 'N_ewm']].rename(columns={'trade_date': 'd_dense'})
+        own = eck.groupby(['cusip'] + keys + ['trade_date'], observed=True)['e_algo_bp'].agg(s='sum', n='count').reset_index()
+        own = decayed_running_sums(own, ['cusip'] + keys, ['s', 'n'])[['cusip'] + keys + ['trade_date', 's_ewm', 'n_ewm']].rename(columns={'trade_date': 'd_own'})
+        q = eck[['_id', 'cusip', 'trade_date'] + keys].sort_values('trade_date')
+        q = pd.merge_asof(q, dense.sort_values('d_dense'), left_on='trade_date', right_on='d_dense', by=keys, direction='backward', allow_exact_matches=False)
+        q = pd.merge_asof(q.sort_values('trade_date'), own.sort_values('d_own'), left_on='trade_date', right_on='d_own', by=['cusip'] + keys, direction='backward', allow_exact_matches=False)
+        wd = LAM ** (q['trade_date'] - q['d_dense']).dt.days.astype(float); wo = LAM ** (q['trade_date'] - q['d_own']).dt.days.astype(float)
+        num = (q['S_ewm'] * wd).fillna(0.0) - (q['s_ewm'] * wo).fillna(0.0); den = (q['N_ewm'] * wd).fillna(0.0) - (q['n_ewm'] * wo).fillna(0.0)
+        q[f'{fname}_err_bp'] = np.where(den >= 20.0, num / den.replace(0, np.nan), np.nan); q[f'{fname}_n_eff'] = den
+        eck = eck.merge(q[['_id', f'{fname}_err_bp', f'{fname}_n_eff']], on='_id', how='left')
+    print(f'cluster memory available for {eck["clu_err_bp"].notna().mean():.1%} of trades (median effective neighbours {eck["clu_n_eff"].median():.0f}); cluster x side for {eck["clu_side_err_bp"].notna().mean():.1%}')
+    print(f'corr(own EWMA, cluster memory) = {eck["ewm_algo_err_bp"].corr(eck["clu_err_bp"]):+.3f}; corr(cluster memory, algo error at this print) = {eck["clu_err_bp"].corr(eck["e_algo_bp"]):+.3f} | {time.perf_counter() - t0_all:.0f}s')
+
+    # ---------- within-cluster relative value from the residual layer ----------
+    HAS_RV = 'ssm_drift' in resid.columns and resid['ssm_drift'].notna().any()
+    if HAS_RV:
+        rvp = resid[['cusip', 'date', 'ssm_drift', 'beta_cluster']].dropna().copy()
+        rvp['rv_bp'] = rvp['ssm_drift'] - rvp.groupby(['date', 'beta_cluster'], observed=True)['ssm_drift'].transform('median')
+        rvp['residual_date'] = to_ns(rvp['date']); rvp['cusip'] = rvp['cusip'].astype('string')
+        eck['residual_date'] = to_ns(eck['residual_date'])
+        eck = eck.merge(rvp[['cusip', 'residual_date', 'rv_bp']], on=['cusip', 'residual_date'], how='left')
+        print(f'within-cluster relative value available for {eck["rv_bp"].notna().mean():.1%} of trades')
+
+    # bring the Section 10 mids onto the same rows (C, F, G, D) for like-for-like tables
+    _keys = ['cusip', 'trade_ts', 'signal_ts', 'side', 'e_algo_bp']
+    _prev = ecp[_keys + ['e_C_bp', 'e_F_bp', 'e_G_bp', 'e_D_bp']].copy(); _prev['cusip'] = _prev['cusip'].astype('string'); _prev['trade_ts'] = to_ns(_prev['trade_ts']); _prev['signal_ts'] = to_ns(_prev['signal_ts'])
+    _prev = _prev.drop_duplicates(subset=_keys)
+    eck['trade_ts'] = to_ns(eck['trade_ts'])
+    eck = eck.merge(_prev, on=_keys, how='left')
+    eck['dur_band'] = pd.cut(eck['modified_duration_lag1'], bins=[-1, 1, 11, 100], labels=['<1y', '1-11y', '>11y']).astype(str)
+
+    # ---------- walk-forward by month ----------
+    parts2, path2 = [], []
+    for m in sorted(eck['month'].unique())[1:]:
+        t0 = time.perf_counter()
+        tr, te = eck[eck['month'] < m], eck[eck['month'] == m].copy()
+        if len(tr) < 5_000 or te.empty:
+            continue
+        trh = tr[tr['has_err']]
+        side_med = tr.groupby('side')['e_algo_bp'].median(); te['side_bias'] = te['side'].map(side_med).fillna(0.0)
+        rho_ewm = fm_slope(trh.dropna(subset=['ewm_algo_err_bp']), 'e_algo_bp', 'ewm_algo_err_bp', ['log_size'])['fm_beta']
+        row = {'month': str(m), 'rho_ewm': rho_ewm}
+        # (S) same-side EWMA with pooled fallback
+        _ts = trh.dropna(subset=['ewm_side_err_bp'])
+        rho_s = fm_slope(_ts, 'e_algo_bp', 'ewm_side_err_bp', ['log_size'])['fm_beta'] if len(_ts) >= 2000 else rho_ewm
+        te['e_S_bp'] = te['e_algo_bp'] - np.where(te['ewm_side_err_bp'].notna(), rho_s * te['ewm_side_err_bp'].fillna(0.0), rho_ewm * te['ewm_algo_err_bp'].fillna(0.0))
+        # (S2) side bias + rho x EWMA of side-adjusted errors
+        trs = trh.assign(e_sd=trh['e_algo_bp'] - trh['side'].map(side_med).fillna(0.0))
+        _t2 = trs.dropna(subset=['ewm_adj_err_bp'])
+        rho_s2 = fm_slope(_t2, 'e_sd', 'ewm_adj_err_bp', ['log_size'])['fm_beta'] if len(_t2) >= 2000 else rho_ewm
+        te['e_S2_bp'] = te['e_algo_bp'] - te['side_bias'] - (rho_s2 * te['ewm_adj_err_bp']).fillna(0.0)
+        row.update({'rho_side': rho_s, 'rho_adj': rho_s2})
+        # (K) state-space memory: parameters on prints before m, filter over every print, posterior at the last print before the signal, decayed to the trade
+        theta = fit_kf(m); phi_d = 1.0 / (1.0 + np.exp(-theta[0])); q_kf = float(np.exp(theta[1])); r_kf = float(np.exp(theta[2]))
+        post, postvar = kf_pass(theta, None, True)
+        pk = pd.DataFrame({'cusip': pr['cusip'], 'trade_ts': pr['trade_ts'], 'kf_post': post, 'kf_var': postvar}).sort_values('trade_ts')
+        jk = pd.merge_asof(sigk[['_id', 'cusip', 'signal_ts']], pk, left_on='signal_ts', right_on='trade_ts', by='cusip', direction='backward', allow_exact_matches=False).set_index('_id')
+        _gap = (jk['signal_ts'] - jk['trade_ts']).dt.total_seconds() / 86400.0
+        kf_pred = (jk['kf_post'] * (phi_d ** _gap)).reindex(eck['_id']).to_numpy(); kf_var = jk['kf_var'].reindex(eck['_id']).to_numpy()
+        eck['kf_pred_bp'] = kf_pred; eck['kf_var'] = kf_var
+        tr = eck[eck['month'] < m]; te['kf_pred_bp'] = eck.loc[eck['month'] == m, 'kf_pred_bp'].to_numpy(); te['kf_var'] = eck.loc[eck['month'] == m, 'kf_var'].to_numpy()
+        trs = tr[tr['has_err']].assign(e_sd=lambda d: d['e_algo_bp'] - d['side'].map(side_med).fillna(0.0))
+        _tk = trs.dropna(subset=['kf_pred_bp'])
+        rho_k = fm_slope(_tk, 'e_sd', 'kf_pred_bp', ['log_size'])['fm_beta'] if len(_tk) >= 2000 else 1.0
+        rho_k = float(rho_k) if np.isfinite(rho_k) else 1.0
+        te['e_K_bp'] = te['e_algo_bp'] - te['side_bias'] - (rho_k * te['kf_pred_bp']).fillna(0.0)
+        row.update({'kf_phi_daily': phi_d, 'kf_half_life_days': float(np.log(0.5) / np.log(phi_d)) if phi_d < 1 else np.inf, 'kf_q': q_kf, 'kf_r': r_kf, 'rho_K': rho_k})
+        # (P, PS) cluster pooling, (CP) own + cluster, (KP) state-space + cluster-side
+        _tp = tr.dropna(subset=['clu_err_bp']); rho_p = fm_slope(_tp, 'e_algo_bp', 'clu_err_bp', ['log_size'])['fm_beta'] if len(_tp) >= 2000 else 0.0
+        te['e_P_bp'] = te['e_algo_bp'] - (rho_p * te['clu_err_bp']).fillna(0.0)
+        _tps = tr.dropna(subset=['clu_side_err_bp']); rho_ps = fm_slope(_tps, 'e_algo_bp', 'clu_side_err_bp', ['log_size'])['fm_beta'] if len(_tps) >= 2000 else 0.0
+        te['e_PS_bp'] = te['e_algo_bp'] - (rho_ps * te['clu_side_err_bp']).fillna(0.0)
+        _tcp = trh.dropna(subset=['ewm_algo_err_bp', 'clu_err_bp'])
+        if len(_tcp) >= 2000:
+            jcp = fm_multi(_tcp, 'e_algo_bp', ['ewm_algo_err_bp', 'clu_err_bp'], ['log_size']).set_index('score')['fm_beta']
+        else:
+            jcp = pd.Series({'ewm_algo_err_bp': rho_ewm, 'clu_err_bp': 0.0})
+        te['e_CP_bp'] = te['e_algo_bp'] - (jcp['ewm_algo_err_bp'] * te['ewm_algo_err_bp']).fillna(0.0) - (jcp['clu_err_bp'] * te['clu_err_bp']).fillna(0.0)
+        _tkp = trs.dropna(subset=['kf_pred_bp', 'clu_side_err_bp'])
+        if len(_tkp) >= 2000:
+            jkp = fm_multi(_tkp, 'e_sd', ['kf_pred_bp', 'clu_side_err_bp'], ['log_size']).set_index('score')['fm_beta']
+        else:
+            jkp = pd.Series({'kf_pred_bp': rho_k, 'clu_side_err_bp': 0.0})
+        te['e_KP_bp'] = te['e_algo_bp'] - te['side_bias'] - (jkp['kf_pred_bp'] * te['kf_pred_bp']).fillna(0.0) - (jkp['clu_side_err_bp'] * te['clu_side_err_bp']).fillna(0.0)
+        row.update({'rho_P': rho_p, 'rho_PS': rho_ps, 'CP_own': float(jcp['ewm_algo_err_bp']), 'CP_cluster': float(jcp['clu_err_bp']), 'KP_kf': float(jkp['kf_pred_bp']), 'KP_cluster_side': float(jkp['clu_side_err_bp'])})
+        # (RV, CRV) within-cluster relative value
+        if HAS_RV:
+            _trv = tr.dropna(subset=['rv_bp']); b_rv = fm_slope(_trv, 'e_algo_bp', 'rv_bp', ['log_size'])['fm_beta'] if len(_trv) >= 2000 else 0.0
+            te['e_RV_bp'] = te['e_algo_bp'] - (b_rv * te['rv_bp']).fillna(0.0)
+            _tcrv = tr.dropna(subset=['rv_bp', 'e_C_bp']); b_crv = fm_slope(_tcrv, 'e_C_bp', 'rv_bp', ['log_size'])['fm_beta'] if len(_tcrv) >= 2000 else 0.0
+            te['e_CRV_bp'] = te['e_C_bp'].fillna(te['e_algo_bp']) - (b_crv * te['rv_bp']).fillna(0.0)
+            row.update({'b_RV': b_rv, 'b_CRV': b_crv})
+        # (Gc) local factor loading per cluster
+        te['e_Gc_bp'] = te['e_algo_bp'].to_numpy()
+        for c, g in tr.dropna(subset=beta_cols).groupby('beta_cluster', observed=True):
+            if len(g) < 2000:
+                continue
+            bc = fm_multi(g, 'e_algo_bp', beta_cols, ['log_size']).set_index('score')['fm_beta'].reindex(beta_cols).to_numpy(float)
+            ac = float((g['e_algo_bp'] - g[beta_cols].to_numpy(float) @ bc).mean())
+            sel = (te['beta_cluster'] == c).to_numpy()
+            te.loc[sel, 'e_Gc_bp'] = te.loc[sel, 'e_algo_bp'] - (ac + te.loc[sel, beta_cols].fillna(0.0).to_numpy(float) @ bc)
+        path2.append(row); parts2.append(te)
+        print(f'  {m}: train {len(tr):,} | test {len(te):,} | KF phi/day {phi_d:.3f} (half-life {row["kf_half_life_days"]:.0f}d), q {q_kf:.2f}, r {r_kf:.1f}, rho_K {rho_k:+.2f} | rho_P {rho_p:+.2f} rho_PS {rho_ps:+.2f} | {time.perf_counter() - t0:.0f}s')
+    ecp2 = pd.concat(parts2, ignore_index=True); path_df = pd.DataFrame(path2).set_index('month')
+    print('Coefficients and state-space parameters by month (estimated on prior months):'); display(path_df.round(3))
+
+    PREDS2 = {'A algo quote': 'e_algo_bp', 'C own EWMA': 'e_C_bp', 'F side intercept + own EWMA': 'e_F_bp', 'S same-side EWMA': 'e_S_bp', 'S2 side bias + side-adjusted EWMA': 'e_S2_bp', 'K state-space memory': 'e_K_bp',
+              'P cluster pooling': 'e_P_bp', 'PS cluster x side pooling': 'e_PS_bp', 'CP own EWMA + cluster': 'e_CP_bp', 'KP state-space + cluster x side': 'e_KP_bp'}
+    if HAS_RV:
+        PREDS2.update({'RV within-cluster relative value': 'e_RV_bp', 'CRV own EWMA + relative value': 'e_CRV_bp'})
+    PREDS2.update({'Gc local factor loading': 'e_Gc_bp', 'G universe factor loading': 'e_G_bp', 'D level model': 'e_D_bp'})
+    PREDS2 = {k: v for k, v in PREDS2.items() if v in ecp2.columns}
+    for c in PREDS2.values():
+        ecp2[c] = ecp2[c].fillna(ecp2['e_algo_bp'])
+
+    def ec_table2(frame: pd.DataFrame, by: str) -> pd.DataFrame:
+        g = frame.groupby(by, observed=True); out = pd.DataFrame({'n': g.size()})
+        for k, c in PREDS2.items():
+            out[f'MAE {k.split()[0]}'] = g[c].apply(lambda s: s.abs().mean())
+        for k, c in list(PREDS2.items())[1:]:
+            d = frame.assign(gain=frame['e_algo_bp'].abs() - frame[c].abs()).groupby([by, 'trade_date'], observed=True)['gain'].mean().groupby(level=0)
+            out[f'gain {k.split()[0]} (bp)'] = d.mean(); out[f't {k.split()[0]}'] = np.sqrt(d.count()) * d.mean() / d.std().replace(0, np.nan)
+        return out
+
+    _gd2 = {k: ecp2.assign(gain=ecp2['e_algo_bp'].abs() - ecp2[c].abs()).groupby('trade_date')['gain'].mean().to_numpy() for k, c in list(PREDS2.items())[1:]}
+    summary2 = pd.DataFrame({'mid': list(PREDS2), 'MAE (bp)': [ecp2[c].abs().mean() for c in PREDS2.values()]}).set_index('mid')
+    summary2['MAE ex <1y (bp)'] = [ecp2.loc[ecp2['dur_band'] != '<1y', c].abs().mean() for c in PREDS2.values()]
+    summary2['gain (bp)'] = [np.nan] + [v.mean() for v in _gd2.values()]
+    summary2['FM t'] = [np.nan] + [np.sqrt(len(v)) * v.mean() / v.std() for v in _gd2.values()]
+    summary2['boot t'] = [np.nan] + [block_bootstrap_t(v, CFG.block_days, CFG.n_boot, CFG.seed) for v in _gd2.values()]
+    for s_ in ['P', 'S', 'D']:
+        summary2[f'gain {s_} (bp)'] = [np.nan] + [ecp2[ecp2['side'] == s_].assign(gain=lambda d, c=c: d['e_algo_bp'].abs() - d[c].abs()).groupby('trade_date')['gain'].mean().mean() for c in list(PREDS2.values())[1:]]
+    summary2['gain <1y (bp)'] = [np.nan] + [ecp2[ecp2['dur_band'] == '<1y'].assign(gain=lambda d, c=c: d['e_algo_bp'].abs() - d[c].abs()).groupby('trade_date')['gain'].mean().mean() for c in list(PREDS2.values())[1:]]
+    summary2['gain 1-11y (bp)'] = [np.nan] + [ecp2[ecp2['dur_band'] == '1-11y'].assign(gain=lambda d, c=c: d['e_algo_bp'].abs() - d[c].abs()).groupby('trade_date')['gain'].mean().mean() for c in list(PREDS2.values())[1:]]
+    print(f'Held-out MAE against the print and daily-FM gain over the algo quote, {len(ecp2):,} trades ({ecp2["month"].nunique()} months), all mids on the same rows:'); display(summary2.round(3))
+    ec2_side = ec_table2(ecp2, 'side'); ec2_age = ec_table2(ecp2, 'age_bucket').reindex(['<=1d', '1-3d', '3-7d', '7-21d', '>21d', 'no prior print']).dropna(how='all'); ec2_band = ec_table2(ecp2, 'dur_band')
+    print('By MSRB side:'); display(ec2_side[[c for c in ec2_side.columns if c.startswith('gain') or c == 'n']].round(3))
+    print('By age of the last print:'); display(ec2_age[[c for c in ec2_age.columns if c.startswith('gain') or c == 'n']].round(3))
+    print('By duration band:'); display(ec2_band[[c for c in ec2_band.columns if c.startswith('gain') or c == 'n']].round(3))
+    # ---------- figures: the gains, and side x duration for F, K, KP ----------
+    fig, ax = plt.subplots(1, 2, figsize=(19, 6))
+    _s = summary2.iloc[1:]; _se = (_s['gain (bp)'] / _s['FM t'].replace(0, np.nan)).abs().fillna(0.0)
+    ax[0].barh(np.arange(len(_s)), _s['gain (bp)'], xerr=1.96 * _se, color=['#2E8B57' if v >= 0 else '#C44E52' for v in _s['gain (bp)']], error_kw={'ecolor': '#222222', 'lw': 0.8, 'capsize': 2})
+    ax[0].set_yticks(np.arange(len(_s))); ax[0].set_yticklabels(_s.index, fontsize=8); ax[0].axvline(0, color='k', lw=0.6); ax[0].set_title('Gain over the algo quote, all held-out trades (bp, 95% band from the FM t)', fontsize=10); ax[0].invert_yaxis(); ax[0].grid(axis='x', alpha=0.3)
+    for i, v in enumerate(_s['gain (bp)']):
+        ax[0].text(v + 0.02 * np.sign(v) if v != 0 else 0.02, i, f'{v:+.2f}', va='center', ha='left' if v >= 0 else 'right', fontsize=7)
+    _sb = _s[['gain P (bp)', 'gain S (bp)', 'gain D (bp)']]; _sb.columns = ['P bid', 'S offer', 'D inter-dealer']
+    _sb.plot.barh(ax=ax[1], width=0.8); ax[1].axvline(0, color='k', lw=0.6); ax[1].set_title('Gain by MSRB side (bp)', fontsize=10); ax[1].invert_yaxis(); ax[1].tick_params(axis='y', labelsize=8); ax[1].legend(fontsize=8); ax[1].grid(axis='x', alpha=0.3)
+    plt.tight_layout(); savefig('10b_framework_memories')
+    _dur_order = ['<1', '1-2.5', '2.5-4', '4-6', '6-8', '8-11', '>11']
+    ecp2['dur_bucket'] = pd.cut(ecp2['modified_duration_lag1'], bins=[-1, 1, 2.5, 4, 6, 8, 11, 100], labels=_dur_order).astype(str)
+    show_mids = [k for k in ['F side intercept + own EWMA', 'S2 side bias + side-adjusted EWMA', 'K state-space memory', 'PS cluster x side pooling', 'KP state-space + cluster x side'] if k in PREDS2]
+    fig, axs = plt.subplots(1, len(show_mids), figsize=(4.6 * len(show_mids), 5.2), squeeze=False); axs = axs.ravel(); hms = {}
+    for a, k in zip(axs, show_mids):
+        c = PREDS2[k]
+        hm = ecp2.assign(gain=ecp2['e_algo_bp'].abs() - ecp2[c].abs()).groupby(['dur_bucket', 'side', 'trade_date'], observed=True)['gain'].mean().groupby(level=[0, 1]).mean().unstack('side').reindex(_dur_order)[['P', 'S', 'D']]
+        hms[k] = hm; v = np.nanmax(np.abs(hm.to_numpy(float)))
+        im = a.imshow(hm.to_numpy(float), cmap='RdYlGn', aspect='auto', vmin=-v, vmax=v); a.set_xticks(range(3)); a.set_xticklabels(['P bid', 'S offer', 'D inter-dealer'], fontsize=8); a.set_yticks(range(len(hm))); a.set_yticklabels(hm.index, fontsize=8); a.set_title(k, fontsize=9); a.grid(False)
+        for i in range(hm.shape[0]):
+            for j in range(hm.shape[1]):
+                x = hm.iloc[i, j]
+                if np.isfinite(x):
+                    a.text(j, i, f'{x:+.1f}', ha='center', va='center', fontsize=8)
+    fig.suptitle('Gain over the algo by duration bucket and MSRB side: does the side-aware or pooled memory fix the short-end sign flip?', fontsize=11); plt.tight_layout(); savefig('10b_side_by_duration')
+    # ---------- carry the framework mids into the Section 12 breakdowns and the dollar view ----------
+    _carry = {k: v for k, v in PREDS2.items() if v not in ecp.columns}
+    _m = ecp2[_keys + list(_carry.values())].drop_duplicates(subset=_keys).copy()
+    ecp['cusip'] = ecp['cusip'].astype('string'); ecp['trade_ts'] = to_ns(ecp['trade_ts']); ecp['signal_ts'] = to_ns(ecp['signal_ts'])
+    ecp = ecp.merge(_m, on=_keys, how='left')
+    for c in _carry.values():
+        ecp[c] = ecp[c].fillna(ecp['e_algo_bp'])
+    FRAMEWORK_MIDS = {k: v for k, v in PREDS2.items() if k.split()[0] in ('S2', 'K', 'PS', 'KP')}
+    ecp2.to_parquet(ARTIFACTS / 'algo_error_correction_framework_v3.parquet', index=False)
+    record('error_correction_framework', coefficients_by_month=path_df.round(4).reset_index().to_dict(orient='records'), summary=summary2.round(4).reset_index().to_dict(orient='records'),
+           by_side=ec2_side.round(4).reset_index().to_dict(orient='records'), by_age=ec2_age.round(4).reset_index().to_dict(orient='records'), by_duration_band=ec2_band.round(4).reset_index().to_dict(orient='records'),
+           side_by_duration={k: v.round(4).reset_index().to_dict(orient='records') for k, v in hms.items()}, cluster_half_life_days=CLU_HL_DAYS)
+    print(f'Section 10b done in {time.perf_counter() - t0_all:.0f}s')
+else:
+    print('Section 10b skipped: needs Section 10.')
+
+# %% [markdown]
 # ## 11. Conformal band around the chosen mid: split and rolling calibration
 #
 # v2.3 fitted a quantile model of |print − mid| and got 71% coverage at an 80% target: the quantile model is
@@ -1878,6 +2191,8 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
     bk['cluster'] = bk['beta_cluster'].map(CLUSTER_LABEL).fillna('NA')
     bk['side_label'] = bk['side'].map({'P': 'P dealer buys (bid)', 'S': 'S dealer sells (offer)', 'D': 'D inter-dealer'}).fillna(bk['side'].astype(str))
     MIDS_BK = {'A algo quote': 'e_algo_bp', 'E algo + side intercept': 'e_E_bp', 'F revised third term': 'e_F_bp', 'G factor-beta correction': 'e_G_bp', 'D level model': 'e_D_bp'}
+    if 'FRAMEWORK_MIDS' in globals():
+        MIDS_BK.update({k: v for k, v in FRAMEWORK_MIDS.items() if v in bk.columns})   # v3.6: S2, K, PS, KP from Section 10b
 
     def gain_table(frame: pd.DataFrame, by: str, n_min: int) -> pd.DataFrame:
         g = frame.groupby(by, observed=True); out = pd.DataFrame({'n': g.size()})
@@ -2125,6 +2440,8 @@ if HAS_TRADES and 'bk' in globals() and 'msrb_price' in bk.columns:
     _px = pd.to_numeric(bk['msrb_price'], errors='coerce').replace([np.inf, -np.inf], np.nan).clip(1, 300).fillna(100.0)
     bk['dollar_per_bp'] = (bk['msrb_quantity'] * _px / 100.0 * bk['modified_duration_lag1'].clip(lower=0).fillna(0) * 1e-4)
     DOL = {'C EWMA rule': 'e_C_bp', 'F revised third term': 'e_F_bp', 'G factor-beta correction': 'e_G_bp', 'D level model': 'e_D_bp'}
+    if 'FRAMEWORK_MIDS' in globals():
+        DOL.update({k: v for k, v in FRAMEWORK_MIDS.items() if v in bk.columns})
     for k, c in DOL.items():
         bk[f'$ removed [{k}]'] = (bk['e_algo_bp'].abs() - bk[c].abs()) * bk['dollar_per_bp']
         bk[f'par-bp [{k}]'] = (bk['e_algo_bp'].abs() - bk[c].abs()) * bk['msrb_quantity'].clip(lower=0).fillna(0)
