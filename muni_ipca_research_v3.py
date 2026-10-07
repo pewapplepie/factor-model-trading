@@ -41,8 +41,8 @@
 # 6. Factor-mimicking weights, leverage, beta-space map and clusters
 # 7. Residual dynamics: ACF, activity buckets, the state-space filter (signal of record), two-regime check
 # 8. Hedged paper portfolio (vol-scaled) as the information metric
-# 9. Transaction validation of the signal of record (Fama-MacBeth with block bootstrap)
-# 10. Algo error correction: persistence, point-in-time error features, the same-side memory, the per-side state-space memory, the level model
+# 9. Transaction validation of the signal of record (Fama-MacBeth with block bootstrap); 9b trade size and side
+# 10. Algo error correction: the same-side memory, the interaction ladder (rho conditioned on factor state, cluster, residual drift, age, size, industry) with its pre-registered bar, the direction-aware view, the level model
 # 11. Conformal band around the chosen mid: split (monthly) and rolling (10-day) calibration
 # 12. Where the gains live: breakdown by characteristics, factor betas and beta-space clusters; 12b what they are worth in dollars
 # 13. Systematic path: factor roll-forward of stale marks, by segment
@@ -58,6 +58,15 @@
 # the stage, so a re-run with the same inputs and code reuses it automatically and any change to either recomputes it.
 # Nothing is toggled by hand; stale cache files for a stage are removed when a new key is written.
 #
+# **v3.9 additions.** Two characteristics the desk works with and the model had overlooked: *trade size* (decayed
+# mean of MSRB print size and print frequency, strictly before the date, with a no-print flag) and *issuer industry*
+# (from the trade-track static table; dummies for the largest industries). Both enter the IPCA instrument set, the
+# EDA (Section 9b: size x side, with the desk's quantity bins) and the Section 12 breakdowns. The algo correction
+# gets an *interaction ladder*: the same-side memory with its persistence coefficient conditioned on the factor
+# betas, the beta-space cluster, the filtered residual drift, the same-side age, the trade size, side x cluster and
+# industry, judged against a pre-registered bar (>= 0.10 bp over S, bootstrap t > 3, positive in 4 of 5 months), and a
+# *direction-aware* view (signed decomposition, crossing rate by side, pinball loss) beside the absolute gains.
+#
 # Every leakage boundary is explicit: Gamma is refit on past dates only, instruments are lagged and rank-normalised
 # within date, every trade is matched to a residual dated strictly before the trade date, every print-derived
 # feature is cut at the algo signal time, and every calibration uses the month before the test month.
@@ -68,6 +77,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import re
 import sys
 import time
 import warnings
@@ -155,6 +165,11 @@ class RunConfig:
     conformal_window_days: int = 10       # rolling conformal: trading days of realised scores used to set the scale
     n_clusters: int = 8                   # beta-space clusters for the breakdown (fitted on the first OOS month, applied forward)
     n_min_cell: int = 2000                # minimum trades in a characteristic cell for the breakdown tables
+    # --- v3.9: new characteristics and the interaction ladder ---
+    trade_size_halflife_days: float = 30.0   # time-decayed mean log trade size per bond from MSRB prints strictly before the date
+    industry_dummies: int = 5                # largest issuer industries as IPCA dummies; OTHER and UNKNOWN omitted
+    interaction_bar_bp: float = 0.10         # a variant replaces S only if it adds this over S with bootstrap t > 3 and gains in >= 4 of 5 months
+    asym_tau: float = 0.65                   # weight on the aggressive side of the error in the asymmetric loss (P and S; D symmetric)
     seed: int = 20260921
 
 
@@ -174,6 +189,11 @@ PRE_REGISTERED = {
     'portfolio_scaling': 'vol', 'band_coverage': 0.80, 'conformal': 'split conformal, calibration = the month before the test month, normalised score |err| / q_hat',
     'error_correction_reference': 'algo + rho x side-pooled EWMA of past algo errors (C), kept as the reference the same-side memory is measured against',
     'housekeeping_v38': 'closed mids removed from the run; stage cache keyed on config, data fingerprints and code',
+    'v39_new_instruments': 'trade size (decayed mean log MSRB quantity, half-life 30 days, prints strictly before the date), decayed print frequency, a no-print flag, and the five largest issuer industries as dummies',
+    'v39_qty_bins': 'desk bins: 0-5K, 5K-10K, 10K-15K, 15K-25K, 25K-50K, 50K-100K, 100K-250K, >250K',
+    'v39_interaction_ladder': 'rho of the same-side EWMA conditioned on factor betas, beta-space cluster, |filtered residual drift|, same-side age, trade size, side x cluster, industry; all on prior months',
+    'v39_bar': 'a variant replaces S only if gain - gain(S) >= 0.10 bp, bootstrap t of the daily difference > 3, and the difference is positive in >= 4 of 5 held-out months',
+    'v39_direction': 'signed decomposition (toward / crossed by less / crossed by more / away), crossing rate by side, asymmetric pinball loss with tau 0.65 on the aggressive side',
 }
 
 
@@ -203,6 +223,14 @@ def savefig(name: str) -> None:
 
 def record(section: str, **values) -> None:
     REGISTRY.setdefault(section, {}).update({k: (v.item() if hasattr(v, 'item') else v) for k, v in values.items()})
+
+
+def flat_records(frame: pd.DataFrame, digits: int = 4) -> list[dict]:
+    """to_dict(orient='records') with two-level column headers flattened to 'a | b' so the registry stays JSON-serialisable."""
+    f = frame.copy()
+    if isinstance(f.columns, pd.MultiIndex):
+        f.columns = [' | '.join(str(x) for x in c if str(x) != '') for c in f.columns]
+    return f.round(digits).reset_index().to_dict(orient='records')
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -263,6 +291,36 @@ def frame_fingerprint(frame: pd.DataFrame, cols: list[str]) -> str:
             except Exception:
                 parts.append(f'{c}:{frame[c].astype(str).str.len().sum()}')
     return '|'.join(parts)
+
+
+# Desk quantity bins (upper edges in par) and their labels
+QTY_EDGES = [5_000, 10_000, 15_000, 25_000, 50_000, 100_000, 250_000]
+QTY_LABELS = ['0-5K', '5K-10K', '10K-15K', '15K-25K', '25K-50K', '50K-100K', '100K-250K', '>250K']
+
+
+def qty_group(q: pd.Series) -> pd.Series:
+    """Desk quantity bins: 0-5K, 5K-10K, 10K-15K, 15K-25K, 25K-50K, 50K-100K, 100K-250K, >250K."""
+    v = pd.to_numeric(q, errors='coerce')
+    return pd.cut(v, bins=[-np.inf] + QTY_EDGES + [np.inf], labels=QTY_LABELS, right=True).astype(str).replace('nan', 'NA')
+
+
+def group_decayed_sums(frame: pd.DataFrame, keys: list[str], cols: list[str], halflife_days: float, date_col: str = 'trade_date') -> pd.DataFrame:
+    """Per key group, running sums of cols decayed by 0.5^(gap_days / halflife) between the group's successive dates
+    (value up to and including each date). Vectorised: one numpy step per observation index."""
+    f = frame.sort_values(keys + [date_col], kind='stable').reset_index(drop=True)
+    lam = 0.5 ** (1.0 / halflife_days)
+    gid = f.groupby(keys, observed=True, sort=False).ngroup().to_numpy(); ng = int(gid.max()) + 1 if len(f) else 0
+    step = f.groupby(keys, observed=True, sort=False).cumcount().to_numpy()
+    gap = f.groupby(keys, observed=True, sort=False)[date_col].diff().dt.days.fillna(0).to_numpy(float)
+    order = np.argsort(step, kind='stable'); ks = step[order]; st = np.searchsorted(ks, np.arange(ks.max() + 2)) if len(f) else np.array([0, 0])
+    acc = {c: np.zeros(ng) for c in cols}; out = {c: np.empty(len(f)) for c in cols}; vals = {c: f[c].to_numpy(float) for c in cols}
+    for k in range(len(st) - 1):
+        rows = order[st[k]:st[k + 1]]; g = gid[rows]; w = lam ** gap[rows]
+        for c in cols:
+            acc[c][g] = acc[c][g] * w + vals[c][rows]; out[c][rows] = acc[c][g]
+    for c in cols:
+        f[f'{c}_ewm'] = out[c]
+    return f
 
 
 def group_ewm_by_order(values: np.ndarray, group_ids: np.ndarray, halflife: float) -> np.ndarray:
@@ -350,6 +408,58 @@ savefig('02_market_context')
 record('data', panel_rows=len(raw_panel), panel_cusips=raw_panel['cusip'].nunique(), date_min=str(raw_panel['date'].min().date()), date_max=str(raw_panel['date'].max().date()))
 
 # %%
+# --- v3.9 new characteristics: trade size from MSRB prints, issuer industry from the trade track ---
+# Trade size is a bond characteristic here, not a trade feature: the time-decayed mean of log quantity over the
+# bond's MSRB prints strictly before the date (half-life trade_size_halflife_days), with the decayed print count as
+# a frequency measure and a flag for bonds with no print history. Industry comes from muni_algo_trade_track via the
+# pipeline's static source (`track_static`); when the source is absent the industry instruments are skipped.
+t0 = time.perf_counter()
+msrb_store = PIPE.store('msrb')
+msrb_raw = msrb_store.read(columns=['date', 'cusip', 'quantity', 'tradetime', 'tradetype', 'side'], categorical=False)
+HAS_MSRB = msrb_raw is not None and not msrb_raw.empty
+if HAS_MSRB:
+    prints_src = msrb_raw[['cusip', 'tradetime', 'quantity']]
+elif HAS_TRADES:
+    prints_src = trades_raw[['cusip', 'msrb_tradetime', 'msrb_quantity']].rename(columns={'msrb_tradetime': 'tradetime', 'msrb_quantity': 'quantity'})
+    print('MSRB store empty: trade-size characteristics built from the matched trades instead')
+else:
+    prints_src = None
+
+
+def trade_size_features(prints: pd.DataFrame, panel_rows: pd.DataFrame, halflife_days: float) -> pd.DataFrame:
+    """Per bond-day: decayed mean log trade size and decayed print count over prints STRICTLY before the date."""
+    p = prints.dropna(subset=['cusip', 'tradetime', 'quantity']).copy()
+    p['cusip'] = p['cusip'].astype('string'); p['trade_date'] = to_ns(p['tradetime']).dt.normalize()
+    p['lq'] = np.log(pd.to_numeric(p['quantity'], errors='coerce').clip(lower=1_000.0, upper=1e8))
+    p = p.dropna(subset=['lq', 'trade_date'])
+    daily = p.groupby(['cusip', 'trade_date'], observed=True).agg(S=('lq', 'sum'), N=('lq', 'size')).reset_index()
+    dec = group_decayed_sums(daily, ['cusip'], ['S', 'N'], halflife_days, 'trade_date').rename(columns={'trade_date': 'print_date'}).sort_values('print_date')
+    q = panel_rows[['cusip', 'date']].copy(); q['cusip'] = q['cusip'].astype('string'); q['_i'] = np.arange(len(q)); q = q.sort_values('date')
+    j = pd.merge_asof(q, dec[['cusip', 'print_date', 'S_ewm', 'N_ewm']], left_on='date', right_on='print_date', by='cusip', direction='backward', allow_exact_matches=False)
+    w = (0.5 ** (1.0 / halflife_days)) ** (j['date'] - j['print_date']).dt.days.astype(float)
+    j['print_freq_lag'] = (j['N_ewm'] * w).fillna(0.0)
+    j['trade_size_lag'] = np.where(j['print_freq_lag'] > 0.05, (j['S_ewm'] * w) / j['print_freq_lag'].replace(0, np.nan), np.nan)
+    return j.sort_values('_i')[['trade_size_lag', 'print_freq_lag']].reset_index(drop=True)
+
+
+if prints_src is not None:
+    _ts = trade_size_features(prints_src, raw_panel, CFG.trade_size_halflife_days)
+    raw_panel['trade_size_lag'] = _ts['trade_size_lag'].to_numpy(); raw_panel['print_freq_lag'] = _ts['print_freq_lag'].to_numpy()
+    print(f'trade-size characteristics: {raw_panel["trade_size_lag"].notna().mean():.1%} of bond-days have a print history; median decayed print count {raw_panel["print_freq_lag"].median():.2f}; '
+          f'median trade size {np.exp(raw_panel["trade_size_lag"].median()):,.0f} par | {time.perf_counter() - t0:.0f}s')
+_ts_dir = PIPE.path(PIPE.data_dir, 'track_static')
+track_static = PIPE.store('track_static').read(categorical=False) if _ts_dir.exists() and any(_ts_dir.glob('*.parquet')) else None
+HAS_INDUSTRY = track_static is not None and 'issuer_industry' in track_static.columns
+if HAS_INDUSTRY:
+    _ind = track_static[['cusip', 'issuer_industry']].copy(); _ind['cusip'] = _ind['cusip'].astype('string'); _ind = _ind.dropna(subset=['cusip']).drop_duplicates('cusip', keep='last')
+    raw_panel = raw_panel.merge(_ind, on='cusip', how='left')
+    _share = raw_panel['issuer_industry'].astype('string').str.strip().replace('', pd.NA).notna().mean()
+    print(f'issuer industry: {_share:.1%} of bond-days labelled; largest industries:'); display(raw_panel['issuer_industry'].astype('string').str.upper().value_counts().head(12).to_frame('bond-days'))
+else:
+    print('issuer industry: track_static source not found in the pipeline store; industry instruments and breakdowns are skipped (see the regeneration note in the header)')
+record('data', has_msrb_store=bool(HAS_MSRB), has_industry=bool(HAS_INDUSTRY), trade_size_coverage=float(raw_panel['trade_size_lag'].notna().mean()) if 'trade_size_lag' in raw_panel.columns else None)
+
+# %%
 # --- rating fallback audit ---
 RATING_SCALE = {'AAA': 21, 'AA+': 20, 'AA': 19, 'AA-': 18, 'A+': 17, 'A': 16, 'A-': 15, 'BBB+': 14, 'BBB': 13, 'BBB-': 12,
                 'BB+': 11, 'BB': 10, 'BB-': 9, 'B+': 8, 'B': 7, 'B-': 6, 'CCC+': 5, 'CCC': 4, 'CCC-': 3, 'CC': 2, 'C': 1, 'D': 0}
@@ -416,8 +526,12 @@ record('data', extreme_yield_rows=int(raw_panel['extreme_yield'].sum()), extreme
 # %% [markdown]
 # ## 3. Model panel: instruments
 #
-# Thirteen instruments: an intercept, seven rank-normalised continuous characteristics, the NR flag and four
-# state dummies (CA, NY, TX, FL). The continuous set is premium/discount, yield level, years to worst, extension,
+# Thirteen instruments in v3: an intercept, seven rank-normalised continuous characteristics, the NR flag and four
+# state dummies (CA, NY, TX, FL). v3.9 adds the characteristics the desk works with and the model had overlooked:
+# **trade size** (decayed mean log MSRB quantity per bond, prints strictly before the date), **print frequency**
+# (the decayed print count), a **no-print flag**, and **issuer industry** (the largest industries as dummies, with
+# OTHER and UNKNOWN as the omitted reference). Size enters the factor model as a bond characteristic; the trade's
+# own quantity is used in Section 9b and as a breakdown axis, with the desk's quantity bins. The continuous set is premium/discount, yield level, years to worst, extension,
 # rating score, trailing mark-change liquidity, and a duration instrument. In the v1 spec the duration instrument
 # was modified duration itself; on the regenerated data its rank correlation with years-to-worst reached 0.98 and
 # the first factor became a leveraged long-short of the two (gross weight 27). With `duration_instrument='ratio'`
@@ -492,6 +606,11 @@ def build_model_panel(panel: pd.DataFrame, cfg: RunConfig) -> tuple[pd.DataFrame
     dur_instr = 'duration_ratio' if cfg.duration_instrument == 'ratio' else 'modified_duration_lag1'
     base = [dur_instr, 'premium_discount_lag1', 'closing_yield_lag1']
     cont = base + ['years_to_worst', 'extension', 'rating_score', 'liquidity_20']
+    # v3.9: trade size and print frequency from MSRB prints (strictly before the date), with a no-print flag
+    size_cols = [c for c in ['trade_size_lag', 'print_freq_lag'] if c in yp.columns and yp[c].notna().mean() > 0.2]
+    if 'trade_size_lag' in yp.columns:
+        yp['no_print_flag'] = yp['trade_size_lag'].isna().astype(float)
+    cont = cont + size_cols
     yp = yp.dropna(subset=base + [TARGET]).copy()
     yp['target_bp_raw'] = yp[TARGET]
     yp[TARGET] = yp[TARGET].clip(-cfg.target_clip_bp, cfg.target_clip_bp)
@@ -501,7 +620,17 @@ def build_model_panel(panel: pd.DataFrame, cfg: RunConfig) -> tuple[pd.DataFrame
     yp['days_since_mark_move'] = yp['mark_unchanged'].groupby([yp['cusip'], _moved], observed=True).cumsum()
     yp, zcols = rank_normalize(yp, cont)
     yp['market_fv'] = 1.0
-    chars = ['market_fv'] + zcols + ['nr_flag'] + [f'state_{s}' for s in STATE_DUMMIES]
+    # v3.9: issuer industry dummies for the largest industries; OTHER and UNKNOWN are the omitted reference
+    ind_cols = []
+    if 'issuer_industry' in yp.columns:
+        ind = yp['issuer_industry'].astype('string').str.strip().str.upper()
+        ind = ind.where(ind.notna() & ~ind.isin(['', 'NAN', 'NONE', 'NULL', '<NA>']), 'UNKNOWN')
+        top_ind = ind[ind != 'UNKNOWN'].value_counts().head(cfg.industry_dummies).index.tolist()
+        yp['industry_bucket'] = ind.where(ind.isin(top_ind), pd.Series(np.where(ind == 'UNKNOWN', 'UNKNOWN', 'OTHER'), index=ind.index))
+        for k in top_ind:
+            col = 'ind_' + re.sub(r'[^A-Za-z0-9]+', '_', str(k)).strip('_')[:20]
+            yp[col] = (ind == k).astype(float); ind_cols.append(col)
+    chars = ['market_fv'] + zcols + ['nr_flag'] + (['no_print_flag'] if 'no_print_flag' in yp.columns else []) + [f'state_{s}' for s in STATE_DUMMIES] + ind_cols
     cnt = yp.groupby('cusip', observed=True)[TARGET].transform('count')
     yp = yp[cnt >= cfg.min_obs_per_bond].copy()
     per_date = yp.groupby('date', observed=True)['cusip'].transform('size')
@@ -511,7 +640,8 @@ def build_model_panel(panel: pd.DataFrame, cfg: RunConfig) -> tuple[pd.DataFrame
         yp = yp[~sparse].copy()
     keep = ['cusip', 'date', TARGET, 'target_bp_raw', 'mark_unchanged', 'days_since_mark_move', 'closing_lag_days', 'closing_yield', 'closing_yield_lag1',
             'closing_price', 'modified_duration_lag1', 'duration_ratio', 'dv01_lag1', 'years_to_worst', 'extension', 'rating', 'rating_score', 'rating_source',
-            'cpn', 'state_code', 'state_bucket', 'state_others', 'mkt_yield', 'long_comp_name', 'maturity_year', 'is_callable', 'call_structure'] + chars
+            'cpn', 'state_code', 'state_bucket', 'state_others', 'mkt_yield', 'long_comp_name', 'maturity_year', 'is_callable', 'call_structure',
+            'trade_size_lag', 'print_freq_lag', 'issuer_industry', 'industry_bucket'] + chars
     keep = [c for c in dict.fromkeys(keep) if c in yp.columns]
     return yp[keep].sort_values(['cusip', 'date'], kind='stable').reset_index(drop=True), chars
 
@@ -527,6 +657,9 @@ print('Geo buckets (OTHER is the omitted reference category in Z; state_others i
 display(geo.sort_values('rows', ascending=False))
 top_other = model.loc[model['state_bucket'] == 'OTHER', 'state_code'].astype('string').value_counts().head(8)
 print('largest states inside OTHER:', top_other.to_dict())
+if 'industry_bucket' in model.columns:
+    _ib = model.groupby('industry_bucket', observed=True).agg(rows=('cusip', 'size'), cusips=('cusip', 'nunique')); _ib['row_share'] = _ib['rows'] / _ib['rows'].sum()
+    print('Industry buckets (OTHER and UNKNOWN are the omitted reference in Z):'); display(_ib.sort_values('rows', ascending=False))
 display(model[CHARS].describe().T[['mean', 'std', 'min', 'max']])
 record('model_panel', rows=len(model), cusips=model['cusip'].nunique(), dates=model['date'].nunique(), instruments=CHARS, mark_unchanged_share=float(model['mark_unchanged'].mean()), geo_buckets=geo.round(4).to_dict())
 
@@ -534,7 +667,7 @@ record('model_panel', rows=len(model), cusips=model['cusip'].nunique(), dates=mo
 # Instrument EDA: correlation structure and the duration vs term relationship
 zc = [c for c in CHARS if c.startswith('z_')]
 sample = model.sample(min(len(model), 200_000), random_state=CFG.seed)
-corr = sample[zc + ['nr_flag'] + [f'state_{s}' for s in STATE_DUMMIES]].corr(method='spearman')
+corr = sample[zc + ['nr_flag'] + [c for c in CHARS if c in ('no_print_flag',) or c.startswith('ind_')] + [f'state_{s}' for s in STATE_DUMMIES]].corr(method='spearman')
 fig, ax = plt.subplots(1, 3, figsize=(19, 6), gridspec_kw={'width_ratios': [1.3, 1.1, 0.7]})
 im = ax[0].imshow(corr.values, cmap='RdBu_r', vmin=-1, vmax=1)
 ax[0].set_xticks(range(len(corr))); ax[0].set_xticklabels([c.replace('z_', '').replace('_lag1', '') for c in corr.columns], rotation=90)
@@ -1690,6 +1823,65 @@ else:
     print('No matched trades in the pipeline store; Sections 9 to 11 are skipped.')
 
 # %% [markdown]
+# ### 9b. Trade size and side: how large and small prints behave
+#
+# Size was missing from the framework. Here every matched print is placed in the desk's quantity bins (0-5K,
+# 5K-10K, 10K-15K, 15K-25K, 25K-50K, 50K-100K, 100K-250K, >250K par) and cut by MSRB side: where the volume is,
+# how far prints sit from the quote and from the prior mark (absolute and signed, daily Fama-MacBeth means), the
+# dealer round trip by size, and the same by issuer industry when the pipeline carries it. Signed errors are in
+# yield: on P (dealer buys) a positive error means the print's yield was above the quote's, so the quote's price
+# was above the print and the bid was aggressive; on S the sign reverses.
+
+# %%
+if HAS_TRADES and not tv.empty:
+    tv['qty_group'] = qty_group(tv['msrb_quantity'])
+    if 'industry_bucket' in model.columns:
+        _im = model[['cusip', 'date', 'industry_bucket']].rename(columns={'date': 'residual_date'}); _im['residual_date'] = to_ns(_im['residual_date']); _im['cusip'] = _im['cusip'].astype('string')
+        tv['residual_date'] = to_ns(tv['residual_date']); tv['cusip'] = tv['cusip'].astype('string')
+        tv = tv.merge(_im, on=['cusip', 'residual_date'], how='left')
+
+    def side_size_table(frame: pd.DataFrame, by: str, order: list | None = None) -> pd.DataFrame:
+        g = frame.groupby([by, 'side'], observed=True)
+        out = pd.DataFrame({'trades': g.size(), 'par ($mm)': g['msrb_quantity'].sum() / 1e6,
+                            '|trade - algo| (bp)': g['e_algo_bp'].apply(lambda x: x.abs().mean()), '|trade - mark| (bp)': g['e_mark_bp'].apply(lambda x: x.abs().mean())})
+        sg = frame.groupby([by, 'side', 'trade_date'], observed=True)['e_algo_bp'].mean().groupby(level=[0, 1])
+        out['signed algo error, FM mean (bp)'] = sg.mean(); out['FM t'] = np.sqrt(sg.count()) * sg.mean() / sg.std().replace(0, np.nan)
+        out['share of trades'] = out['trades'] / out['trades'].sum()
+        out = out.unstack('side')
+        return out.reindex(order) if order else out
+
+    sz = side_size_table(tv, 'qty_group', QTY_LABELS)
+    print('Trades by desk quantity bin and MSRB side (P dealer buys, S dealer sells, D inter-dealer):'); display(sz.round(2))
+    _rt = tv[tv['side'].isin(['P', 'S'])].groupby(['cusip', 'trade_date', 'side'], observed=True).agg(y=('msrb_yield', 'mean'), q=('msrb_quantity', 'mean')).unstack('side')
+    if ('y', 'P') in _rt.columns and ('y', 'S') in _rt.columns:
+        _rt2 = pd.DataFrame({'round_trip_bp': 100.0 * (_rt[('y', 'P')] - _rt[('y', 'S')]), 'qty_group': qty_group(_rt[('q', 'P')])}).dropna()
+        rt_size = _rt2.groupby('qty_group', observed=True)['round_trip_bp'].agg(['count', 'median', 'mean']).reindex(QTY_LABELS).dropna(how='all')
+        print('Dealer round trip (P yield - S yield, same bond-day) by the quantity bin of the purchase:'); display(rt_size.round(2))
+    else:
+        rt_size = pd.DataFrame()
+    fig, ax = plt.subplots(1, 3, figsize=(19, 4.8))
+    sz['share of trades'].reindex(QTY_LABELS).plot.bar(ax=ax[0], stacked=True, width=0.8); ax[0].set_title('Share of matched prints by quantity bin and side', fontsize=10); ax[0].set_xlabel(''); ax[0].legend(fontsize=8); ax[0].tick_params(axis='x', rotation=30)
+    _hm = sz['|trade - algo| (bp)'].reindex(QTY_LABELS)[[c for c in ['P', 'S', 'D'] if c in sz['|trade - algo| (bp)'].columns]]
+    im = ax[1].imshow(_hm.to_numpy(float), cmap='YlOrRd', aspect='auto'); ax[1].set_xticks(range(_hm.shape[1])); ax[1].set_xticklabels(_hm.columns); ax[1].set_yticks(range(len(_hm))); ax[1].set_yticklabels(_hm.index, fontsize=8); ax[1].set_title('|trade - algo quote| (bp) by quantity bin and side', fontsize=10); ax[1].grid(False); plt.colorbar(im, ax=ax[1], fraction=0.046)
+    for i in range(_hm.shape[0]):
+        for j in range(_hm.shape[1]):
+            v = _hm.iloc[i, j]
+            if np.isfinite(v):
+                ax[1].text(j, i, f'{v:.1f}', ha='center', va='center', fontsize=8)
+    _sg = sz['signed algo error, FM mean (bp)'].reindex(QTY_LABELS)
+    for c in [x for x in ['P', 'S', 'D'] if x in _sg.columns]:
+        ax[2].plot(range(len(_sg)), _sg[c], marker='o', label={'P': 'P dealer buys', 'S': 'S dealer sells', 'D': 'D inter-dealer'}[c])
+    ax[2].axhline(0, color='k', lw=0.6); ax[2].set_xticks(range(len(_sg))); ax[2].set_xticklabels(_sg.index, rotation=30, fontsize=8); ax[2].set_title('Signed algo error by quantity bin and side (FM daily mean, bp; + = print yield above quote)', fontsize=9); ax[2].legend(fontsize=8)
+    savefig('09b_size_and_side')
+    if 'industry_bucket' in tv.columns and tv['industry_bucket'].notna().any():
+        ind_tab = side_size_table(tv.dropna(subset=['industry_bucket']), 'industry_bucket')
+        print('Trades by issuer industry and MSRB side:'); display(ind_tab.round(2))
+        record('size_side_eda', by_industry=flat_records(ind_tab))
+    record('size_side_eda', by_qty_group=flat_records(sz), round_trip_by_size=flat_records(rt_size) if len(rt_size) else [])
+else:
+    print('Section 9b skipped: needs matched trades.')
+
+# %% [markdown]
 # ## 10. Algo error correction
 #
 # The v5 print-to-print panel found that the algo's pricing error on a bond persists from one print to the next
@@ -1754,8 +1946,13 @@ if HAS_TRADES and not tv.empty and 'cum_fitted_bp' in tv.columns:
     ec['month'] = ec['trade_date'].dt.to_period('M')
     ec['spread_bp'] = 100.0 * (ec['msrb_yield'] - ec['MmdYld'])
     ec['dur_band'] = pd.cut(ec['modified_duration_lag1'], bins=[-1, 1, 11, 100], labels=['<1y', '1-11y', '>11y']).astype(str)
+    # v3.9 conditioning variables for the interaction ladder
+    ec['qty_group'] = qty_group(ec['msrb_quantity'])
+    ec['side_age_bucket'] = pd.cut(ec['side_err_age_days'], bins=list(CFG.age_bins_days), labels=['<=1d', '1-3d', '3-7d', '7-21d', '>21d']).astype(str).replace('nan', 'no same-side print') if 'side_err_age_days' in ec.columns else 'NA'
+    ec['abs_m'] = ec['ssm_drift'].abs().clip(upper=20.0) if 'ssm_drift' in ec.columns else np.nan
+    ec['side_cluster'] = ec['side'].astype(str) + '|' + ec['beta_cluster'].astype('Int64').astype(str)
     print(f'trades with a prior matched print before the signal time: {ec["has_err"].mean():.1%} of {len(ec):,}; with a prior print on the same side: {ec["has_side_err"].mean():.1%}')
-    feat_panel = model[['cusip', 'date', 'rating_score', 'years_to_worst', 'extension', 'cpn', 'closing_yield_lag1', 'state_others', 'call_structure', 'state_bucket', 'is_callable'] + [c for c in CHARS if c != 'market_fv']].rename(columns={'date': 'residual_date'})
+    feat_panel = model[['cusip', 'date', 'rating_score', 'years_to_worst', 'extension', 'cpn', 'closing_yield_lag1', 'state_others', 'call_structure', 'state_bucket', 'is_callable'] + [c for c in ['industry_bucket', 'trade_size_lag', 'print_freq_lag'] if c in model.columns] + [c for c in CHARS if c != 'market_fv']].rename(columns={'date': 'residual_date'})
     feat_panel = feat_panel[[c for c in feat_panel.columns if c in ('cusip', 'residual_date') or c not in ec.columns]]
     feat_panel['residual_date'] = to_ns(feat_panel['residual_date']); ec['residual_date'] = to_ns(ec['residual_date'])
     ec = ec.merge(feat_panel, on=['cusip', 'residual_date'], how='left')
@@ -1896,6 +2093,49 @@ if HAS_TRADES and not tv.empty and 'cum_fitted_bp' in tv.columns:
         rho_s = fm_slope(_ts, 'e_algo_bp', 'ewm_side_err_bp', ['log_size'])['fm_beta'] if len(_ts) >= 2_000 else rho_ewm
         te['e_S_bp'] = te['e_algo_bp'] - np.where(te['ewm_side_err_bp'].notna(), rho_s * te['ewm_side_err_bp'].fillna(0.0), rho_ewm * te['ewm_algo_err_bp'].fillna(0.0))
         row = {'month': str(m), 'rho_pooled': rho_ewm, 'rho_same_side': rho_s}
+        # ---- v3.9 interaction ladder: the same-side memory with a persistence coefficient conditioned on the factor
+        #      model's coordinates and on trade/microstructure state. Every coefficient on prior months; the fallback
+        #      where a group is thin or a bond has no same-side history is S itself.
+        trs_ = trh.dropna(subset=['ewm_side_err_bp'])
+        _base_S = te['e_S_bp'].to_numpy()
+
+        def apply_rho(rho_te) -> np.ndarray:
+            r = np.asarray(rho_te, float)
+            return np.where(te['ewm_side_err_bp'].notna(), te['e_algo_bp'] - r * te['ewm_side_err_bp'].fillna(0.0), _base_S)
+
+        def rho_by_group(gcol: str, min_rows: int = 2_000):
+            rho = {}
+            for g_, gg in trs_.groupby(gcol, observed=True):
+                if len(gg) >= min_rows:
+                    v = fm_slope(gg, 'e_algo_bp', 'ewm_side_err_bp', ['log_size'])['fm_beta']
+                    if np.isfinite(v):
+                        rho[g_] = float(v)
+            return te[gcol].map(rho).astype(float).fillna(rho_s).to_numpy(), rho
+
+        def rho_interaction(cont_cols: list[str]):
+            X = ['ewm_side_err_bp'] + [f'_x_{c}' for c in cont_cols]
+            trx = trs_.copy(); tex = te.copy()
+            for c in cont_cols:
+                trx[f'_x_{c}'] = trx['ewm_side_err_bp'] * trx[c].astype(float).fillna(0.0); tex[f'_x_{c}'] = tex['ewm_side_err_bp'] * tex[c].astype(float).fillna(0.0)
+            if len(trx) < 5_000:
+                return np.full(len(te), rho_s), {}
+            b = fm_multi(trx, 'e_algo_bp', X, ['log_size']).set_index('score')['fm_beta']
+            r = b['ewm_side_err_bp'] + sum(b[f'_x_{c}'] * tex[c].astype(float).fillna(0.0) for c in cont_cols)
+            return np.where(np.isfinite(r), r, rho_s), b.to_dict()
+
+        r_b, b_beta = rho_interaction(beta_cols); te['e_Sb_bp'] = apply_rho(r_b); row.update({f'Sb_{k}': v for k, v in b_beta.items()})
+        r_c, rho_c = rho_by_group('beta_cluster'); te['e_Sc_bp'] = apply_rho(r_c); row.update({f'Sc_{k}': v for k, v in rho_c.items()})
+        if ec['abs_m'].notna().any():
+            r_m, b_m = rho_interaction(['abs_m']); te['e_Sm_bp'] = apply_rho(r_m); row.update({f'Sm_{k}': v for k, v in b_m.items()})
+        else:
+            te['e_Sm_bp'] = _base_S
+        r_a, rho_a = rho_by_group('side_age_bucket'); te['e_Sa_bp'] = apply_rho(r_a); row.update({f'Sa_{k}': v for k, v in rho_a.items()})
+        r_q, rho_q = rho_by_group('qty_group'); te['e_Sq_bp'] = apply_rho(r_q); row.update({f'Sq_{k}': v for k, v in rho_q.items()})
+        r_sc, rho_sc = rho_by_group('side_cluster'); te['e_Ssc_bp'] = apply_rho(r_sc)
+        if 'industry_bucket' in te.columns and te['industry_bucket'].notna().any():
+            r_i, rho_i = rho_by_group('industry_bucket'); te['e_Si_bp'] = apply_rho(r_i); row.update({f'Si_{k}': v for k, v in rho_i.items()})
+        else:
+            te['e_Si_bp'] = _base_S
         kf = KF_BY_MONTH.get(str(m))
         if kf is not None:
             te['kf_pred_bp'] = kf['kf_pred_bp'].reindex(te['_id']).to_numpy(); trk = tr.assign(kf_pred_bp=kf['kf_pred_bp'].reindex(tr['_id']).to_numpy()).dropna(subset=['kf_pred_bp'])
@@ -1913,7 +2153,11 @@ if HAS_TRADES and not tv.empty and 'cum_fitted_bp' in tv.columns:
     for c in ['e_D_bp', 'e_Dminus_bp']:
         ecp[c] = ecp[c].fillna(ecp['e_algo_bp'])
     print('Error-correction coefficients and state-space parameters by month (estimated on prior months):'); display(rho_path.round(3))
-    PREDS = {'A algo quote': 'e_algo_bp', 'C side-pooled EWMA (reference)': 'e_C_bp', 'S same-side EWMA': 'e_S_bp', 'K per-side state-space memory': 'e_K_bp', 'D level model with error features': 'e_D_bp', 'D- level model without error features': 'e_Dminus_bp'}
+    PREDS = {'A algo quote': 'e_algo_bp', 'C side-pooled EWMA (reference)': 'e_C_bp', 'S same-side EWMA': 'e_S_bp',
+             'Sb same-side EWMA, rho by factor betas': 'e_Sb_bp', 'Sc same-side EWMA, rho by beta-space cluster': 'e_Sc_bp', 'Sm same-side EWMA, rho by |residual drift|': 'e_Sm_bp',
+             'Sa same-side EWMA, rho by same-side age': 'e_Sa_bp', 'Sq same-side EWMA, rho by trade size': 'e_Sq_bp', 'Ssc same-side EWMA, rho by side x cluster': 'e_Ssc_bp', 'Si same-side EWMA, rho by industry': 'e_Si_bp',
+             'K per-side state-space memory': 'e_K_bp', 'D level model with error features': 'e_D_bp', 'D- level model without error features': 'e_Dminus_bp'}
+    PREDS = {k: v for k, v in PREDS.items() if v in ecp.columns}
 
     def ec_table(frame: pd.DataFrame, by: str) -> pd.DataFrame:
         g = frame.groupby(by, observed=True); out = pd.DataFrame({'n': g.size()})
@@ -1928,6 +2172,62 @@ if HAS_TRADES and not tv.empty and 'cum_fitted_bp' in tv.columns:
     print('Held-out MAE against the print (bp) and daily-FM gain over the algo quote:'); display(ec_all.T.round(3)); display(ec_age.round(3)); display(ec_side.round(3)); display(ec_band.round(3))
     _gd = {k_: ecp.assign(gain=ecp['e_algo_bp'].abs() - ecp[c].abs()).groupby('trade_date')['gain'].mean().to_numpy() for k_, c in list(PREDS.items())[1:]}
     boot_gain = pd.Series({k_: block_bootstrap_t(v, CFG.block_days, CFG.n_boot, CFG.seed) for k_, v in _gd.items()}, name='bootstrap t of the daily gain'); display(boot_gain.round(2).to_frame())
+    # ---- the pre-registered bar: does a conditioned variant replace S?
+    _gS = _gd['S same-side EWMA']; _mS = ecp.assign(gain=ecp['e_algo_bp'].abs() - ecp['e_S_bp'].abs()).groupby('trade_date')['gain'].mean()
+    bar_rows = []
+    for k_, c in PREDS.items():
+        if not k_.startswith('S') or k_ == 'S same-side EWMA':
+            continue
+        gv = ecp.assign(gain=ecp['e_algo_bp'].abs() - ecp[c].abs()).groupby('trade_date')['gain'].mean()
+        d = (gv - _mS).dropna(); dm = d.groupby(d.index.to_period('M')).mean()
+        bar_rows.append({'variant': k_, 'gain (bp)': gv.mean(), 'gain S (bp)': _mS.mean(), 'delta vs S (bp)': d.mean(), 'boot t of delta': block_bootstrap_t(d.to_numpy(), CFG.block_days, CFG.n_boot, CFG.seed),
+                         'months positive': int((dm > 0).sum()), 'months': int(len(dm)),
+                         'passes bar': bool(d.mean() >= CFG.interaction_bar_bp and block_bootstrap_t(d.to_numpy(), CFG.block_days, CFG.n_boot, CFG.seed) > 3 and (dm > 0).sum() >= min(4, len(dm)))})
+    bar = pd.DataFrame(bar_rows).set_index('variant')
+    print(f'Pre-registered bar for the interaction ladder: delta >= {CFG.interaction_bar_bp:.2f} bp over S, bootstrap t > 3, positive in >= 4 of {bar["months"].max() if len(bar) else 0} months:'); display(bar.round(3))
+    # ---- direction-aware view: toward the print, crossed by less, crossed by more, away; crossing rate by side; asymmetric loss
+    def oriented(e: pd.Series, side: pd.Series) -> np.ndarray:
+        """Error oriented so that positive = the mid sits on the aggressive side of the print (P: our yield below the print; S: above). D is symmetric."""
+        return np.where(side == 'P', e, np.where(side == 'S', -e, np.abs(e)))
+
+    def asym_loss(e: pd.Series, side: pd.Series, tau: float) -> np.ndarray:
+        o = oriented(e, side); t_ = np.where(side.isin(['P', 'S']), tau, 0.5)
+        return t_ * np.maximum(o, 0.0) + (1.0 - t_) * np.maximum(-o, 0.0)
+
+    dir_rows, cross_rows = [], []
+    eA = ecp['e_algo_bp']
+    for k_, c in PREDS.items():
+        em = ecp[c]; same_sign = np.sign(em) == np.sign(eA); smaller = em.abs() < eA.abs()
+        cat = np.where(same_sign & smaller, 'toward', np.where(~same_sign & smaller, 'crossed, closer', np.where(~same_sign & ~smaller, 'crossed, further', 'away')))
+        if k_ == 'A algo quote':
+            cat = np.full(len(ecp), 'unchanged')
+        g_ = ecp.assign(cat=cat, gain=eA.abs() - em.abs()).groupby('cat', observed=True)['gain'].agg(['size', 'mean'])
+        rrow = {'mid': k_}
+        for cc in ['toward', 'crossed, closer', 'crossed, further', 'away']:
+            rrow[f'share {cc}'] = float(g_['size'].get(cc, 0)) / len(ecp); rrow[f'gain {cc} (bp)'] = float(g_['mean'].get(cc, np.nan))
+        la = pd.Series(asym_loss(eA, ecp['side'], CFG.asym_tau) - asym_loss(em, ecp['side'], CFG.asym_tau), index=ecp.index)
+        dla = la.groupby(ecp['trade_date']).mean()
+        rrow['asym loss gain (bp)'] = float(dla.mean()); rrow['asym FM t'] = float(np.sqrt(len(dla)) * dla.mean() / dla.std()) if dla.std() > 0 else np.nan
+        dir_rows.append(rrow)
+        o = oriented(em, ecp['side'])
+        for sd_ in ['P', 'S']:
+            msk = (ecp['side'] == sd_).to_numpy()
+            cross_rows.append({'mid': k_, 'side': sd_, 'aggressive share': float((o[msk] > 0).mean()) if msk.any() else np.nan, 'mean aggressive bp': float(np.maximum(o[msk], 0).mean()) if msk.any() else np.nan})
+    direction = pd.DataFrame(dir_rows).set_index('mid'); crossing = pd.DataFrame(cross_rows).pivot(index='mid', columns='side', values=['aggressive share', 'mean aggressive bp']).reindex(direction.index)
+    print('Direction-aware view of the gain: where each mid moves the quote relative to the print (shares of trades and the mean gain inside each bucket), and the gain under an asymmetric loss (tau on the aggressive side):'); display(direction.round(3))
+    print('Crossing: share of trades where the mid sits on the aggressive side of the print, by customer side (P = our bid above the print, S = our offer below it):'); display(crossing.round(3))
+    fig, ax = plt.subplots(1, 3, figsize=(20, 5.2))
+    _sh = direction[[f'share {cc}' for cc in ['toward', 'crossed, closer', 'crossed, further', 'away']]].drop(index='A algo quote', errors='ignore'); _sh.columns = ['toward', 'crossed, closer', 'crossed, further', 'away']
+    _sh.plot.barh(ax=ax[0], stacked=True, color=['#2E8B57', '#9ACD32', '#E9967A', '#C44E52']); ax[0].set_title('Where the mid moves relative to the print (share of trades)', fontsize=10); ax[0].legend(fontsize=7, loc='lower right'); ax[0].tick_params(axis='y', labelsize=7); ax[0].invert_yaxis()
+    _cr = crossing['aggressive share']; _cr.plot.barh(ax=ax[1]); ax[1].set_title('Share of trades on the aggressive side of the print, by side', fontsize=10); ax[1].tick_params(axis='y', labelsize=7); ax[1].legend(['P dealer buys', 'S dealer sells'], fontsize=8); ax[1].invert_yaxis()
+    _mae_gain = pd.Series({k_: _gd[k_].mean() for k_ in _gd}); _asym = direction['asym loss gain (bp)'].reindex(_mae_gain.index)
+    ax[2].scatter(_mae_gain, _asym, color='#4C72B0')
+    for k_ in _mae_gain.index:
+        ax[2].annotate(k_.split()[0], (_mae_gain[k_], _asym[k_]), fontsize=7, xytext=(3, 3), textcoords='offset points')
+    _lim = [min(_mae_gain.min(), _asym.min(), 0) - 0.1, max(_mae_gain.max(), _asym.max()) + 0.1]; ax[2].plot(_lim, _lim, 'k--', lw=0.6); ax[2].axhline(0, color='k', lw=0.5); ax[2].axvline(0, color='k', lw=0.5)
+    ax[2].set_xlabel('MAE gain over the algo (bp)'); ax[2].set_ylabel(f'asymmetric-loss gain (bp, tau {CFG.asym_tau})'); ax[2].set_title('Does the accuracy gain survive a penalty on crossing the print?', fontsize=10)
+    savefig('10_direction_aware')
+    record('error_correction', interaction_bar=bar.round(4).reset_index().to_dict(orient='records'), direction=direction.round(4).reset_index().to_dict(orient='records'), crossing=flat_records(crossing))
     fig, ax = plt.subplots(1, 3, figsize=(19, 4.5))
     ec_age[[f'MAE {k_.split()[0]}' for k_ in PREDS]].plot.bar(ax=ax[0]); ax[0].set_title('MAE vs the print by age of the last algo error (bp)', fontsize=10); ax[0].set_xlabel(''); ax[0].legend([k_ for k_ in PREDS], fontsize=7)
     dd = ecp[ecp['has_side_err']].copy(); dd['decile'] = pd.qcut(dd['ewm_side_err_bp'].rank(method='first'), 10, labels=False) + 1
@@ -2111,11 +2411,11 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
         out['share of trades'] = out['n'] / len(frame)
         return out[out['n'] >= n_min]
 
-    SEGMENTS = {'duration bucket': 'dur_bucket', 'call structure': 'call_structure', 'rating bucket': 'rating_bucket', 'state bucket': 'state_bucket', 'liquidity quintile': 'liq_q', 'beta-space cluster': 'cluster', 'beta1 tercile': 'beta1_tercile', 'beta2 tercile': 'beta2_tercile', 'beta3 tercile': 'beta3_tercile', 'MSRB side': 'side_label'}
+    SEGMENTS = {'duration bucket': 'dur_bucket', 'call structure': 'call_structure', 'rating bucket': 'rating_bucket', 'state bucket': 'state_bucket', 'liquidity quintile': 'liq_q', 'beta-space cluster': 'cluster', 'beta1 tercile': 'beta1_tercile', 'beta2 tercile': 'beta2_tercile', 'beta3 tercile': 'beta3_tercile', 'MSRB side': 'side_label', 'trade size': 'qty_group', 'industry': 'industry_bucket'}
     seg_tables = {}
     for name, col in SEGMENTS.items():
-        if col in bk.columns:
-            seg_tables[name] = gain_table(bk, col, CFG.n_min_cell)
+        if col in bk.columns and bk[col].notna().any():
+            seg_tables[name] = gain_table(bk.dropna(subset=[col]), col, CFG.n_min_cell)
             print(f'Gain over the algo by {name}:'); display(seg_tables[name].round(3))
     # characteristic cells: duration x call x rating, ranked by the gain of the same-side memory
     bk['cell'] = bk['dur_bucket'] + ' | ' + bk['call_structure'].astype(str) + ' | ' + bk['rating_bucket']
@@ -2216,8 +2516,8 @@ if HAS_TRADES and 'seg_tables' in globals() and seg_tables:
     fig.suptitle('Where the error-correction gains live (share of held-out trades in brackets)', fontsize=12); plt.tight_layout(); savefig('12a_top_gains')
 
     # (2) one panel per characteristic axis
-    axes_show = [k for k in ['duration bucket', 'call structure', 'rating bucket', 'MSRB side', 'state bucket', 'liquidity quintile', 'beta-space cluster'] if k in seg_tables and len(seg_tables[k])]
-    ORDERS = {'duration bucket': ['<1', '1-2.5', '2.5-4', '4-6', '6-8', '8-11', '>11'], 'liquidity quintile': ['Q1 illiquid', 'Q2', 'Q3', 'Q4', 'Q5 liquid'], 'MSRB side': ['P dealer buys (bid)', 'S dealer sells (offer)', 'D inter-dealer']}
+    axes_show = [k for k in ['duration bucket', 'call structure', 'rating bucket', 'MSRB side', 'trade size', 'industry', 'state bucket', 'liquidity quintile', 'beta-space cluster'] if k in seg_tables and len(seg_tables[k])]
+    ORDERS = {'duration bucket': ['<1', '1-2.5', '2.5-4', '4-6', '6-8', '8-11', '>11'], 'liquidity quintile': ['Q1 illiquid', 'Q2', 'Q3', 'Q4', 'Q5 liquid'], 'MSRB side': ['P dealer buys (bid)', 'S dealer sells (offer)', 'D inter-dealer'], 'trade size': QTY_LABELS}
     _nr = max(1, int(np.ceil(len(axes_show) / 3)))
     fig, axs = plt.subplots(_nr, 3, figsize=(20, 5 * _nr), squeeze=False); axs = axs.ravel()
     for a, k in zip(axs, axes_show):
@@ -2272,10 +2572,10 @@ else:
 # %%
 if HAS_TRADES and 'seg_tables' in globals() and seg_tables and 'side_label' in bk.columns:
     SIDES = [s for s in ['P dealer buys (bid)', 'S dealer sells (offer)', 'D inter-dealer'] if s in bk['side_label'].unique()]
-    SIDE_AXES = {'duration bucket': 'dur_bucket', 'call structure': 'call_structure', 'rating bucket': 'rating_bucket', 'beta-space cluster': 'cluster', 'liquidity quintile': 'liq_q'}
+    SIDE_AXES = {'duration bucket': 'dur_bucket', 'call structure': 'call_structure', 'rating bucket': 'rating_bucket', 'beta-space cluster': 'cluster', 'liquidity quintile': 'liq_q', 'trade size': 'qty_group', 'industry': 'industry_bucket'}
     side_tabs = {}
     for name, col in SIDE_AXES.items():
-        if col not in bk.columns:
+        if col not in bk.columns or not bk[col].notna().any():
             continue
         parts = {s: gain_table(bk[bk['side_label'] == s], col, CFG.n_min_cell) for s in SIDES}
         g = pd.DataFrame({s: p['gain S (bp)'] for s, p in parts.items()}); t = pd.DataFrame({s: p['t S'] for s, p in parts.items()})
@@ -2288,7 +2588,7 @@ if HAS_TRADES and 'seg_tables' in globals() and seg_tables and 'side_label' in b
     side_all = gain_table(bk, 'side_label', CFG.n_min_cell).reindex(SIDES)
     print('Gain over the algo by MSRB side, every mid:'); display(side_all.round(3))
     # heatmaps: rows = segment, columns = side
-    hm_axes = [k for k in ['duration bucket', 'call structure', 'rating bucket', 'beta-space cluster'] if k in side_tabs]
+    hm_axes = [k for k in ['duration bucket', 'call structure', 'rating bucket', 'trade size', 'beta-space cluster', 'industry'] if k in side_tabs]
     if hm_axes:
         fig, axs = plt.subplots(1, len(hm_axes), figsize=(5.2 * len(hm_axes), 5.6), squeeze=False); axs = axs.ravel()
         vmax = max(np.nanmax(np.abs(side_tabs[k]['gain S'].to_numpy(float))) for k in hm_axes) or 1.0
@@ -2364,7 +2664,7 @@ if HAS_TRADES and 'bk' in globals() and 'msrb_price' in bk.columns:
     dol_all = dollar_table(bk.assign(all='ALL'), 'all')
     print(f'Dollar error removed on held-out trades ({months_held} months, {len(bk):,} trades, {bk["msrb_quantity"].sum()/1e9:.1f} bn par):'); display(dol_all.T.round(2))
     print('By month:'); display(dol_month[['trades', 'par traded ($mm)'] + [c for c in dol_month.columns if c.startswith('$ removed')]].round(1))
-    dol_seg = {name: dollar_table(bk, col, CFG.n_min_cell) for name, col in [('rating bucket', 'rating_bucket'), ('duration bucket', 'dur_bucket'), ('call structure', 'call_structure'), ('beta-space cluster', 'cluster')]}
+    dol_seg = {name: dollar_table(bk, col, CFG.n_min_cell) for name, col in [('rating bucket', 'rating_bucket'), ('duration bucket', 'dur_bucket'), ('call structure', 'call_structure'), ('beta-space cluster', 'cluster'), ('trade size', 'qty_group')] + ([('industry', 'industry_bucket')] if 'industry_bucket' in bk.columns and bk['industry_bucket'].notna().any() else [])}
     for name, tbl in dol_seg.items():
         print(f'By {name}:'); display(tbl[['trades', 'par traded ($mm)', 'algo |error| ($k)'] + [c for c in tbl.columns if '$ removed' in c]].round(1))
     dol_cells = dollar_table(bk, 'cell', CFG.n_min_cell).sort_values('$ removed per month ($k) [S same-side memory]', ascending=False)
@@ -2463,6 +2763,11 @@ if 'error_correction' in REGISTRY:
         _lvd = pd.DataFrame(REGISTRY['error_correction']['last_value_diagnostic']).set_index('bucket')
         summary_rows.append(("Algo error on its own last-value adjustment (ALL)", f"{_lvd.loc['ALL', 'fm_beta']:+.3f} (t {_lvd.loc['ALL', 'fm_t']:+.1f}); corr(same-side memory, adjustment) {REGISTRY['error_correction']['corr_side_err_last_value']:+.3f}"))
     summary_rows.append(('Gain over algo (bp, daily FM t, bootstrap t)', '; '.join(f"{k.split()[0]}: {_o[f'gain {k.split()[0]} (bp)']:+.2f} (t {_o[f't {k.split()[0]}']:+.1f}, boot {boot_gain[k]:+.1f})" for k in list(PREDS)[1:])))
+    if 'bar' in globals() and len(bar):
+        summary_rows.append(('Interaction ladder vs S (delta bp, boot t, passes bar)', '; '.join(f"{i.split()[0]}: {r['delta vs S (bp)']:+.2f} (boot {r['boot t of delta']:+.1f}) {'PASS' if r['passes bar'] else 'no'}" for i, r in bar.iterrows())))
+    if 'direction' in globals():
+        _dS = direction.loc['S same-side EWMA']
+        summary_rows.append(('Direction of the S correction (share toward | crossed closer | crossed further | away; asym-loss gain)', f"{_dS['share toward']:.0%} | {_dS['share crossed, closer']:.0%} | {_dS['share crossed, further']:.0%} | {_dS['share away']:.0%}; {_dS['asym loss gain (bp)']:+.2f} bp (t {_dS['asym FM t']:+.1f})"))
 if 'conformal_band' in REGISTRY:
     for mid_name, r in REGISTRY['conformal_band']['by_mid'].items():
         summary_rows.append((f'Band around {mid_name} ({CFG.band_coverage:.0%} target)', f"fixed {r['coverage fixed']:.1%} at {r['half-width fixed (bp)']:.1f} bp | split conformal {r['coverage conformal']:.1%} at {r['half-width conformal (bp)']:.1f} | rolling conformal {r['coverage rolling']:.1%} at {r['half-width rolling (bp)']:.1f}"))
