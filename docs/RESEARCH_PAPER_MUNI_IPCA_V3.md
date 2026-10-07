@@ -2,7 +2,7 @@
 
 **Yield-space IPCA K=3 v3 factor model of record, state-space residual signal, and print-level error-correction validation | Research decision note for management, quantitative researchers and traders**
 
-*Jer-Shen Chen · v3.3 · run `muni_ipca_research_v33` on data 2026-01-05 to 2026-09-30 · October 2026*
+*Jer-Shen Chen · v3.5 · run `muni_ipca_research_v35` on data 2026-01-05 to 2026-09-30 · October 2026*
 
 ---
 
@@ -10,7 +10,7 @@
 
 We estimate a three-factor, yield-space Instrumented Principal Components model in which municipal-bond factor loadings are functions of thirteen observable characteristics, and we carry the model through to the quoting engine. On the covered closing-mark panel (1.77 million bond-days, 53,408 CUSIPs, 181 dates), the walk-forward model explains 35.6% of out-of-sample daily yield-change variance with a monthly refit and leaves a point-in-time residual with standard deviation 5.28 bp. Two data rules remove the evaluator artefacts that distorted earlier versions, and the refit-cadence question is closed: monthly, quarterly and frozen Gamma are within 0.3 percentage points of each other. The residual is best described by a pooled state-space filter (near-random-walk drift plus mark noise plus white noise). The filtered drift has daily rank IC +0.083 and a vol-scaled hedged paper Sharpe of 6.8, and the filtered mark noise is a strong mark-quality score (+41.7 bp of trade-versus-mark error per unit, t = 14.9). The residual signal predicts where evaluated marks go; it does not predict where trades print relative to the algo quote (−0.14 bp per rank unit, t = −0.18).
 
-The deployable result sits one layer down. The algo quote's own pricing error persists from one matched print to the next with coefficient +0.59 (t = 22.9), the quote's existing last-value adjustment is already right-sized (−0.037, so there is no mis-scaled term to fix), and a two-parameter rule that adds 0.8 × EWMA of past errors (half-life three prints) lowers held-out MAE against the print from 12.95 to 12.26 bp (+0.68 bp, Fama–MacBeth t = 8.1, block-bootstrap t = 6.1) on 537,845 held-out trades. The gain is concentrated where the factor framework says it should be: single-A callables (+18 to +22 bp in two cells), 4–6 year bonds (+2.0 bp), short bullets (+1.8 bp) and the high slope-beta tercile (+1.5 bp); it is zero or negative in AAA and in the 6–8 year belly. The algo's error loads on the slope factor (−30.8 bp per unit beta<sub>2</sub>, t = −4.2) and the correction removes that loading; a direct factor-beta correction does not work on its own (−0.29 bp). A LightGBM level model reaches +1.55 bp but is not yet an object we would deploy. For the quote band, a fixed width rescaled on a ten-day window covers 78% at 11.2 bp and is more efficient than every conditional band we tried. The evidence supports deploying the EWMA error-correction rule in the identified cells behind a shadow period, promoting the state-space outputs as marks-and-risk tooling, and keeping the level model and conditional bands as challengers.
+The deployable result sits one layer down. The algo quote's own pricing error persists from one matched print to the next with coefficient +0.59 (t = 22.9), the quote's existing last-value adjustment is already right-sized (−0.037, so there is no mis-scaled term to fix), and a two-parameter rule that adds 0.8 × EWMA of past errors (half-life three prints) lowers held-out MAE against the print from 12.95 to 12.26 bp (+0.68 bp, Fama–MacBeth t = 8.1, block-bootstrap t = 6.1) on 537,845 held-out trades. The gain is concentrated where the factor framework says it should be: single-A callables (+18 to +22 bp in two cells), 4–6 year bonds (+2.0 bp), short bullets (+1.8 bp) and the high slope-beta tercile (+1.5 bp); it is zero or negative in AAA and in the 6–8 year belly. In dollars of price the rule removes about $2.5 million a month of the quote's $30 million a month of absolute error on the held-out prints, nine tenths of it in single-A callables. The gain is largest on the bid (+1.4 bp on dealer purchases against +0.5 bp on dealer sales and +0.2 bp inter-dealer), and in the sub-one-year and short-callable cells it helps the bid and hurts the offer, so the deployable rule must be side-aware. The algo's error loads on the slope factor (−30.8 bp per unit beta<sub>2</sub>, t = −4.2) and the correction removes that loading; a direct factor-beta correction does not work on its own (−0.29 bp). A LightGBM level model reaches +1.55 bp but is not yet an object we would deploy. For the quote band, a fixed width rescaled on a ten-day window covers 78% at 11.2 bp and is more efficient than every conditional band we tried. The evidence supports deploying the EWMA error-correction rule in the identified cells behind a shadow period, promoting the state-space outputs as marks-and-risk tooling, and keeping the level model and conditional bands as challengers.
 
 # 1. Motivation and Research Question
 
@@ -404,6 +404,9 @@ The universe gain of +0.68 bp hides a very uneven map, and the unevenness is the
 | Cluster C4 (1.5 y bullets) | 12% | 9.1 | +1.30 | 7.7 | +1.78 |
 | Cluster C1 (7 y callables) | 33% | 7.5 | +0.62 | 4.1 | +0.91 |
 | Cluster C7 (1.4 y callables, extension 5.9) | 6% | 45.7 | −1.88 | −4.1 | +2.20 |
+| Side P, dealer buys (bid) | 29% | 12.7 | **+1.43** | 10.8 | +2.46 |
+| Side S, dealer sells (offer) | 34% | 13.0 | +0.46 | 4.6 | +1.27 |
+| Side D, inter-dealer | 38% | 13.1 | +0.20 | 1.8 | +1.14 |
 
 | **Table 12. Top and bottom duration × call × rating cells by the gain of F (cells with at least 2,000 trades)** | | | | | |
 |---|---|---|---|---|---|
@@ -422,11 +425,44 @@ The universe gain of +0.68 bp hides a very uneven map, and the unevenness is the
 
 **Finding 11 — The gains sit in single-A callables, intermediate bonds and short bullets, and the quote is already right in AAA and the 6–8 year belly.** In two A-rated callable cells the quote's MAE falls from 33 to 39 bp to 12 to 15 bp, a gain of 18 to 22 bp on 2% of trades. Single-A bonds as a group gain 4.0 bp (t 9.0), 4 to 6 year bonds 2.0 bp (t 12.2), bullets 1.4 bp (t 10.5) and the high yield-tilt tercile 1.5 bp (t 11.5). In AAA (−0.45 bp) and the 6 to 8 year belly (−0.28 bp) the quote is already well behaved and a correction only adds noise. The sub-one-year and near-call segments have quote MAEs of 40 to 120 bp, which is yield-space noise on bonds whose yield is barely defined; even there the split is by call structure, with sub-one-year bullets gaining 14 bp and sub-one-year priced-to-call bonds losing 2 bp (Figure 16). They dominate the universe MAE and should be reported separately, which is why the headline excluding duration below one year (8.76 to 7.77 bp) is the number to quote.
 
-**Finding 12 — The residual signal's information is also concentrated, in the short end.** Within clusters the record signal's rank IC is 0.10 to 0.15 in the two sub-one-year clusters and 0.07 in the short callables, against 0.01 to 0.05 elsewhere, and the within-cluster hedged Sharpe is highest in the short callables C7 (4.9) and the 4 year callables C3 (3.7). Against prints the within-cluster slopes are small and mixed. The two layers divide the map: the residual layer knows most about the short idiosyncratic end, where the quote's own error is noise; the error-correction layer works in the intermediate and single-A cells, where the quote's error is persistent.
+**Finding 13 — The residual signal's information is also concentrated, in the short end.** Within clusters the record signal's rank IC is 0.10 to 0.15 in the two sub-one-year clusters and 0.07 in the short callables, against 0.01 to 0.05 elsewhere, and the within-cluster hedged Sharpe is highest in the short callables C7 (4.9) and the 4 year callables C3 (3.7). Against prints the within-cluster slopes are small and mixed. The two layers divide the map: the residual layer knows most about the short idiosyncratic end, where the quote's own error is noise; the error-correction layer works in the intermediate and single-A cells, where the quote's error is persistent.
 
 ![Figure 16. Where the gains live: gain of the revised third term by duration × call structure (left); gain by beta-space cluster for F and D (centre); Fama–MacBeth loading of each mid's pricing error on the three factor betas (right).](figures_v33/fig_25.png)
 
-![Figure 17. The record residual signal within beta-space clusters: within-cluster hedged Sharpe (left) and next-day rank IC (right).](figures_v33/fig_26.png)
+![Figure 17. The achievement map: the ten best segments across every axis (left) and the ten best and five worst duration × call × rating cells with the MAE before and after (right). Bars are the revised third term with a 95% band from the Fama–MacBeth t; the diamond is the level model.](figures_v35/fig_27.png)
+
+![Figure 18. Gain of the revised third term by characteristic, one panel per axis: duration, call structure, rating, MSRB side, state, liquidity and beta-space cluster.](figures_v35/fig_28.png)
+
+![Figure 19. Gains in factor coordinates: level, slope and yield-tilt beta terciles, point-in-time within each trade date, with the algo MAE and the share of trades under each tick.](figures_v35/fig_29.png)
+
+**Notebook evidence — by MSRB side.** The same gains split by the side of the print, P a dealer purchase from a customer (the bid), S a dealer sale (the offer), D inter-dealer.
+
+| **Table 12a. Gain of the revised third term by characteristic and side (bp; * marks \|FM t\| ≥ 2)** | | | |
+|---|---|---|---|
+| **Segment** | **P bid** | **S offer** | **D inter-dealer** |
+| All trades | +1.43* | +0.46* | +0.20 |
+| Rating A | +4.75* | +3.57* | +3.88* |
+| Rating AA | +1.17* | +0.05 | −0.38* |
+| Rating AAA | −0.18 | −0.48* | −0.63* |
+| Bullets | +1.49* | +1.32* | +1.38* |
+| Callable to maturity | +1.04* | +0.73 | +0.43 |
+| Priced to call | +1.39* | −0.21 | −0.44* |
+| Duration 4–6 y | +1.67* | +2.00* | +2.32* |
+| Duration 8–11 y | +3.11* | +2.90* | +2.80* |
+| Duration 6–8 y | −0.78* | −0.01 | −0.18* |
+| Duration < 1 y | +5.25* | −2.66* | −3.36* |
+| Cluster C5 (0.3 y bullets) | +6.86* | −7.52* | −4.89* |
+| Cluster C7 (1.4 y callables) | +3.99* | −3.84* | −3.56* |
+| Liquidity Q2 | +2.17* | +1.17* | +1.14* |
+
+**Finding 12 — Outside bullets and single-A, the correction is a bid-side result, and in the short end it flips sign with the side.** Single-A bonds, bullets and the 4 to 11 year callable cells gain on all three sides, so there the quote's error is a level the bond carries whichever way it trades. AA, priced-to-call and the liquidity quintiles gain on the bid and not on the offer. The sub-one-year bucket and the two short clusters gain 4 to 7 bp on the bid and lose 3 to 8 bp on the offer and inter-dealer. The reason is mechanical: the EWMA pools prints from both sides, and in the short end the dealer round trip is large relative to the yield, so the last error from a sale is applied with the wrong sign to the next purchase. The universe side intercept in F cannot fix a cell-specific round trip. The deployable rule therefore needs a side-aware error memory (separate memories per side, or errors demeaned by a cell-level side bias before smoothing), and the shadow gating must be by side as well as by cell.
+
+![Figure 20. Gain of the revised third term by characteristic and MSRB side: duration, call structure, rating and beta-space cluster against P, S and D, with an asterisk at \|FM t\| ≥ 2.](figures_v35/fig_30.png)
+
+![Figure 21. The five best duration × call × rating cells on each side, with the MAE before and after.](figures_v35/fig_31.png)
+
+
+![Figure 22. The record residual signal within beta-space clusters: within-cluster hedged Sharpe (left) and next-day rank IC (right).](figures_v33/fig_26.png)
 
 ## 5.6 The Quote Band
 
@@ -442,9 +478,9 @@ The universe gain of +0.68 bp hides a very uneven map, and the unevenness is the
 | Around the level model D, rolling conformal | 77.9% | 15.9 | 0.204 |
 | Around the revised third term F, rolling fixed | 78.4% | 12.0 | 0.152 |
 
-**Finding 13 — A rescaled fixed band beats every conditional band we tried.** The fixed band collapses in September (63.8% coverage) because the training months were calmer. Rolling conformal recovers coverage to 77% and is flat across width deciles (0.73 to 0.83), which is what conformal is for, but its mean half-width is 16 to 18 bp and its top width decile averages 70 bp. The fair benchmark, a fixed width rescaled on the same ten-day window, covers 78% at 11.2 bp with no model at all. On efficiency the rolling fixed band is 0.143 to 0.152 against 0.204 to 0.234 for rolling conformal around every mid. The conditional band's shape is right and its level is too wide; until the quantile model is sharper, current practice (a fixed width, now rescaled on a short window) is the right band.
+**Finding 14 — A rescaled fixed band beats every conditional band we tried.** The fixed band collapses in September (63.8% coverage) because the training months were calmer. Rolling conformal recovers coverage to 77% and is flat across width deciles (0.73 to 0.83), which is what conformal is for, but its mean half-width is 16 to 18 bp and its top width decile averages 70 bp. The fair benchmark, a fixed width rescaled on the same ten-day window, covers 78% at 11.2 bp with no model at all. On efficiency the rolling fixed band is 0.143 to 0.152 against 0.204 to 0.234 for rolling conformal around every mid. The conditional band's shape is right and its level is too wide; until the quantile model is sharper, current practice (a fixed width, now rescaled on a short window) is the right band.
 
-![Figure 18. The quote band around the level model: coverage by predicted-width decile for the five bands (left); daily coverage under monthly and rolling calibration, with the rolling conformal scale (centre); mean half-width by mid and side, rolling fixed against rolling conformal (right).](figures_v33/fig_24.png)
+![Figure 23. The quote band around the level model: coverage by predicted-width decile for the five bands (left); daily coverage under monthly and rolling calibration, with the rolling conformal scale (centre); mean half-width by mid and side, rolling fixed against rolling conformal (right).](figures_v33/fig_24.png)
 
 ## 5.7 Roll-Forward of Stale Marks
 
@@ -466,11 +502,11 @@ The universe gain of +0.68 bp hides a very uneven map, and the unevenness is the
 | Priced to call | 380,942 | 14.9 | 8.8 | 41% |
 | Bullets | 543,401 | 17.8 | 12.1 | 32% |
 
-**Finding 14 — The factor model moves intermediate and long marks; the short end is idiosyncratic.** For bonds with one to eleven years of duration, rolling a five-day-stale mark forward with the factor path removes 56 to 71% of the RMSE. Below one year, which is 40% of bond-days, it removes 22% and drags the universe figure to 36%. This is the strongest single argument for the factor model as marks tooling, and it is already in the identified cells.
+**Finding 15 — The factor model moves intermediate and long marks; the short end is idiosyncratic.** For bonds with one to eleven years of duration, rolling a five-day-stale mark forward with the factor path removes 56 to 71% of the RMSE. Below one year, which is 40% of bond-days, it removes 22% and drags the universe figure to 36%. This is the strongest single argument for the factor model as marks tooling, and it is already in the identified cells.
 
-![Figure 19. Rolling a stale mark forward with the factor path: MAE by horizon, stale against rolled (in-panel upper bound).](figures_v33/fig_28.png)
+![Figure 24. Rolling a stale mark forward with the factor path: MAE by horizon, stale against rolled (in-panel upper bound).](figures_v33/fig_28.png)
 
-![Figure 20. Roll-forward at five days by duration bucket, call structure and beta-space cluster.](figures_v33/fig_29.png)
+![Figure 25. Roll-forward at five days by duration bucket, call structure and beta-space cluster.](figures_v33/fig_29.png)
 
 ## 5.8 External Benchmarks and Interpretation
 
@@ -487,7 +523,7 @@ The universe gain of +0.68 bp hides a very uneven map, and the unevenness is the
 3. **The algo error correction** C (quote + 0.8 × EWMA of past errors, half-life three prints) lowers held-out MAE by 0.68 bp universe-wide with bootstrap t 6.1, and by 2 to 22 bp in identified single-A, 4 to 6 year and short-bullet cells, while removing the quote's slope-factor loading. It is ready for a bounded shadow deployment in those cells.
 4. **The conditional band** is well shaped and too wide; the rescaled fixed band is current best practice. The level model (+1.55 bp) remains a challenger.
 
-**Decision.** Deploy C as a shadow third term in the cells of Table 12 with positive, significant gain (rating A; duration 4 to 6 and 8 to 11 years; bullets 1 to 4 years; the high yield-tilt tercile), with the correction capped and logged, and with the sub-one-year and near-call cells excluded. Promote the state-space outputs (filtered drift, mark-noise score, factor roll-forward, beta-space comparables) as research and desk tooling with no pricing impact. Keep the level model and the conditional band as challengers behind the same gates. Do not use the residual signal as a quote adjustment.
+**Decision.** Deploy C as a shadow third term in the cells of Table 12 with positive, significant gain (rating A; duration 4 to 6 and 8 to 11 years; bullets 1 to 4 years; the high yield-tilt tercile), with the correction capped and logged, with the sub-one-year and near-call cells excluded, and gated by side: all sides in bullets, single-A and the 4 to 11 year callable cells, bid only elsewhere, until a side-aware error memory replaces the pooled EWMA. Promote the state-space outputs (filtered drift, mark-noise score, factor roll-forward, beta-space comparables) as research and desk tooling with no pricing impact. Keep the level model and the conditional band as challengers behind the same gates. Do not use the residual signal as a quote adjustment.
 
 ## 6.1 Market-Making Evaluation Gates
 
@@ -496,7 +532,7 @@ The universe gain of +0.68 bp hides a very uneven map, and the unevenness is the
 | **1. Signal validity** | Is the error memory stable? | Persistence by gap and side pair; coefficient path over months; FM and block-bootstrap t | Passed: persistence 0.31 to 0.58 in every gap bucket and both side pairs; ρ rises monotonically from 0.77 to 0.84; bootstrap t 6.1 |
 | **2. Incremental fair value** | Does it beat the quote on the print? | Held-out MAE by age, side, segment and cell against A; the quote's own last-value term checked; factor loading of the error | Passed in the identified cells; neutral to negative in AAA, 6 to 8 years and below one year; the quote's own term is right-sized (−0.037) |
 | **3. Execution utility** | Does bounded use improve quoting? | RFQ replay with fills, adverse selection, inventory, turnover and tail loss, in the shadow cells | Not yet run: the shadow deployment is the test |
-| **4. Economic size** | What is it worth? | Par- and duration-weighted dollars of error removed per month, by cell | Pending the v3.3 rerun (Section 6.3) |
+| **4. Economic size** | What is it worth? | Par- and duration-weighted dollars of error removed per month, by cell | Measured: $2.5 million a month, 8% of the quote's absolute error, nine tenths in single-A callables (Section 6.3) |
 
 ## 6.2 Controlled Integration Path
 
@@ -513,7 +549,34 @@ where C* is the set of validated characteristic cells, ρ<sub>ewm</sub> is estim
 
 ## 6.3 Economic Size
 
-The notebook converts the error removed on each held-out trade into dollars of price with par × price/100 × modified duration × 10<sup>−4</sup>, summed per month and per cell. In the v33 run this cell returned non-finite values because the raw MSRB quantity field carries infinite entries; v3.3 adds a par filter (non-finite, non-positive and above $100 million par dropped, price clipped to [1, 300]) and reports how many trades it removes. The dollar tables will be inserted here from the v3.3 run. The order of magnitude can be read from Table 12: a 20 bp gain on a $500k, five-year-duration trade is $500 of price per trade, and the two A-rated callable cells carry about 10,500 held-out trades over five months.
+The error removed on each held-out trade is converted into dollars of price with par × price/100 × modified duration × 10<sup>−4</sup>. The par filter drops 1,392 of 537,845 trades with non-finite, non-positive or implausible par; the remaining trades carry $45.5 billion of par over five months.
+
+| **Table 15. Dollar error removed on held-out prints (five months, 536,453 trades)** | | |
+|---|---|---|
+| **Mid** | **$ removed per month ($k)** | **Par-weighted gain (bp)** |
+| Algo quote absolute error, for scale | 30,254 per month | |
+| C algo + ρ × EWMA error | **+2,481** | **+0.54** |
+| F revised third term | +1,581 | +0.37 |
+| G factor-beta correction | −1,353 | −0.34 |
+| D level model | +2,693 | +0.97 |
+| **By segment, C rule** | | |
+| Rating A (14% of trades, $6.3 bn par) | +2,216 | |
+| Rating AA (72%, $32.5 bn) | +357 | |
+| Rating AAA | −112 | |
+| Duration 4–6 y | +1,727 | |
+| Duration 8–11 y | +619 | |
+| Duration 6–8 y | −13 | |
+| Priced to call | +1,694 | |
+| Bullets | +447 | |
+| **Top cells, F rule** | | |
+| 4–6 y, priced to call, A (7,356 trades, $469 mm) | +1,407 | +26.7 |
+| 8–11 y, callable to maturity, A (3,125 trades, $173 mm) | +922 | +26.7 |
+| 4–6 y, priced to call, AA (47,715 trades, $3.1 bn) | +304 | +1.0 |
+| 2.5–4 y, bullet, AA | +215 | +1.4 |
+
+**Audited result.** The EWMA rule removes about $2.5 million a month of the quote's $30 million a month of absolute pricing error on the prints that matched, 8% of the total, with a par-weighted gain of 0.54 bp. The level model removes $2.7 million, so the two-parameter rule captures most of the ceiling in dollars even though it captures less than half in bp, because its gains sit in the long-duration cells. The dollars are concentrated: single-A bonds account for $2.2 million of the $2.5 million, and the two single-A callable cells alone remove $2.3 million a month on $640 million of par, a par-weighted gain of 27 bp. The 6 to 8 year belly, which carries the most par ($15 billion) and the most absolute error ($59 million), gains nothing. By month the rule is negative in May, when the coefficient was estimated on one month of data, and reaches $1.1 million in August. This is an accuracy measure, not a P&L: how much of it a desk captures depends on which quotes are hit, which is the fill model the RFQ replay in Gate 3 supplies.
+
+![Figure 26. Dollar error removed per month by mid (left), by beta-space cluster (centre), and the ten cells that remove the most dollars under the revised third term (right).](figures_v35/fig_32.png)
 
 # 7. Limitations and Next Steps
 
@@ -524,9 +587,18 @@ The notebook converts the error removed on each held-out trade into dollars of p
 - The universe MAE is dominated by sub-one-year and near-call bonds with 40 to 120 bp errors. All headline numbers should be quoted excluding duration below one year, and the cell view is the honest view.
 - The level model depends on the side-specific MMD spread change and over-corrects the slope loading; it is a ceiling, not a candidate.
 - The conformal band's coverage guarantee assumes exchangeability, which September violated; the rolling version restores coverage at the cost of width.
-- The dollar view is pending the v3.3 rerun.
+- The pooled EWMA mixes prints from both sides; in the short end this flips the sign of the gain between bid and offer. A side-aware memory is the first change for the next version.
+- The dollar view is an accuracy measure on matched prints, not a P&L.
 
-**Next quarter.** Run the shadow third term in the identified cells and collect the RFQ replay evidence for Gate 3; rerun the notebook monthly so the coefficient path and the cell map are refreshed; sharpen the quantile model (print features at signal time, cell indicators) so that the conditional band can compete with the rescaled fixed band on efficiency; add a point-in-time rating history; and extend the out-of-sample window through the next dispersion cycle.
+**Next quarter.** Replace the pooled EWMA with a side-aware, state-space error memory and test cluster-level pooling of the error (Section 7.1); run the shadow third term in the identified cells and collect the RFQ replay evidence for Gate 3; rerun the notebook monthly so the coefficient path and the cell map are refreshed; sharpen the quantile model (print features at signal time, cell indicators) so that the conditional band can compete with the rescaled fixed band on efficiency; add a point-in-time rating history; and extend the out-of-sample window through the next dispersion cycle.
+
+## 7.1 Bringing the correction back inside the factor framework
+
+The EWMA rule is deliberately the simplest object that captures the persistence, and it stands outside the factor model. Three extensions put it back inside, each testable under the same held-out protocol.
+
+1. **A state-space error memory.** Write the algo error at each print as a persistent bond-specific mispricing plus a side offset plus a transient, the same model as Section 4.6 applied to the quote's error on an irregular print clock. The filtered mispricing replaces the EWMA, the side offset absorbs the round trip that flips the short-end sign, and the gain is estimated rather than fixed at a half-life of three prints. The EWMA is the steady-state special case.
+2. **Cluster-level pooling.** The top cells show the quote's MAE falling from 33 to 39 bp to 12 to 15 bp, which is a level the whole cell carries, not bond-specific noise, and the slope-factor loading of the error says the same. A point-in-time EWMA of the algo's errors across a bond's beta-space neighbours, excluding the bond itself, tests whether the cell carries the correction; it also gives a correction for bonds with no print history. The direct beta correction G failed because it imposed one universe-wide linear loading; the within-cluster version is the right test.
+3. **Within-cluster relative value as a feature.** The bond's filtered residual drift relative to its cluster median, the rich/cheap state the beta space was built to show, enters the correction as a feature estimated on prior months. The universe-level test against prints was negative (Finding 7); the cluster-conditional test has not been run.
 
 # Appendix A. Closed Experiments
 
@@ -586,6 +658,8 @@ Fixed on 2026-10-07 (v3.1, after the v31 review) and not changed by the v32 or v
 | v3.1 | Pooled filter as record; last-value diagnostic; baselines E, F; rolling conformal; PIT clusters; segment breakdown | Quote's own term right-sized; EWMA rule +0.68 bp; the gains have a map |
 | v3.2 | Beta-tercile and cluster breakdowns; roll-forward by segment; factor loading of the error | Error loads on the slope factor; F removes it |
 | v3.3 | Baselines G, H; rolling fixed band benchmark; dollar view with finite par | Direct beta correction fails; rescaled fixed band wins on efficiency |
+| v3.4 | Section 12a achievement map: top segments, per-axis grid, factor terciles, scorecard | The "where it works" exhibits come straight from the notebook |
+| v3.5 | MSRB side as a breakdown axis; side × characteristic; top cells per side; dollar view on real data | Bid-side result outside bullets and single-A; short end flips sign by side; $2.5 million a month removed, 90% single-A callables |
 
 ---
 
