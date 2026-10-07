@@ -44,6 +44,7 @@
 # within date, every trade is matched to a residual dated strictly before the trade date, every print-derived
 # feature is cut at the algo signal time, and every calibration uses the month before the test month.
 
+# %%
 from __future__ import annotations
 
 import json
@@ -414,8 +415,6 @@ savefig('03_instrument_eda')
 print('max |corr| off-diagonal:', round(float((corr.values - np.eye(len(corr))).max()), 3), '| duration instrument:', CFG.duration_instrument)
 
 # %%
-
-# %%
 # The two data rules.
 # (1) Dispersion days. An evaluator-wide reprice is a day where many bonds move a lot relative to the day's MEDIAN
 #     move; a day where the whole curve moves 15 bp is a common move the intercept factor absorbs and must stay in
@@ -454,6 +453,7 @@ ax[2].bar(_common.index, _common.values, width=1.0, color=np.where(_common.abs()
 savefig('02_data_rules')
 record('data_rules', partial_days=[str(d.date()) for d in sorted(PARTIAL_DAYS)], dispersion_days=[str(d.date()) for d in sorted(DISPERSION_DAYS)], common_move_days=[str(d.date()) for d in sorted(COMMON_MOVE_DAYS)])
 
+# %% [markdown]
 # ## 4. IPCA: K sweep, Gamma anatomy, factor paths
 #
 # $r_{i,t} = z_{i,t-1}'\Gamma f_t + \varepsilon_{i,t}$, estimated by alternating least squares on per-date
@@ -708,6 +708,7 @@ gamma_versions_raw.reset_index().rename(columns={'index': 'instrument'}).to_parq
 record('walk_forward', folds=len(folds), residual_rows=len(resid), cusips=resid['cusip'].nunique(), oos_dates=resid['date'].nunique(), gamma_versions=resid['gamma_version'].nunique(), oos_variance_explained=float(oos_var_expl), residual_sd_bp=float(resid['pit_residual'].std()))
 del runs
 
+# %%
 # Fit quality over time and Gamma stability across versions
 rm = resid.assign(month=resid['date'].dt.to_period('M').astype(str)).groupby('month').apply(
     lambda g: pd.Series({'oos_var_explained': 1 - g['pit_residual'].var() / g['target_bp'].var(), 'residual_sd_bp': g['pit_residual'].std(), 'target_sd_bp': g['target_bp'].std(), 'rows': len(g)}), include_groups=False)
@@ -739,14 +740,13 @@ savefig('05_residual_dispersion')
 record('walk_forward', gamma_loading_sd_across_versions=drift, gamma_loading_sd_raw=drift_raw, monthly=rm.round(4).to_dict())
 
 # %%
-
-# %%
 # Lookups used by the leverage diagnostic: the instrument matrix per date and the Gamma per version
 MODEL_BY_DATE = {d: g for d, g in model.groupby('date', sort=True, observed=True)}
 GAMMA_ALIGNED = {gv: g.drop(columns=['gamma_version', 'fold', 'regime']).to_numpy(float) for gv, g in gamma_versions.groupby('gamma_version', sort=True)}
 GAMMA_RAW = {gv: g.drop(columns=['gamma_version', 'fold', 'regime']).to_numpy(float) for gv, g in gamma_versions_raw.groupby('gamma_version', sort=True)}
 _gv_index = pd.DatetimeIndex(sorted(GAMMA_ALIGNED))
 
+# %% [markdown]
 # ## 6. Factor-mimicking weights and the residual-maker
 #
 # $f_t = (B_t'B_t+\lambda I)^{-1}B_t'r_t = W_t^{F\prime} r_t$ with $W_t^F = B_t(B_t'B_t+\lambda I)^{-1}$. Each column
@@ -799,7 +799,6 @@ record('mimicking_weights', max_beta_orthogonality=float(max(orth)), **{f'{k}_{m
 # comparables view an RFQ desk uses.
 
 # %%
-
 from sklearn.cluster import KMeans  # noqa: E402
 from sklearn.decomposition import PCA  # noqa: E402
 from sklearn.manifold import TSNE  # noqa: E402
@@ -845,7 +844,6 @@ for a, (col, title, kind) in zip(ax.ravel(), [('rating_bucket', 'by rating', 'ca
 savefig('06b_beta_space_map')
 
 # %%
-
 # Clusters in beta space: profile and named examples, then rich/cheap ranking inside one cluster
 km = KMeans(n_clusters=N_CLUSTERS, n_init=10, random_state=CFG.seed).fit(Bs)
 snap['cluster'] = km.labels_
@@ -882,7 +880,6 @@ record('factor_space', date=str(last_date.date()), embedding=emb_name, clusters=
 # 7b, which is the signal of record.
 
 # %%
-
 resid = resid.sort_values(['cusip', 'date'], kind='stable').reset_index(drop=True)
 grp = resid.groupby('cusip', observed=True)
 resid['dispersion_day'] = resid['date'].isin(DISPERSION_DAYS)
@@ -948,7 +945,6 @@ savefig('07_buckets_and_distribution')
 record('residual_diagnostics', bucket_ic=bucket_ic.round(4).to_dict(), residual_kurtosis=float(stats.kurtosis(e)))
 
 # %%
-
 # Reference forecasters on expanding monthly folds: the trailing mean and the pooled ridge filter
 L = CFG.longconv_lags
 for lag in range(1, L + 1):
@@ -1181,7 +1177,6 @@ savefig('07_forecasters')
 record('residual_forecast', table=fc_table.drop(columns=[c for c in ['params'] if c in fc_table.columns]).round(4).to_dict(), ssm_params=ssm_params.round(5).to_dict(orient='records'), ssm_params_by_bucket=ssmb_params.round(5).to_dict(orient='records'))
 
 # %%
-
 # Two-regime check: does the body persist while the tails revert? Conditional next-residual by current-residual bin.
 bins = pairs['pit_residual'].quantile([0, 0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99, 1.0]).to_numpy()
 pairs['res_bin'] = pd.cut(pairs['pit_residual'], bins=np.unique(bins), include_lowest=True)
@@ -1210,7 +1205,6 @@ record('residual_diagnostics', two_regime=two_regime.reset_index().astype({'res_
 # information is in the residual" rather than as a tradable strategy.
 
 # %%
-
 nxt = resid[['cusip', 'date', 'target_bp']].rename(columns={'date': 'next_date', 'target_bp': 'next_target_bp'})
 
 def prep_portfolio_frame(pred: pd.DataFrame) -> pd.DataFrame:
@@ -1297,7 +1291,6 @@ record('paper_portfolio', table=paper.round(4).reset_index().to_dict(orient='rec
 # inter-dealer. The dealer round trip is therefore `P yield − S yield` and is positive.
 
 # %%
-
 def standardize_trades(tr: pd.DataFrame) -> pd.DataFrame:
     t = tr.copy()
     t.columns = [str(c) for c in t.columns]
