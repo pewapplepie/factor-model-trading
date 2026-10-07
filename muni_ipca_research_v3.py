@@ -2039,7 +2039,7 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
     plt.tight_layout(); savefig('10b_framework_memories')
     _dur_order = ['<1', '1-2.5', '2.5-4', '4-6', '6-8', '8-11', '>11']
     ecp2['dur_bucket'] = pd.cut(ecp2['modified_duration_lag1'], bins=[-1, 1, 2.5, 4, 6, 8, 11, 100], labels=_dur_order).astype(str)
-    show_mids = [k for k in ['F side intercept + own EWMA', 'S2 side bias + side-adjusted EWMA', 'K state-space memory', 'PS cluster x side pooling', 'KP state-space + cluster x side'] if k in PREDS2]
+    show_mids = [k for k in ['F side intercept + own EWMA', 'S same-side EWMA', 'K state-space memory', 'PS cluster x side pooling', 'KP state-space + cluster x side'] if k in PREDS2]
     fig, axs = plt.subplots(1, len(show_mids), figsize=(4.6 * len(show_mids), 5.2), squeeze=False); axs = axs.ravel(); hms = {}
     for a, k in zip(axs, show_mids):
         c = PREDS2[k]
@@ -2059,7 +2059,7 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
     ecp = ecp.merge(_m, on=_keys, how='left')
     for c in _carry.values():
         ecp[c] = ecp[c].fillna(ecp['e_algo_bp'])
-    FRAMEWORK_MIDS = {k: v for k, v in PREDS2.items() if k.split()[0] in ('S2', 'K', 'PS', 'KP')}
+    FRAMEWORK_MIDS = {k: v for k, v in PREDS2.items() if k.split()[0] in ('S', 'K', 'PS', 'KP')}   # v3.7: the same-side memory S replaces S2 in the breakdowns and the dollar view
     ecp2.to_parquet(ARTIFACTS / 'algo_error_correction_framework_v3.parquet', index=False)
     record('error_correction_framework', coefficients_by_month=path_df.round(4).reset_index().to_dict(orient='records'), summary=summary2.round(4).reset_index().to_dict(orient='records'),
            by_side=ec2_side.round(4).reset_index().to_dict(orient='records'), by_age=ec2_age.round(4).reset_index().to_dict(orient='records'), by_duration_band=ec2_band.round(4).reset_index().to_dict(orient='records'),
