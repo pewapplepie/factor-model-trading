@@ -1,6 +1,12 @@
 # %% [markdown]
 # # Muni IPCA v4 — From Fair Mid to Markout: the Factor Model as Risk Layer, the Quote Judged in Dollars
 #
+# **v5.4.** The level-model contrast, named correctly. D- drops the same-side error memory and keeps the factor
+# features, so the 12e pair D vs D- measured the memory, not the factor model. A third level model, D0, drops the
+# betas and the instruments and keeps everything else; D vs D0 is now the factor-feature contrast on the paired-dollar
+# objective, and D vs D- is reported beside it as the error-memory contrast. D0 joins the Section 10 scoreboard and
+# the re-ranking tables. The level-model and fold-loop stages recompute once.
+#
 # **v5.3.** Runtime of 12c. The v48 run spent 25 minutes in the production objective (22 s in v47); the only additions
 # since were replica B's desk curve on the wide grid, a prints x grid matrix built from per-date sorts of the full
 # print history, and its continuous concession table. The desk curve is now a cumulative histogram on the grid (one
@@ -356,7 +362,7 @@ PRE_REGISTERED = {
     'v50_mae_selection': 'Section 10 selects the mid on held-out MAE against the print; the selected mid is carried into the economic comparison as one policy, not as the quote of record',
     'v50_one_objective': 'the engines are compared on one common sample (prints with every mid, every fill curve, both edge models and a raw round-trip exit) and one declared objective: realised dollar P&L per month of the raw round trip (no hedge, no evaluation); the next-print mark is the secondary objective',
     'v50_paired_dollars': 'inference on dollars is the paired daily-dollar difference against S at 0 (and against the production proxy), block-bootstrapped in 5-day blocks with the month count; the dollar bar is a positive monthly difference with bootstrap t > 3 in >= 4 of the held-out months; the per-print basis-point bar is reported beside it, never in its place',
-    'v50_ipca_contrasts': 'the factor model\'s economic value is read from pairs of engines that differ only in one slot: D vs D- (the mid), the GBM fill curve with vs without IPCA features, the edge model with vs without IPCA features, and both together; each pair is a paired daily-dollar difference on the common sample',
+    'v50_ipca_contrasts': 'the factor model\'s economic value is read from pairs of engines that differ only in one slot: D vs D0 (the mid: the level model with and without the betas and instruments; D vs D-, the error memory, is reported beside it and is not a factor contrast), the GBM fill curve with vs without IPCA features, the edge model with vs without IPCA features, and both together; each pair is a paired daily-dollar difference on the common sample',
     'v49_proxy_check': 'on the requests production received, a print that crossed the logged quote is compared with the logged won flag: P(won | crossed) is the competition correction to the would-have-filled proxy and P(crossed | won) its coverage; both reported overall and by size; the universe numbers are read with that correction, not restated',
     'v49_replica_b': 'a second replica of the production objective puts the charge inside the quote: fill iff the print crossed the algo mid shifted by charge + x, value x + charge; the replica whose concession distribution is closer to the logged one on the overlap is the one the universe comparison reads',
     'v48_trade_markout': 'a would-be fill is marked to the next real MSRB print in the bond within 10 calendar days: any side, converted to a mid-equivalent by half the dealer round trip of the mark\'s size bin (median P - S spread of same bond-day prints on prior months; inter-dealer prints unadjusted), and separately to the next inter-dealer, opposite-side and same-side print; and to the last print within 1, 5, 10 business days; the trade-based ranking of record is the next-print mark, raw; date-demeaned and factor-hedged shown as checks; the bar is unchanged',
@@ -2966,6 +2972,8 @@ if HAS_TRADES and not tv.empty and 'cum_fitted_bp' in tv.columns:
     BASE_FEATURES = PRINT_FEATURES + ALGO_DERIVED + ['rating_score', 'years_to_worst', 'extension', 'cpn', 'modified_duration_lag1', 'closing_yield_lag1', 'recency_days_c', 'log_size', 'side_D', 'side_P', 'side_S', 'state_others'] + beta_cols + [c for c in CHARS if c != 'market_fv']
     BASE_FEATURES = [c for c in dict.fromkeys(BASE_FEATURES) if c in ec.columns]
     FULL_FEATURES = BASE_FEATURES + [c for c in ERR_FEATURES if c in ec.columns]
+    FACTOR_FEATURES = [c for c in beta_cols + [c_ for c_ in CHARS if c_ != 'market_fv'] if c in ec.columns]   # v5.4: the factor model's coordinates and instruments
+    NOFACTOR_FEATURES = [c for c in FULL_FEATURES if c not in FACTOR_FEATURES]
     EC_FP = frame_fingerprint(ec, ['e_algo_bp', 'ewm_side_err_bp', 'spread_bp']) + f'|{STAGE_KEYS.get("trades_std")}|{STAGE_KEYS.get("ssm_pooled")}'
     MONTHS_EC = sorted(ec['month'].unique())
 
@@ -3004,17 +3012,18 @@ if HAS_TRADES and not tv.empty and 'cum_fitted_bp' in tv.columns:
             t0 = time.perf_counter()
             yD, impD = fit_gbm(tr, te, FULL_FEATURES, 'spread_bp', CFG.level_model_trees)
             yDm, _ = fit_gbm(tr, te, BASE_FEATURES, 'spread_bp', CFG.level_model_trees)
-            parts.append(pd.DataFrame({'_id': te['_id'].to_numpy(), 'yD': yD, 'yDm': yDm}))
+            yD0, _ = fit_gbm(tr, te, NOFACTOR_FEATURES, 'spread_bp', CFG.level_model_trees)     # v5.4: D0, the level model without the factor features
+            parts.append(pd.DataFrame({'_id': te['_id'].to_numpy(), 'yD': yD, 'yDm': yDm, 'yD0': yD0}))
             if impD is not None:
                 imps.append(impD.rename(str(m)))
             print(f'  level models {m}: train {len(tr):,} | test {len(te):,} | {time.perf_counter() - t0:.0f}s')
-        out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=['_id', 'yD', 'yDm'])
+        out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=['_id', 'yD', 'yDm', 'yD0'])
         if imps:
             imp = pd.concat(imps, axis=1).mean(axis=1)
             out = out.merge(pd.DataFrame({'_id': -1 - np.arange(len(imp)), 'feature': imp.index, 'importance': imp.to_numpy()}), on='_id', how='outer')   # importances ride along with negative ids
         return out
 
-    LVL = cached('level_models', _level_models, deps=[EC_FP, FULL_FEATURES, BASE_FEATURES], code=[fit_gbm, usable_features])
+    LVL = cached('level_models', _level_models, deps=[EC_FP, FULL_FEATURES, BASE_FEATURES, NOFACTOR_FEATURES], code=[fit_gbm, usable_features])
     lvl_pred = LVL[LVL['_id'] >= 0].set_index('_id'); imp_mean = LVL[LVL['_id'] < 0].set_index('feature')['importance'].dropna() if 'feature' in LVL.columns else pd.Series(dtype=float)
 
     # ---- (K) per-side state-space memory on the full print history, cached: the posterior after the last same-side print
@@ -3182,14 +3191,14 @@ if HAS_TRADES and not tv.empty and 'cum_fitted_bp' in tv.columns:
             te['e_SQ_bp'] = te['e_S_bp'] - pd.Series(bias_S.reindex(_key_te).to_numpy(), index=te.index).fillna(0.0)
             BIAS_PATH[str(m)] = {'A': bias_A, 'S': bias_S}
             lp = lvl_pred.reindex(te['_id'])
-            te['e_D_bp'] = te['spread_bp'] - lp['yD'].to_numpy(); te['e_Dminus_bp'] = te['spread_bp'] - lp['yDm'].to_numpy(); te['y_mid_D'] = te['MmdYld'] + lp['yD'].to_numpy() / 100.0
+            te['e_D_bp'] = te['spread_bp'] - lp['yD'].to_numpy(); te['e_Dminus_bp'] = te['spread_bp'] - lp['yDm'].to_numpy(); te['e_D0_bp'] = te['spread_bp'] - lp['yD0'].to_numpy(); te['y_mid_D'] = te['MmdYld'] + lp['yD'].to_numpy() / 100.0
             rho_rows.append(row); parts.append(te)
             print(f'  {m}: train {len(tr):,} | test {len(te):,} | rho pooled {rho_ewm:+.2f} | rho same-side {rho_s:+.2f}' + (f' | rho_K {row["rho_K"]:+.2f}' if 'rho_K' in row else ''))
         return pd.concat(parts, ignore_index=True), pd.DataFrame(rho_rows), BIAS_PATH
 
     ecp, rho_path, BIAS_PATH = cached('fold_loop', _fold_loop, deps=[EC_FP, STAGE_KEYS.get('level_models'), STAGE_KEYS.get('side_state_space_memory'), STAGE_KEYS.get('beta_space_embedding'), repr(beta_cols), repr([str(m) for m in MONTHS_EC])], code=[fm_slope, fm_multi, block_bootstrap_t, qty_group])
     rho_path = rho_path.set_index('month')
-    for c in ['e_D_bp', 'e_Dminus_bp']:
+    for c in ['e_D_bp', 'e_Dminus_bp', 'e_D0_bp']:
         ecp[c] = ecp[c].fillna(ecp['e_algo_bp'])
     print('Error-correction coefficients and state-space parameters by month (estimated on prior months):'); display(rho_path.round(3))
     PREDS = {'A algo quote': 'e_algo_bp', 'C side-pooled EWMA (reference)': 'e_C_bp', 'S same-side EWMA': 'e_S_bp',
@@ -3197,7 +3206,7 @@ if HAS_TRADES and not tv.empty and 'cum_fitted_bp' in tv.columns:
              'E algo + side intercept': 'e_E_bp', 'F side intercept + rho x own EWMA': 'e_F_bp', 'B algo + rho(age) x last error': 'e_B_bp', 'G algo + factor-beta correction': 'e_G_bp',
              'Sb same-side EWMA, rho by factor betas': 'e_Sb_bp', 'Sc same-side EWMA, rho by beta-space cluster': 'e_Sc_bp', 'Sm same-side EWMA, rho by |residual drift|': 'e_Sm_bp',
              'Sa same-side EWMA, rho by same-side age': 'e_Sa_bp', 'Sq same-side EWMA, rho by trade size': 'e_Sq_bp', 'Ssc same-side EWMA, rho by side x cluster': 'e_Ssc_bp', 'Si same-side EWMA, rho by industry': 'e_Si_bp',
-             'K per-side state-space memory': 'e_K_bp', 'D level model with error features': 'e_D_bp', 'D- level model without error features': 'e_Dminus_bp'}
+             'K per-side state-space memory': 'e_K_bp', 'D level model with error features': 'e_D_bp', 'D- level model without error features': 'e_Dminus_bp', 'D0 level model without factor features': 'e_D0_bp'}
     PREDS = {k: v for k, v in PREDS.items() if v in ecp.columns}
     MID_LETTER = {k: k.split()[0] for k in PREDS}
     KEY_MIDS = [k for k in PREDS if MID_LETTER[k] in ('A', 'C', 'S', 'SQ', 'AQ', 'K', 'D')]
@@ -5250,7 +5259,7 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'XSTAR' in globals() an
     gbm_S_tr = interp_rows(_mat('pf_trade'), PFD, XGa)
     LET = {MID_LETTER[k_]: v_ for k_, v_ in PREDS.items()}
     MIDS = {'A algo quote': errA, 'S same-side EWMA': errS}
-    for L_, lab in [('D-', 'D- level model, no factor features'), ('D', 'D level model, + factor features')]:
+    for L_, lab in [('D-', 'D- level model, no error memory'), ('D0', 'D0 level model, no factor features'), ('D', 'D level model, + factor features')]:   # v5.4: D- keeps the factor features; D0 drops them
         if L_ in LET:
             MIDS[lab] = mo[LET[L_]].to_numpy(float)
     _mae_lab = next((lab for lab in MIDS if 'MAE_SELECTED' in globals() and MID_LETTER.get(MAE_SELECTED, '') == lab.split()[0]), None)
@@ -5305,10 +5314,11 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'XSTAR' in globals() an
     engines_tab, DUSD_main = tabs['raw round trip (declared objective)']
 
     # ---- the factor model's economic value: pairs of engines that differ in one slot only
-    PAIRS = [('the mid: level model with vs without factor features', 'D level model, + factor features, at 0', 'D- level model, no factor features, at 0'),
+    PAIRS = [('the mid: level model with vs without factor features', 'D level model, + factor features, at 0', 'D0 level model, no factor features, at 0'),
              ('the fill curve: GBM with vs without factor features (x + charge)', 'engine on S: GBM fill, + factor features | x + charge', 'engine on S: GBM fill, trade features | x + charge'),
              ('the edge model: with vs without factor features (desk curve)', 'engine on S: desk curve | expected P&L, edge + factor features', 'engine on S: desk curve | expected P&L, edge on trade features'),
-             ('all three slots: factor features in the fill curve and the edge model', 'engine on S: GBM fill, + factor features | expected P&L, edge + factor features', 'engine on S: GBM fill, trade features | expected P&L, edge on trade features')]
+             ('all three slots: factor features in the fill curve and the edge model', 'engine on S: GBM fill, + factor features | expected P&L, edge + factor features', 'engine on S: GBM fill, trade features | expected P&L, edge on trade features'),
+             ('the error memory inside the level model (D vs D-; not a factor contrast)', 'D level model, + factor features, at 0', 'D- level model, no error memory, at 0')]
     c_rows = []
     for lab, a_, b_ in PAIRS:
         a_ = next((k_ for k_ in DUSD_main if k_.startswith(a_)), None); b_ = next((k_ for k_ in DUSD_main if k_.startswith(b_)), None)
@@ -5599,7 +5609,7 @@ if 'one_objective' in REGISTRY and REGISTRY['one_objective']['engines']:
     summary_rows.append(('One sample, one objective (raw round-trip $ per month): S at 0 | MAE-selected mid | best engine; winner (paired $ t vs S, months, $ bar)', f"{_oe.loc[_ob, '$ per month ($k)']:,.0f} | " + (f"{_oe.loc[[i_ for i_ in _oe.index if 'MAE-selected' in i_][0], '$ per month ($k)']:,.0f}" if any('MAE-selected' in i_ for i_ in _oe.index) else 'n/a') + f" | {_oe.loc[[i_ for i_ in _oe.index if i_.startswith('engine')], '$ per month ($k)'].max():,.0f} $k; {_ow}" + (f" ($ t {_oe.loc[_ow, '$ boot t vs S at 0']:+.1f}, {int(_oe.loc[_ow, 'months above S at 0 ($)'])} months, {'PASS' if bool(_oe.loc[_ow, 'beats S at 0 ($ bar)']) else 'no'})" if _ow != _ob else ' (the incumbent)')))
     if REGISTRY['one_objective']['contrasts']:
         _oc = pd.DataFrame(REGISTRY['one_objective']['contrasts']).set_index('contrast')
-        summary_rows.append(('Factor model, economic value by slot (delta $k per month, paired $ t): mid | fill curve | edge model | all three', ' | '.join(f"{r_['delta $ per month ($k)']:+,.0f} (t {r_['$ boot t']:+.1f})" for _, r_ in _oc.iterrows())))
+        summary_rows.append(('Factor model, economic value by slot (delta $k per month, paired $ t): mid (D vs D0) | fill curve | edge model | all three | error memory (D vs D-, not a factor contrast)', ' | '.join(f"{r_['delta $ per month ($k)']:+,.0f} (t {r_['$ boot t']:+.1f})" for _, r_ in _oc.iterrows())))
 if 'rfq_ledger' in REGISTRY and REGISTRY['rfq_ledger'].get('policies'):
     _rl = REGISTRY['rfq_ledger']; _rp = pd.DataFrame(_rl['policies']).set_index('policy'); _pn_ = 'production (logged optimal yield)'
     summary_rows.append(('RFQ ledger: requests | printed | joined | scored (months)', f"{_rl['requests']:,} | {_rl['printed']:,} | {_rl['joined']:,} | {_rl['scored']:,} ({_rl['months']})"))
