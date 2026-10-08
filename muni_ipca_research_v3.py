@@ -1,6 +1,15 @@
 # %% [markdown]
 # # Muni IPCA v4 — From Fair Mid to Markout: the Factor Model as Risk Layer, the Quote Judged in Dollars
 #
+# **v4.7.** Three things. (i) Section 8b gains the benchmark it lacked: the equal-weighted universe (long every covered
+# bond) in price and in yield space, and for every portfolio its beta to that market, alpha, excess return, up and
+# down capture and the share of periods it beat the market; the long leg of each sort is judged against the market,
+# not only against its short leg. A one-direction year makes an absolute Sharpe meaningless and a short position look
+# like skill; the benchmark separates the two. (ii) Section 12d reads the real RFQ log's columns (request received
+# time, logged probability, algo_won, quoted, is_final, request id, the print's own time, the final quote yield) and
+# takes the algo mid from the match table when the track carries none. (iii) Runtime: the beta-space embedding is
+# cached, the risk snapshot uses only the trailing window it needs, the roll-forward is vectorised.
+#
 # **v4.6.** The production ledger. The RFQ log (`muni_algo_trade_track`) carries what production actually did on
 # every bid-side request: its optimal yield from the optimizer with the production fill curve, the pfill key it
 # pooled on and the pfill it assigned, the charges, and the print if the request traded. Section 12d reads it as
@@ -280,6 +289,7 @@ PRE_REGISTERED = {
     'v43_pfill': 'fill probability P(o >= delta | x) for the S quote at delta in {-3, 0, 3, 6, 10} bp; four estimators scored by Brier and log-loss on the next month: the desk curve (side, trailing 100-day empirical CDF), a side x size x cluster cell table on prior months (shrunk), a gradient-boosted classifier on trade features, and the same with IPCA and state-space features',
     'v43_edge_model': 'expected round-trip edge of a fill at delta 0, gradient-boosted on the same two feature sets, walk-forward; scored by out-of-sample R2 and realised edge by predicted decile',
     'v43_engine_bar': 'the reduced-form engine (concession per print = argmax over the delta grid of pfill(delta | x) x (expected edge + delta)) replaces S at 0 only if its round-trip P&L per print is higher by 0.10 bp with bootstrap t > 3 and positive in 4 of 5 months',
+    'v47_benchmark': 'the market is the equal-weighted covered universe held long over the same period (price: total return; yield space: minus the mean daily yield change); every portfolio reports beta and alpha on it, excess return, up and down capture and the share of periods above it; a portfolio that fell less with beta below one is defensive, with beta near one and positive alpha is selection, with beta below zero is a short',
     'v46_rfq_ledger': 'the RFQ log is the ground truth for the bid: production optimal yield, pfill key, pfill, charges, print; a request is scored only when it printed and joined to the matched-print frame (trade id, else cusip x side x time within rfq_join_minutes and the same quantity); win = the print crossed the quote (the logged won flag replaces it where present); cover = oriented distance of the print from the quote',
     'v46_grouping_bar': 'a fill-curve grouping replaces the production key only if, at production\'s own quote on the requests it received, it removes >= 5% of the logged pfill\'s Brier in >= 4 of the held-out months; candidates: the production-style key rebuilt (coupon bin x rating group x call group x size), the beta-space cluster in its place, the cluster shifted by the bond\'s oriented residual deviance against its cluster peers, the gradient-boosted model',
     'v46_production_proxy': 'for the universe, production is represented by the algo mid plus the median production concession of the bond\'s pfill key (key prefix from the bond\'s own requests, size token from its quantity), else the side x size median; validated on the overlap against production\'s logged quote before use',
@@ -1223,11 +1233,18 @@ def bond_label(r: pd.Series, width: int = 26) -> str:
 snap['label'] = snap.apply(bond_label, axis=1)
 Bs = snap[beta_cols].to_numpy(float); Bs = (Bs - Bs.mean(axis=0)) / np.maximum(Bs.std(axis=0), 1e-12)
 idx = RNG.choice(len(snap), min(MAP_SAMPLE, len(snap)), replace=False)
-try:
-    emb = TSNE(n_components=2, perplexity=30, init='pca', learning_rate='auto', random_state=CFG.seed).fit_transform(Bs[idx]); emb_name = 't-SNE'
-except Exception as exc:  # noqa: BLE001
-    emb = PCA(n_components=2, random_state=CFG.seed).fit_transform(Bs[idx]); emb_name = 'PCA'
-    print('t-SNE unavailable, using PCA:', exc)
+
+
+def _beta_space_embedding() -> dict:
+    try:
+        e_ = TSNE(n_components=2, perplexity=30, init='pca', learning_rate='auto', random_state=CFG.seed).fit_transform(Bs[idx]); nm_ = 't-SNE'
+    except Exception as exc:  # noqa: BLE001
+        e_ = PCA(n_components=2, random_state=CFG.seed).fit_transform(Bs[idx]); nm_ = 'PCA'; print('t-SNE unavailable, using PCA:', exc)
+    return {'emb': e_, 'name': nm_, 'cusips': snap['cusip'].astype(str).to_numpy()[idx]}
+
+
+_emb = cached('beta_space_embedding', _beta_space_embedding, deps=[STAGE_KEYS.get('walk_forward'), str(last_date.date()), int(MAP_SAMPLE), frame_fingerprint(snap, beta_cols)])   # v4.7: the embedding is deterministic given the betas and the seed, and it took two minutes per run
+emb, emb_name = _emb['emb'], _emb['name']
 sm = snap.iloc[idx].copy(); sm['x'], sm['y'] = emb[:, 0], emb[:, 1]
 
 fig, ax = plt.subplots(2, 2, figsize=(14, 11))
@@ -1670,12 +1687,14 @@ record('residual_diagnostics', two_regime=two_regime.reset_index().astype({'res_
 # %%
 CELL_T('8. Risk model snapshot: what the inventory charge needs [1]')
 last_date = resid['date'].max()
-_rs = resid.sort_values(['cusip', 'date'], kind='stable')
-_rs = _rs.reset_index(drop=True)
-_rs['idio_var_bp2'] = _rs.groupby('cusip', observed=True)['pit_residual'].rolling(CFG.activity_window, min_periods=5).var().reset_index(level=0, drop=True).reindex(_rs.index)
+# v4.7: only the trailing window up to the last date is needed, so the rolling statistics are taken on each bond's last `activity_window` rows (a full rolling pass took two minutes)
+_rs = resid.sort_values(['cusip', 'date'], kind='stable').groupby('cusip', observed=True).tail(CFG.activity_window).reset_index(drop=True)
 _mn_col = 'ssm_mark_noise' if 'ssm_mark_noise' in _rs.columns else None
+_g_rs = _rs.groupby('cusip', observed=True)
+_idio = _g_rs['pit_residual'].agg(['var', 'count']); _idio = _idio['var'].where(_idio['count'] >= 5)
+_rs['idio_var_bp2'] = _rs['cusip'].map(_idio).to_numpy()
 if _mn_col:
-    _rs['mark_noise_sd_bp'] = _rs[_mn_col].abs().groupby(_rs['cusip'], observed=True).rolling(CFG.activity_window, min_periods=5).mean().reset_index(level=0, drop=True).reindex(_rs.index)
+    _mn = _rs.assign(_a=_rs[_mn_col].abs()).groupby('cusip', observed=True)['_a'].agg(['mean', 'count']); _rs['mark_noise_sd_bp'] = _rs['cusip'].map(_mn['mean'].where(_mn['count'] >= 5)).to_numpy()
 fcov = factors.cov()                                                    # bp^2 per day, factors of the full-sample fit
 risk_snap = _rs[_rs['date'] == last_date][['cusip', 'date'] + beta_cols + ['idio_var_bp2'] + (['mark_noise_sd_bp'] if _mn_col else []) + (['beta_cluster'] if 'beta_cluster' in _rs.columns else [])].copy()
 _B = risk_snap[beta_cols].fillna(0.0).to_numpy(float)
@@ -1693,9 +1712,11 @@ ax[1].hist(risk_snap['systematic_share'].clip(0, 1).dropna(), bins=40, color='#5
 savefig('08_risk_model_snapshot')
 risk_snap.to_parquet(ARTIFACTS / f'risk_model_snapshot_{last_date.date()}.parquet', index=False)
 # the factor roll-forward of stale marks (v4.4: folded in from the former Section 14)
-_rsf = resid.sort_values(['cusip', 'date'], kind='stable'); _gsf = _rsf.groupby('cusip', observed=True); rf_rows = []
+_rsf = resid.sort_values(['cusip', 'date'], kind='stable').reset_index(drop=True); _gsf = _rsf.groupby('cusip', observed=True); rf_rows = []
+_cs_t = _gsf['target_bp'].cumsum(); _cs_r = _gsf['pit_residual'].cumsum(); _gt = _cs_t.groupby(_rsf['cusip'], observed=True); _gr = _cs_r.groupby(_rsf['cusip'], observed=True)
 for h in [1, 2, 3, 5, 10]:
-    cum_target = _gsf['target_bp'].transform(lambda s_: s_.rolling(h).sum().shift(-h + 1)); cum_resid = _gsf['pit_residual'].transform(lambda s_: s_.rolling(h).sum().shift(-h + 1))
+    # v4.7: the forward h-observation sum per bond from cumulative sums and group-wise shifts (vectorised; the per-bond rolling pass took a minute)
+    cum_target = _gt.shift(-(h - 1)) - _gt.shift(1).fillna(0.0); cum_resid = _gr.shift(-(h - 1)) - _gr.shift(1).fillna(0.0)
     ok = cum_target.notna() & cum_resid.notna()
     rf_rows.append({'horizon': h, 'n': int(ok.sum()), 'stale_mae_bp': cum_target[ok].abs().mean(), 'rolled_mae_bp': cum_resid[ok].abs().mean(), 'stale_rmse_bp': np.sqrt((cum_target[ok] ** 2).mean()), 'rolled_rmse_bp': np.sqrt((cum_resid[ok] ** 2).mean())})
 rollf = pd.DataFrame(rf_rows).set_index('horizon'); rollf['rmse_reduction'] = 1 - rollf['rolled_rmse_bp'] / rollf['stale_rmse_bp']
@@ -1818,6 +1839,8 @@ def _sort_once(t0: pd.Timestamp, t1: pd.Timestamp) -> tuple[list[dict], pd.DataF
         r['LS equal-weight (bp)'] = _leg_ret(f, 'ret_bp', 5, 'ew') - _leg_ret(f, 'ret_bp', 1, 'ew'); r['LS DV01-balanced (bp)'] = _leg_ret(f, 'ret_bp', 5, 'dv01') - _leg_ret(f, 'ret_bp', 1, 'dv01')
         r['LS yield change, short minus long (bp)'] = _leg_ret(f, 'dy_bp', 1, 'ew') - _leg_ret(f, 'dy_bp', 5, 'ew')
         r['long leg (bp)'] = _leg_ret(f, 'ret_bp', 5, 'ew'); r['short leg (bp)'] = _leg_ret(f, 'ret_bp', 1, 'ew'); r['universe mean (bp)'] = float(f['ret_bp'].mean())
+        _wd = 1.0 / f['D'].clip(lower=0.25); r['market DV01-weighted (bp)'] = float((f['ret_bp'] * _wd).sum() / _wd.sum()); r['market yield change, minus mean dy (bp)'] = float(-f['dy_bp'].mean())
+        r['long leg DV01-balanced (bp)'] = _leg_ret(f, 'ret_bp', 5, 'dv01'); r['long leg yield change, minus mean dy (bp)'] = float(-_leg_ret(f, 'dy_bp', 5, 'ew'))
         r['predicted spread (bp)'] = float(x[f['q'] == 5].mean() - x[f['q'] == 1].mean()) if 'within' not in name and 'reference' not in name else np.nan
         rows.append(r)
         qt.append(f.dropna(subset=['q']).groupby('q')['ret_bp'].mean().rename(name).to_frame().T.assign(t0=t0))
@@ -1847,6 +1870,30 @@ if len(ls):
             sum_rows.append({'freq': fq, 'signal': name, 'portfolio': col, 'rebalances': len(v), 'mean (bp)': v.mean(), 'sd (bp)': v.std(ddof=1), 't': np.sqrt(len(v)) * v.mean() / v.std(ddof=1) if v.std(ddof=1) > 0 else np.nan,
                              'Sharpe (annualised)': ann[fq] * v.mean() / v.std(ddof=1) if v.std(ddof=1) > 0 else np.nan, 'hit rate': float((v > 0).mean()), 'predicted spread (bp)': float(g['predicted spread (bp)'].mean()) if g['predicted spread (bp)'].notna().any() else np.nan})
     prem_tab = pd.DataFrame(sum_rows).set_index(['freq', 'signal', 'portfolio'])
+    # the benchmark: the equal-weighted universe over the same periods; beta, alpha and capture of each portfolio on it, and the long leg against it
+    def _vs_market(v: np.ndarray, m: np.ndarray) -> dict:
+        ok = np.isfinite(v) & np.isfinite(m); v, m = v[ok], m[ok]
+        if len(v) < 3 or m.std() == 0:
+            return {'beta to market': np.nan, 'alpha per period (bp)': np.nan, 'excess over market (bp)': float(np.mean(v - m)) if len(v) else np.nan, 'periods above market': float(np.mean(v > m)) if len(v) else np.nan, 'up capture': np.nan, 'down capture': np.nan}
+        b = float(np.cov(v, m, ddof=1)[0, 1] / np.var(m, ddof=1)); a = float(v.mean() - b * m.mean()); up = m > 0; dn = m < 0
+        return {'beta to market': b, 'alpha per period (bp)': a, 'excess over market (bp)': float(np.mean(v - m)), 'periods above market': float(np.mean(v > m)), 'up capture': float(v[up].mean() / m[up].mean()) if up.sum() >= 2 and m[up].mean() != 0 else np.nan, 'down capture': float(v[dn].mean() / m[dn].mean()) if dn.sum() >= 2 and m[dn].mean() != 0 else np.nan}
+    bm_rows = []
+    for fq in CFG.premia_freqs:
+        gf = ls[ls['freq'] == fq]
+        if gf.empty:
+            continue
+        mk = gf.groupby('t0')[['universe mean (bp)', 'market DV01-weighted (bp)', 'market yield change, minus mean dy (bp)']].first().sort_index()
+        bm_rows.append({'freq': fq, 'signal': 'MARKET: equal-weighted universe, long all bonds', 'portfolio': 'total return (bp)', 'rebalances': len(mk), 'mean (bp)': float(mk['universe mean (bp)'].mean()), 'sd (bp)': float(mk['universe mean (bp)'].std(ddof=1)), 'periods above market': np.nan, 'beta to market': 1.0, 'alpha per period (bp)': 0.0, 'excess over market (bp)': 0.0, 'up capture': 1.0, 'down capture': 1.0})
+        bm_rows.append({'freq': fq, 'signal': 'MARKET: DV01-weighted universe', 'portfolio': 'total return (bp)', 'rebalances': len(mk), 'mean (bp)': float(mk['market DV01-weighted (bp)'].mean()), 'sd (bp)': float(mk['market DV01-weighted (bp)'].std(ddof=1)), **_vs_market(mk['market DV01-weighted (bp)'].to_numpy(float), mk['universe mean (bp)'].to_numpy(float))})
+        for name, g in gf.groupby('signal', sort=False):
+            g = g.set_index('t0').sort_index(); m_ew = g['universe mean (bp)'].to_numpy(float)
+            for col, mcol, lab in [('long leg (bp)', 'universe mean (bp)', 'long leg, equal-weight (bp)'), ('long leg DV01-balanced (bp)', 'market DV01-weighted (bp)', 'long leg, DV01-balanced (bp)'), ('LS equal-weight (bp)', 'universe mean (bp)', 'LS equal-weight (bp)'), ('LS DV01-balanced (bp)', 'market DV01-weighted (bp)', 'LS DV01-balanced (bp)'), ('long leg yield change, minus mean dy (bp)', 'market yield change, minus mean dy (bp)', 'long leg, yield space (bp)')]:
+                v = g[col].to_numpy(float); m = g[mcol].to_numpy(float)
+                bm_rows.append({'freq': fq, 'signal': name, 'portfolio': lab, 'rebalances': int(np.isfinite(v).sum()), 'mean (bp)': float(np.nanmean(v)), 'sd (bp)': float(np.nanstd(v, ddof=1)) if np.isfinite(v).sum() > 1 else np.nan, **_vs_market(v, m)})
+    bench = pd.DataFrame(bm_rows).set_index(['freq', 'signal', 'portfolio'])
+    for fq in CFG.premia_freqs:
+        if fq in bench.index.get_level_values(0):
+            print(f'Against the market, {fq}: the equal-weighted universe is the benchmark (beta, alpha and capture across rebalances; a long leg that fell less with beta < 1 is defensive, with beta near 1 and alpha > 0 is selection; a long-short is market-neutral only if its beta reads near 0):'); display(bench.loc[fq].round(3))
     for fq in CFG.premia_freqs:
         if fq in prem_tab.index.get_level_values(0):
             print(f'Expected-return quintile long-short, {fq} rebalancing (top quintile minus bottom; bp of price per holding period, yield-change row in bp of yield):'); display(prem_tab.loc[fq].round(3))
@@ -1873,12 +1920,23 @@ for k_, lam in LAM.items():
     mve_rows.append({'fold': k_, **{f'w{j+1}': w_t[j] for j in range(CFG.selected_k)}, 'test days': len(te)})
 if mve_daily:
     mve_d = pd.concat(mve_daily); mve_w = pd.DataFrame(mve_rows).set_index('fold')
+    # v4.7: the market in yield space (long every covered bond, equal-weighted: minus the mean daily yield change), and each portfolio against it
+    _mkt_d = (-resid.groupby('date')['target_bp'].mean()).reindex(mve_d.index); mve_d['MARKET: equal-weighted universe (long all bonds)'] = _mkt_d.to_numpy()
     print('Tangency weights on the factors at each refit (normalised to unit gross; from the training-date mean and covariance):'); display(mve_w.round(3))
     _cols = [c_ for c_ in mve_d.columns if c_ != 'fold']
     mve = pd.DataFrame({'mean (bp/day)': mve_d[_cols].mean(), 'sd (bp/day)': mve_d[_cols].std(), 'Sharpe (annualised, daily)': np.sqrt(252.0) * mve_d[_cols].mean() / mve_d[_cols].std(), 'OOS days': len(mve_d)})
     _mm = mve_d[_cols].groupby(mve_d.index.to_period('M')).sum()
     mve['monthly hit rate'] = (_mm > 0).mean(); mve['months'] = len(_mm)
-    print('Out-of-sample factor portfolios in yield space (bp of yield per day; the tangency portfolio is the paper\'s model-implied mean-variance portfolio):'); display(mve.round(3))
+    _mk = mve_d['MARKET: equal-weighted universe (long all bonds)'].to_numpy(float); _mkm = _mm['MARKET: equal-weighted universe (long all bonds)'].to_numpy(float)
+    for c_ in _cols:
+        v = mve_d[c_].to_numpy(float); ok = np.isfinite(v) & np.isfinite(_mk)
+        b = float(np.cov(v[ok], _mk[ok], ddof=1)[0, 1] / np.var(_mk[ok], ddof=1)) if ok.sum() > 3 and np.var(_mk[ok]) > 0 else np.nan; a = float(v[ok].mean() - b * _mk[ok].mean()) if np.isfinite(b) else np.nan
+        resid_ = v[ok] - (a + b * _mk[ok]) if np.isfinite(b) else np.array([np.nan])
+        mve.loc[c_, 'beta to market'] = b; mve.loc[c_, 'alpha (bp/day)'] = a; mve.loc[c_, 'alpha t'] = float(np.sqrt(ok.sum()) * a / resid_.std(ddof=1)) if np.isfinite(b) and resid_.std(ddof=1) > 0 else np.nan
+        mve.loc[c_, 'information ratio (annualised)'] = float(np.sqrt(252.0) * np.mean(v[ok] - _mk[ok]) / np.std(v[ok] - _mk[ok], ddof=1)) if ok.sum() > 3 and np.std(v[ok] - _mk[ok]) > 0 else np.nan
+        mve.loc[c_, 'months above market'] = float(np.mean(_mm[c_].to_numpy(float) > _mkm)); up = _mkm > 0; dn = _mkm < 0
+        mve.loc[c_, 'up capture'] = float(_mm[c_].to_numpy(float)[up].mean() / _mkm[up].mean()) if up.sum() >= 2 else np.nan; mve.loc[c_, 'down capture'] = float(_mm[c_].to_numpy(float)[dn].mean() / _mkm[dn].mean()) if dn.sum() >= 2 else np.nan
+    print('Out-of-sample factor portfolios in yield space (bp of yield per day) against the market (the equal-weighted universe held long): a positive mean with beta below zero is a short position in a sell-off, and only its alpha counts; the tangency portfolio is the paper\'s model-implied mean-variance portfolio:'); display(mve.round(3))
 else:
     mve = pd.DataFrame(); mve_d = pd.DataFrame()
 
@@ -1899,15 +1957,16 @@ if len(ls):
         for name, c_ in zip(['factor premium  (-D x beta.lambda x h)', 'factor premium + carry', 'carry only'], ['#4C72B0', '#2E8B57', '#DD8452']):
             if name in qm.index:
                 ax[1, 0].plot(qm.columns, qm.loc[name], marker='o', color=c_, label=name)
+        _mk_q = ls[ls['freq'] == CFG.premia_freqs[0]].groupby('t0')['universe mean (bp)'].first().mean(); ax[1, 0].axhline(_mk_q, color='k', ls='--', lw=1.0, label=f'market (equal-weighted universe): {_mk_q:+.0f} bp')
         ax[1, 0].set_xlabel('predicted-return quintile (1 = lowest)'); ax[1, 0].set_ylabel('mean realised total return (bp)'); ax[1, 0].set_title(f'Realised return by predicted quintile, {CFG.premia_freqs[0]} (a premium rises left to right)', fontsize=10); ax[1, 0].legend(fontsize=8)
 if len(mve_d):
     _cum = mve_d[[c_ for c_ in mve_d.columns if c_ != 'fold']].cumsum()
-    for c_, col_ in zip(_cum.columns, ['k', '#8C8C8C', '#4C72B0', '#55A868', '#C44E52']):
-        ax[1, 1].plot(_cum.index, _cum[c_], color=col_, lw=1.6 if c_.startswith('tangency') else 1.0, label=c_)
-    ax[1, 1].axhline(0, color='k', lw=0.6); ax[1, 1].set_title('Cumulative out-of-sample factor portfolio P&L in yield space (bp; tangency in black)', fontsize=10); ax[1, 1].legend(fontsize=7)
+    for c_, col_ in zip(_cum.columns, ['k', '#8C8C8C', '#4C72B0', '#55A868', '#C44E52', '#DD8452']):
+        ax[1, 1].plot(_cum.index, _cum[c_], color=col_, lw=1.6 if c_.startswith('tangency') else (1.8 if c_.startswith('MARKET') else 1.0), ls='--' if c_.startswith('MARKET') else '-', label=c_)
+    ax[1, 1].axhline(0, color='k', lw=0.6); ax[1, 1].set_title('Cumulative out-of-sample factor portfolio P&L in yield space (bp; tangency in black, market dashed)', fontsize=10); ax[1, 1].legend(fontsize=7)
 fig.suptitle('Factor premia as expected returns: the Kelly-Palhares-Pruitt test on evaluated-price total returns', fontsize=12); plt.tight_layout(); savefig('08b_factor_premia')
 record('factor_premia', premium_estimates=premia.round(5).to_dict(orient='records'), long_short=prem_tab.round(5).reset_index().to_dict(orient='records') if len(ls) else [], by_rebalance=ls.drop(columns=[]).round(4).astype({'t0': str, 't1': str}).to_dict(orient='records') if len(ls) else [],
-       quintiles=qm.round(4).reset_index().to_dict(orient='records') if len(ls) and len(qt_all) else [], return_check=chk.round(4).astype({'t0': str}).to_dict(orient='records') if len(chk) else [], tangency=mve.round(5).reset_index().to_dict(orient='records') if len(mve) else [], tangency_weights=mve_w.round(4).reset_index().to_dict(orient='records') if mve_daily else [])
+       benchmark=bench.round(5).reset_index().to_dict(orient='records') if len(ls) else [], quintiles=qm.round(4).reset_index().to_dict(orient='records') if len(ls) and len(qt_all) else [], return_check=chk.round(4).astype({'t0': str}).to_dict(orient='records') if len(chk) else [], tangency=mve.round(5).reset_index().to_dict(orient='records') if len(mve) else [], tangency_weights=mve_w.round(4).reset_index().to_dict(orient='records') if mve_daily else [])
 
 # %% [markdown]
 # ## 9. Transaction validation (PIT-safe)
@@ -3955,15 +4014,19 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'okm' in globals() and 
     if rfq_raw is None or rfq_raw.empty:
         print('Section 12d: no track_rfq store under the pipeline root. Pull it (mdp.pull(mdp.Config(root=..., sources=("track_rfq",)))) and rerun; the production ledger is skipped on this run.')
     else:
-        CAND = {'time': ['rfq_time', 'rfq_ts', 'timestamp', 'ts', 'time', 'quote_time', 'signal_ts', 'signal_time', 'tradetime', 'trade_time', 'date'],
+        CAND = {'time': ['rfq_received_time', 'rfq_time', 'rfq_ts', 'received_time', 'timestamp', 'ts', 'time', 'quote_time', 'signal_ts', 'signal_time', 'date'],
+                'print_time': ['msrb_tradetime', 'msrb_event_time', 'print_time', 'tradetime', 'trade_time'],
+                'req_id': ['strategy_ecn_req_id', 'ecn_req_id', 'rfq_id', 'req_id', 'request_id'],
+                'is_final': ['is_final'], 'quoted': ['quoted', 'is_quoted'], 'pricing_error': ['strategy_is_pricing_error', 'is_pricing_error', 'pricing_error'], 'manual': ['manual_takeover', 'is_manual_mode', 'manual'],
+                'final_quote_yield': ['final_quote_yield', 'quoted_yield', 'quote_yield_final'],
                 'quantity': ['quantity', 'msrb_quantity', 'qty', 'size', 'par', 'par_amount', 'notional'],
                 'algo_yield': ['algo_yield', 'algo_signal_yield', 'signal_yield', 'mid_yield', 'model_yield', 'algo_yld', 'yield_mid', 'fair_yield', 'mid'],
                 'optimal_yield': ['optimal_yield', 'opt_yield', 'optimal_yld', 'opt_yld', 'quote_yield', 'our_yield', 'bid_yield', 'optimal'],
-                'pfill': ['pfill', 'p_fill', 'prob_fill', 'fill_prob', 'pfill_value', 'pfill_prob'],
+                'pfill': ['pfill', 'probability', 'p_fill', 'prob_fill', 'fill_prob', 'pfill_value', 'pfill_prob'],
                 'pfill_key': ['pfill_key', 'pf_key', 'pfillkey', 'pfill_group', 'pfill_bin'],
                 'msrb_yield': ['msrb_yield', 'msrb_yld', 'print_yield', 'trade_yield'],
                 'msrb_trade_id': ['msrb_trade_id', 'trade_id', 'msrb_id'],
-                'won': ['won', 'is_won', 'filled', 'is_filled', 'traded', 'executed', 'win', 'done', 'hit'],
+                'won': ['algo_won', 'won', 'is_won', 'filled', 'is_filled', 'traded', 'executed', 'win', 'done', 'hit'],
                 'side': ['side', 'msrb_side', 'signal_side', 'quote_side', 'rfq_side'],
                 'cover': ['cover', 'cover_yield', 'cover_yld', 'cover_bp']}
         cols_l = {str(c).lower(): c for c in rfq_raw.columns}
@@ -3975,7 +4038,9 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'okm' in globals() and 
 
         RC = {r: _pick(r) for r in CAND}
         print(f'track_rfq: {len(rfq_raw):,} rows, {rfq_raw.shape[1]} columns: {list(rfq_raw.columns)}'); print('column roles detected (override with TRACK_RFQ_COLUMNS):', RC)
-        _need = [r for r in ['time', 'optimal_yield', 'algo_yield'] if RC[r] is None]
+        _need = [r for r in ['time', 'optimal_yield'] if RC[r] is None]
+        if RC['algo_yield'] is None:
+            print('the track carries no algo mid yield column: the concession x_prod is measured against the match table\'s algo signal yield on the joined requests')
         if _need or 'cusip' not in rfq_raw.columns:
             print(f'Section 12d: cannot identify {_need or ["cusip"]} on the track from its column names; set TRACK_RFQ_COLUMNS and rerun. The production ledger is skipped on this run.')
         else:
@@ -3985,8 +4050,17 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'okm' in globals() and 
 CELL_T('12d. The production ledger: the RFQs we received [2]')
 if HAS_RFQ:
     rq = pd.DataFrame({'cusip': rfq_raw['cusip'].astype('string'), 'rfq_ts': to_ns(rfq_raw[RC['time']])})
-    for role in ['quantity', 'algo_yield', 'optimal_yield', 'pfill', 'msrb_yield', 'cover']:
+    for role in ['quantity', 'algo_yield', 'optimal_yield', 'pfill', 'msrb_yield', 'cover', 'final_quote_yield']:
         rq[role] = pd.to_numeric(rfq_raw[RC[role]], errors='coerce').to_numpy() if RC[role] else np.nan
+    rq['print_ts'] = to_ns(rfq_raw[RC['print_time']]).to_numpy() if RC['print_time'] else pd.NaT
+    def _flag(role: str):
+        if not RC[role]:
+            return None
+        _v = rfq_raw[RC[role]]
+        return (_v.astype('string').str.lower().isin(['true', '1', 'y', 'yes', 't']) if (_v.dtype == object or str(_v.dtype).startswith('string')) else pd.to_numeric(_v, errors='coerce').fillna(0) > 0).to_numpy()
+    for role in ['is_final', 'quoted', 'pricing_error', 'manual']:
+        _f = _flag(role); rq[role] = _f if _f is not None else np.nan
+    rq['req_id'] = rfq_raw[RC['req_id']].astype('string').to_numpy() if RC['req_id'] else pd.NA
     rq['pfill_key'] = rfq_raw[RC['pfill_key']].astype('string').fillna('NA').to_numpy() if RC['pfill_key'] else 'NA'
     if RC['side']:
         _sv = rfq_raw[RC['side']].astype('string').str.upper().str.strip(); print('track side values:', _sv.value_counts(dropna=False).head(8).to_dict())
@@ -4001,20 +4075,39 @@ if HAS_RFQ:
         rq['won'] = (_w.astype('string').str.lower().isin(['true', '1', 'y', 'yes', 't', 'won', 'filled', 'done', 'win']).astype(float) if (_w.dtype == object or str(_w.dtype).startswith('string') or str(_w.dtype) == 'bool') else pd.to_numeric(_w, errors='coerce').fillna(0.0).clip(0, 1)).to_numpy(float)
     else:
         rq['won'] = np.nan
-    n0 = len(rq); rq = rq.dropna(subset=['cusip', 'rfq_ts', 'optimal_yield', 'algo_yield'])
+    n0 = len(rq)
+    # one row per request: the final state where the track versions its rows, else the last row by time; only requests we actually quoted, without pricing errors
+    if RC['req_id']:
+        if RC['is_final'] and pd.Series(rq['is_final']).notna().any() and bool(pd.Series(rq['is_final']).fillna(False).astype(bool).any()):
+            rq = rq[rq['is_final'].fillna(False).astype(bool)]
+        rq = rq.sort_values('rfq_ts').drop_duplicates('req_id', keep='last')
+    if RC['quoted']:
+        _nq = len(rq); rq = rq[rq['quoted'].fillna(False).astype(bool)]; print(f'{_nq - len(rq):,} requests we did not quote dropped')
+    if RC['pricing_error']:
+        _ne = len(rq); rq = rq[~rq['pricing_error'].fillna(False).astype(bool)]; print(f'{_ne - len(rq):,} requests with a pricing error dropped')
+    if RC['manual']:
+        print(f'manual takeover on {float(rq["manual"].fillna(False).astype(bool).mean()):.1%} of the remaining requests (kept; the optimal yield is still the optimizer\'s output)')
+    rq = rq.dropna(subset=['cusip', 'rfq_ts', 'optimal_yield'])
     rq = rq[(rq['rfq_ts'] >= pd.Timestamp(CFG.first_oos_date)) & (rq['rfq_ts'] < pd.Timestamp(CFG.end_date) + pd.Timedelta(days=1)) & rq['side'].isin(['P', 'S'])].reset_index(drop=True)
-    rq['s'] = np.where(rq['side'] == 'P', 1.0, -1.0); rq['x_prod'] = rq['s'] * 100.0 * (rq['optimal_yield'] - rq['algo_yield'])
-    _nx = len(rq); rq = rq[rq['x_prod'].abs() <= 100.0].reset_index(drop=True)          # a concession beyond 100 bp is a data error
+    rq['s'] = np.where(rq['side'] == 'P', 1.0, -1.0); rq['x_prod'] = rq['s'] * 100.0 * (rq['optimal_yield'] - rq['algo_yield'])   # NaN where the track has no algo yield: filled from the match table after the join
+    _nx = len(rq); rq = rq[~(rq['x_prod'].abs() > 100.0)].reset_index(drop=True)          # a concession beyond 100 bp is a data error (NaN kept: filled after the join)
     if _nx - len(rq):
         print(f'{_nx - len(rq):,} requests dropped for |x_prod| > 100 bp (check the yield units of the optimal and algo yield columns if this is large)')
     rq['has_print'] = rq['msrb_yield'].notna(); rq['month'] = rq['rfq_ts'].dt.to_period('M'); rq['qty_group'] = qty_group(rq['quantity']).to_numpy()
     print(f'RFQ ledger: {len(rq):,} requests in the held-out window ({n0:,} rows on the track); side mix {rq["side"].value_counts(normalize=True).round(3).to_dict()}; {rq["has_print"].mean():.1%} printed; '
           f'pfill logged on {rq["pfill"].notna().mean():.0%}, key on {(rq["pfill_key"] != "NA").mean():.0%}; won flag {"present" if RC["won"] else "absent"}')
+    HAS_ALGO_Y = bool(RC['algo_yield']) and rq['x_prod'].notna().mean() > 0.5
     led = rq.groupby('month').agg(requests=('cusip', 'size'), bonds=('cusip', 'nunique'), printed=('has_print', 'mean'), median_x_prod=('x_prod', 'median'), mean_pfill=('pfill', 'mean'), logged_win=('won', 'mean'))
     print('By month: requests, bonds, share that printed, production median concession (bp; positive = less aggressive than the algo mid), mean logged pfill, logged win share:'); display(led.round(3))
-    xq = rq.groupby(['side', 'qty_group'], observed=True)['x_prod'].quantile([0.1, 0.25, 0.5, 0.75, 0.9]).unstack(); xq.columns = [f'q{int(round(c * 100))}' for c in xq.columns]; xq['n'] = rq.groupby(['side', 'qty_group'], observed=True).size()
-    print('Production concession x_prod by side x quantity bin (bp): the range the optimizer actually uses, which the universe grid has to cover:'); display(xq.round(2))
-    _share_in = float(((rq['x_prod'] >= XGa[0]) & (rq['x_prod'] <= XGa[-1])).mean()); print(f'{_share_in:.0%} of production concessions fall inside the universe grid [{XGa[0]:g}, {XGa[-1]:g}] bp.')
+    def _xq_table(frame: pd.DataFrame, label: str) -> pd.DataFrame:
+        t_ = frame.dropna(subset=['x_prod']); xq_ = t_.groupby(['side', 'qty_group'], observed=True)['x_prod'].quantile([0.1, 0.25, 0.5, 0.75, 0.9]).unstack(); xq_.columns = [f'q{int(round(c * 100))}' for c in xq_.columns]; xq_['n'] = t_.groupby(['side', 'qty_group'], observed=True).size()
+        print(f'Production concession x_prod by side x quantity bin (bp; {label}): the range the optimizer actually uses, which the universe grid has to cover:'); display(xq_.round(2))
+        _si = float(((t_['x_prod'] >= XGa[0]) & (t_['x_prod'] <= XGa[-1])).mean()); print(f'{_si:.0%} of production concessions fall inside the universe grid [{XGa[0]:g}, {XGa[-1]:g}] bp.')
+        return xq_, _si
+    if HAS_ALGO_Y:
+        xq, _share_in = _xq_table(rq, 'all requests, against the track\'s algo yield')
+    else:
+        xq, _share_in = pd.DataFrame(), np.nan
     keys_top = rq.loc[rq['pfill_key'] != 'NA', 'pfill_key'].value_counts()
     if len(keys_top):
         print(f'{len(keys_top)} distinct pfill keys; the 10 most used:'); display(keys_top.head(10).to_frame('requests'))
@@ -4025,9 +4118,16 @@ if HAS_RFQ:
     if 'msrb_trade_id' in mo.columns:
         mo_k['tid'] = _tidn(mo['msrb_trade_id']).to_numpy()
     rp = rq[rq['has_print']].copy().reset_index(drop=True); rp['_rid'] = np.arange(len(rp)); rp['_id'] = np.nan; how = []
-    if RC['msrb_trade_id'] and 'tid' in mo_k.columns and rp['msrb_trade_id'].notna().any():
+    if RC['print_time'] and pd.Series(rp['print_ts']).notna().any():
+        # the print's own time on the track: exact to the minute, same bond and side, same quantity where both are known
+        a0 = rp[['_rid', 'cusip', 'side', 'print_ts', 'quantity']].dropna(subset=['print_ts']).copy(); a0['side'] = a0['side'].astype(str); a0['print_ts'] = to_ns(a0['print_ts']); a0 = a0.sort_values('print_ts')
+        b0 = mo_k[['_id', 'cusip', 'side', 'trade_ts', 'qty_mo']].sort_values('trade_ts')
+        j0 = pd.merge_asof(a0, b0, left_on='print_ts', right_on='trade_ts', by=['cusip', 'side'], direction='nearest', tolerance=pd.Timedelta(minutes=1))
+        okq0 = j0['qty_mo'].isna() | j0['quantity'].isna() | ((j0['qty_mo'] - j0['quantity']).abs() <= 1.0); j0.loc[~okq0, '_id'] = np.nan
+        rp['_id'] = rp['_rid'].map(j0.set_index('_rid')['_id']); how.append('the print\'s own time')
+    if RC['msrb_trade_id'] and 'tid' in mo_k.columns and rp['msrb_trade_id'].notna().any() and rp['_id'].isna().any():
         _m1 = mo_k.dropna(subset=['tid']).drop_duplicates(['cusip', 'tid'])[['_id', 'cusip', 'tid']].rename(columns={'tid': 'msrb_trade_id'})
-        j1 = rp[['_rid', 'cusip', 'msrb_trade_id']].merge(_m1, on=['cusip', 'msrb_trade_id'], how='left'); rp['_id'] = j1['_id'].to_numpy(); how.append('trade id')
+        j1 = rp[['_rid', 'cusip', 'msrb_trade_id']].merge(_m1, on=['cusip', 'msrb_trade_id'], how='left'); rp['_id'] = rp['_id'].fillna(pd.Series(j1['_id'].to_numpy(), index=rp.index)); how.append('trade id')
     _miss = rp['_id'].isna()
     if _miss.any():
         a_ = rp.loc[_miss, ['_rid', 'cusip', 'side', 'rfq_ts', 'quantity']].copy(); a_['side'] = a_['side'].astype(str); a_ = a_.sort_values('rfq_ts')
@@ -4040,7 +4140,16 @@ if HAS_RFQ:
     rp = rp.dropna(subset=['pos']).copy(); rp['pos'] = rp['pos'].astype(int); rp = rp.drop_duplicates('pos').reset_index(drop=True)
     n_printed = int(rq['has_print'].sum()); print(f'{len(rp):,} of {n_printed:,} printed requests joined to the matched-print frame by {" then ".join(how)} ({len(rp) / max(n_printed, 1):.0%}).')
     P = rp['pos'].to_numpy(); sP = S_ARR[P]; ypP = pd.to_numeric(mo['msrb_yield'], errors='coerce').to_numpy(float)[P]; TDP = TD[P]
+    _yalgo_mo = pd.to_numeric(mo['algo_signal_yield'], errors='coerce').to_numpy(float)[P]
+    if not HAS_ALGO_Y:
+        rp['algo_yield'] = _yalgo_mo; rp['x_prod'] = sP * 100.0 * (rp['optimal_yield'].to_numpy(float) - _yalgo_mo)
+        rp = rp[~(rp['x_prod'].abs() > 100.0)].reset_index(drop=True); P = rp['pos'].to_numpy(); sP = S_ARR[P]; ypP = pd.to_numeric(mo['msrb_yield'], errors='coerce').to_numpy(float)[P]; TDP = TD[P]
+        xq, _share_in = _xq_table(rp, 'joined requests, against the match table\'s algo signal yield')
+        rq = rq.drop(columns=['x_prod']).merge(rp[['req_id', 'x_prod']].drop_duplicates('req_id'), on='req_id', how='left') if RC['req_id'] else rq
     o_prod = sP * 100.0 * (ypP - rp['optimal_yield'].to_numpy(float)); o_algo_t = sP * 100.0 * (ypP - rp['algo_yield'].to_numpy(float)); x_prodP = rp['x_prod'].to_numpy(float)
+    _ya_gap = np.abs(rp['algo_yield'].to_numpy(float) - _yalgo_mo) * 100.0
+    if HAS_ALGO_Y:
+        print(f'track algo yield vs match-table algo signal yield on the joined requests: median |gap| {np.nanmedian(_ya_gap):.1f} bp, within 1 bp on {float(np.nanmean(_ya_gap <= 1.0)):.0%}')
     okr = okm[P] & np.isfinite(BASE_RT[P]) & np.isfinite(o_prod); nmr = max(int(pd.Series(MONTH_ARR[P][okr]).nunique()), 1)
     _yd = np.abs(ypP - rp['msrb_yield'].to_numpy(float)); print(f'{int(okr.sum()):,} joined requests carry every input ({nmr} months); the track print and the matched print agree on yield within 0.5 bp on {float((_yd[okr] <= 0.005).mean()):.0%} of them.')
     if okr.sum() < 200:
@@ -4102,6 +4211,13 @@ if HAS_RFQ:
 
     # ---- (4) production's quote against ours on the same requests
     RPOL = {'production (logged optimal yield)': o_prod, 'algo mid at 0 (track algo yield)': o_algo_t, 'A at 0 (match-table algo yield)': O_A[P], 'S at 0': O_S[P], 'SQ at 0': sP * errSQ[P], 'S + production concession x_prod': O_S[P] - x_prodP}
+    if RC['final_quote_yield'] and rp['final_quote_yield'].notna().mean() > 0.5:
+        _ofq = sP * 100.0 * (ypP - rp['final_quote_yield'].to_numpy(float))
+        if np.nanmean(np.abs(_ofq - o_prod)) > 0.05:
+            RPOL['as quoted (final quote yield, after manual changes)'] = _ofq
+    if RC['cover'] and rp['cover'].notna().mean() > 0.2:
+        _cv = rp['cover'].to_numpy(float); _okc = okr & np.isfinite(_cv) & (o_prod >= 0)
+        print(f'Logged cover on the track (units as logged): median {np.nanmedian(_cv[okr]):.3f}, 10th-90th {np.nanpercentile(_cv[okr], 10):.3f} to {np.nanpercentile(_cv[okr], 90):.3f}; correlation with our distance through the print on wins {float(np.corrcoef(_cv[_okc], o_prod[_okc])[0, 1]) if _okc.sum() > 30 else np.nan:+.2f}')
     for pname, lab in [('A, GBM + IPCA fill model, x + charge', 'A, GBM fill model, x + charge (12c)'), ('S, GBM + IPCA fill model, expected P&L (the Section 11b engine)', 'engine: S, GBM + IPCA, expected P&L (12c)')]:
         if pname in XSTAR:
             xs = XSTAR[pname][P]; base_o = O_A[P] if pname.startswith('A') else O_S[P]; RPOL[lab] = np.where(np.isfinite(xs), base_o - xs, -np.inf)
@@ -4158,7 +4274,7 @@ if HAS_RFQ:
         print('By characteristic: production vs S at 0 vs the engine on the requests:'); display(_pv.round(3))
 
     # ---- (5) the production proxy for the universe: the algo mid plus the median production concession of the bond's key
-    kk = rq[rq['pfill_key'] != 'NA'].copy()
+    kk = rq[(rq['pfill_key'] != 'NA') & rq['x_prod'].notna()].copy()
     if len(kk) >= CFG.proxy_min_rfqs:
         kk['prefix'] = kk['pfill_key'].str.rsplit('_', n=1).str[0]; kk['qtok'] = kk['pfill_key'].str.rsplit('_', n=1).str[-1]
         bond_prefix = kk.groupby('cusip')['prefix'].agg(lambda x: x.value_counts().index[0]); qtok_map = kk.groupby('qty_group', observed=True)['qtok'].agg(lambda x: x.value_counts().index[0])
@@ -4167,9 +4283,9 @@ if HAS_RFQ:
         x_key = u_key.map(med_key).to_numpy(float); proxy_src = 'key'
     else:
         x_key = np.full(len(mo), np.nan); print('too few requests with a pfill key for a key-level proxy; the side x size medians are used throughout')
-    med_sq = rq.groupby(['side', 'qty_group'], observed=True)['x_prod'].median()
+    med_sq = rq.dropna(subset=['x_prod']).groupby(['side', 'qty_group'], observed=True)['x_prod'].median()
     _sq_side = SIDE_ARR if (rq['side'] == 'S').any() else np.full(len(mo), 'P')           # no offers on the track: the offer takes the bid's medians (flagged)
-    x_sq = med_sq.reindex(pd.MultiIndex.from_arrays([_sq_side, QTY_ARR])).to_numpy(float); x_sq = np.where(np.isfinite(x_sq), x_sq, float(rq['x_prod'].median()))
+    x_sq = med_sq.reindex(pd.MultiIndex.from_arrays([_sq_side, QTY_ARR])).to_numpy(float); x_sq = np.where(np.isfinite(x_sq), x_sq, float(rq['x_prod'].dropna().median()) if rq['x_prod'].notna().any() else 0.0)
     x_proxy = np.where(np.isfinite(x_key), x_key, x_sq); _cov_key = float(np.isfinite(x_key[okm]).mean())
     # validation on the overlap: the proxy and the 12c replica against production's logged concession on the same requests
     _val = pd.DataFrame({'proxy (median x_prod by key)': x_proxy[P], 'replica (12c, desk curve x (x + charge))': XSTAR[PRODN][P] if PRODN in XSTAR else np.nan, 'logged x_prod': x_prodP})[okr]
@@ -4197,7 +4313,7 @@ if HAS_RFQ:
     # ---- figures
     fig, ax = plt.subplots(2, 3, figsize=(20, 11))
     for sd_, c_ in [('P', '#4C72B0'), ('S', '#DD8452')]:
-        v_ = rq.loc[rq['side'] == sd_, 'x_prod']
+        v_ = rq.loc[rq['side'] == sd_, 'x_prod'].dropna()
         if len(v_):
             ax[0, 0].hist(v_.clip(-30, 30), bins=60, alpha=0.6, color=c_, label=f'{sd_}: production x_prod ({len(v_):,} requests)')
     if PRODN in XSTAR:
@@ -4223,7 +4339,7 @@ if HAS_RFQ:
     else:
         ax[1, 2].set_axis_off()
     fig.suptitle('The production ledger: what production quoted, whether its fill curve is calibrated, and how its quote compares with ours on the same requests', fontsize=12); plt.tight_layout(); savefig('12d_rfq_ledger')
-    record('rfq_ledger', roles=RC, requests=int(len(rq)), printed=int(n_printed), joined=int(len(rp)), scored=int(okr.sum()), months=nmr, by_month=led.round(4).reset_index().astype({'month': str}).to_dict(orient='records'), x_prod_by_cell=flat_records(xq.reset_index()), share_x_prod_in_grid=_share_in,
+    record('rfq_ledger', roles=RC, requests=int(len(rq)), printed=int(n_printed), joined=int(len(rp)), scored=int(okr.sum()), months=nmr, by_month=led.round(4).reset_index().astype({'month': str}).to_dict(orient='records'), x_prod_by_cell=flat_records(xq.reset_index()) if len(xq) else [], share_x_prod_in_grid=_share_in,
            calibration_by_key=cal_key.round(4).reset_index().to_dict(orient='records') if len(cal_key) else [], calibration_by_component={k_: v_.round(4).reset_index().to_dict(orient='records') for k_, v_ in comp_tabs.items()},
            grouping=grouping.round(5).reset_index().to_dict(orient='records'), policies=rfq_tab.round(4).reset_index().to_dict(orient='records'), by_qty=flat_records(by_q.reset_index()) if len(by_q) else [], by_characteristic=rfq_char.round(4).to_dict(orient='records') if len(rfq_char) else [],
            proxy_validation=proxy_val.round(4).reset_index().to_dict(orient='records'), proxy_key_coverage=_cov_key, universe=flat_records(universe.reset_index()))
@@ -4507,7 +4623,15 @@ if 'factor_premia' in REGISTRY and REGISTRY['factor_premia']['long_short']:
         summary_rows.append(('Factor premium estimates with |t| >= 2 at the refits (of refit x factor)', f"{int((_pe['t'].abs() >= 2).sum())} of {len(_pe)}"))
     if REGISTRY['factor_premia']['tangency']:
         _tg = pd.DataFrame(REGISTRY['factor_premia']['tangency']).set_index('index')
-        summary_rows.append(('Tangency portfolio of the factors, OOS (yield space): annualised Sharpe | equal weight | factor 1 alone', ' | '.join(f"{_tg.loc[k_, 'Sharpe (annualised, daily)']:+.2f}" for k_ in ['tangency (model-implied MVE)', 'equal weight of factors', 'factor1 alone (long the factor)'] if k_ in _tg.index)))
+        summary_rows.append(('Tangency portfolio of the factors, OOS (yield space): annualised Sharpe | equal weight | factor 1 alone | market', ' | '.join(f"{_tg.loc[k_, 'Sharpe (annualised, daily)']:+.2f}" for k_ in ['tangency (model-implied MVE)', 'equal weight of factors', 'factor1 alone (long the factor)', 'MARKET: equal-weighted universe (long all bonds)'] if k_ in _tg.index)))
+        if 'beta to market' in _tg.columns and 'tangency (model-implied MVE)' in _tg.index:
+            summary_rows.append(('Tangency portfolio against the market: beta | alpha bp/day (t) | information ratio | months above market', f"{_tg.loc['tangency (model-implied MVE)', 'beta to market']:+.2f} | {_tg.loc['tangency (model-implied MVE)', 'alpha (bp/day)']:+.3f} (t {_tg.loc['tangency (model-implied MVE)', 'alpha t']:+.1f}) | {_tg.loc['tangency (model-implied MVE)', 'information ratio (annualised)']:+.2f} | {_tg.loc['tangency (model-implied MVE)', 'months above market']:.0%}"))
+    if REGISTRY['factor_premia'].get('benchmark'):
+        _bm = pd.DataFrame(REGISTRY['factor_premia']['benchmark']).set_index(['freq', 'signal', 'portfolio'])
+        for fq_ in CFG.premia_freqs:
+            _k = (fq_, 'factor premium + carry', 'long leg, equal-weight (bp)'); _km = (fq_, 'MARKET: equal-weighted universe, long all bonds', 'total return (bp)')
+            if _k in _bm.index and _km in _bm.index:
+                summary_rows.append((f'Long leg of premium + carry vs the market, {fq_}: mean | market | excess (bp per period); beta; periods above market; down capture', f"{_bm.loc[_k, 'mean (bp)']:+.1f} | {_bm.loc[_km, 'mean (bp)']:+.1f} | {_bm.loc[_k, 'excess over market (bp)']:+.1f}; {_bm.loc[_k, 'beta to market']:+.2f}; {_bm.loc[_k, 'periods above market']:.0%}; {_bm.loc[_k, 'down capture']:.2f}"))
 summary = pd.DataFrame(summary_rows, columns=['item', 'result']).set_index('item')
 display(summary)
 print('Artifacts written to', ARTIFACTS)
