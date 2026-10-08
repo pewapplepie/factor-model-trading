@@ -1,6 +1,16 @@
 # %% [markdown]
 # # Muni IPCA v4 — From Fair Mid to Markout: the Factor Model as Risk Layer, the Quote Judged in Dollars
 #
+# **v4.8.** The quote marked to the next real trade. The evaluation markout of Section 11 marks a would-be fill to the
+# closing evaluation, which is the market's systematic view and the surface the factor model is fitted on. The real
+# out-of-sample information is the next print. Section 11c builds the print tape from every MSRB print in the universe
+# and marks each would-be fill to the next real print (any side, converted to a mid-equivalent by half the dealer round
+# trip of its size bin estimated on prior months; inter-dealer prints unadjusted), to the next inter-dealer print, to the
+# next opposite-side print (the round trip) and to the next same-side print, and to the last print within 1, 5 and 10
+# business days. Every rule is re-ranked on the next-print mark, raw, with the date-demeaned and factor-hedged versions
+# as checks, and the trade-based ranking is set against the evaluation-based one. The round trip of Section 11 now
+# exits on the full tape rather than on the matched prints, which raises its coverage.
+#
 # **v4.7.** Three things. (i) Section 8b gains the benchmark it lacked: the equal-weighted universe (long every covered
 # bond) in price and in yield space, and for every portfolio its beta to that market, alpha, excess return, up and
 # down capture and the share of periods it beat the market; the long leg of each sort is judged against the market,
@@ -236,6 +246,8 @@ class RunConfig:
     markout_record_h: int = 5                            # the marking horizon of record for the re-ranking and the concession choice
     concession_grid_bp: tuple[float, float, float] = (-10.0, 26.0, 1.0)   # concession grid (start, stop, step) in bp of yield; negative = more aggressive than the mid (v4.2: to 25 bp, the v4.1 bid optimum sat on the 14 bp edge)
     rt_max_days: int = 10                                # v4.2 realised round trip: exit at the next opposite-side print in the same bond within this many calendar days
+    trade_mark_horizons: tuple[int, ...] = (1, 5, 10)    # v4.8: business-day windows for the last-print-within mark, beside the next-print mark
+    trade_mark_min_pairs: int = 200                      # v4.8: bond-day P/S pairs needed on prior months to estimate the half spread of a size bin
     signal_kappas: tuple[float, ...] = (0.0, 0.25, 0.5, 1.0, 1.5)   # v4.2 residual-signal concession: quote shift = -kappa x oriented forecast (bp), kappa chosen on prior months
     signal_clip_bp: float = 5.0                          # the signal concession is clipped to +/- this many bp
     width_scalar_bar: float = 0.01                       # the mark-noise width scalar replaces the pooled grid if the tail calibration error falls by this much on both sides
@@ -289,6 +301,7 @@ PRE_REGISTERED = {
     'v43_pfill': 'fill probability P(o >= delta | x) for the S quote at delta in {-3, 0, 3, 6, 10} bp; four estimators scored by Brier and log-loss on the next month: the desk curve (side, trailing 100-day empirical CDF), a side x size x cluster cell table on prior months (shrunk), a gradient-boosted classifier on trade features, and the same with IPCA and state-space features',
     'v43_edge_model': 'expected round-trip edge of a fill at delta 0, gradient-boosted on the same two feature sets, walk-forward; scored by out-of-sample R2 and realised edge by predicted decile',
     'v43_engine_bar': 'the reduced-form engine (concession per print = argmax over the delta grid of pfill(delta | x) x (expected edge + delta)) replaces S at 0 only if its round-trip P&L per print is higher by 0.10 bp with bootstrap t > 3 and positive in 4 of 5 months',
+    'v48_trade_markout': 'a would-be fill is marked to the next real MSRB print in the bond within 10 calendar days: any side, converted to a mid-equivalent by half the dealer round trip of the mark\'s size bin (median P - S spread of same bond-day prints on prior months; inter-dealer prints unadjusted), and separately to the next inter-dealer, opposite-side and same-side print; and to the last print within 1, 5, 10 business days; the trade-based ranking of record is the next-print mark, raw; date-demeaned and factor-hedged shown as checks; the bar is unchanged',
     'v47_benchmark': 'the market is the equal-weighted covered universe held long over the same period (price: total return; yield space: minus the mean daily yield change); every portfolio reports beta and alpha on it, excess return, up and down capture and the share of periods above it; a portfolio that fell less with beta below one is defensive, with beta near one and positive alpha is selection, with beta below zero is a short',
     'v46_rfq_ledger': 'the RFQ log is the ground truth for the bid: production optimal yield, pfill key, pfill, charges, print; a request is scored only when it printed and joined to the matched-print frame (trade id, else cusip x side x time within rfq_join_minutes and the same quantity); win = the print crossed the quote (the logged won flag replaces it where present); cover = oriented distance of the print from the quote',
     'v46_grouping_bar': 'a fill-curve grouping replaces the production key only if, at production\'s own quote on the requests it received, it removes >= 5% of the logged pfill\'s Brier in >= 4 of the held-out months; candidates: the production-style key rebuilt (coupon bin x rating group x call group x size), the beta-space cluster in its place, the cluster shifted by the bond\'s oriented residual deviance against its cluster peers, the gradient-boosted model',
@@ -529,7 +542,7 @@ CELL_T('2. Data load and QA [2]')
 # pipeline's static source (`track_static`); when the source is absent the industry instruments are skipped.
 t0 = time.perf_counter()
 msrb_store = PIPE.store('msrb')
-msrb_raw = msrb_store.read(columns=['date', 'cusip', 'quantity', 'tradetime', 'tradetype', 'side'], categorical=False)
+msrb_raw = msrb_store.read(columns=['date', 'cusip', 'quantity', 'tradetime', 'tradetype', 'side', 'yield', 'price'], categorical=False)   # v4.8: the yield makes the store the print tape of Section 11c
 HAS_MSRB = msrb_raw is not None and not msrb_raw.empty
 if HAS_MSRB:
     prints_src = msrb_raw[['cusip', 'tradetime', 'quantity']]
@@ -2919,8 +2932,17 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
 
     # ---- (4) the cell-optimal concession, walk-forward: delta* per side x quantity bin on prior months, applied to the test month, on the S quote
     # ---- realised round trip (v4.2): exit at the next opposite-side print in the same bond, hedged over the holding period
-    _pr = trades_all[['cusip', 'side', 'trade_ts', 'trade_date', 'msrb_yield']].dropna().copy(); _pr['cusip'] = _pr['cusip'].astype('string'); _pr['trade_ts'] = to_ns(_pr['trade_ts']); _pr['trade_date'] = to_ns(_pr['trade_date'])
-    _pr = _pr[_pr['side'].isin(['P', 'S'])].rename(columns={'side': 'exit_side', 'trade_ts': 'exit_ts', 'trade_date': 'exit_date', 'msrb_yield': 'y_exit'}); _pr['exit_side'] = _pr['exit_side'].astype(str); _pr = _pr.sort_values('exit_ts')
+    # ---- v4.8: the print tape: every MSRB print of the universe with a yield (the msrb store), else the matched prints
+    if HAS_MSRB and 'yield' in msrb_raw.columns and pd.to_numeric(msrb_raw['yield'], errors='coerce').notna().mean() > 0.5:
+        tape = pd.DataFrame({'cusip': msrb_raw['cusip'].astype('string').to_numpy(), 'ts': to_ns(msrb_raw['tradetime']).to_numpy(), 'side': msrb_raw['side'].astype('string').str.upper().str[0].to_numpy(), 'y': pd.to_numeric(msrb_raw['yield'], errors='coerce').to_numpy(float), 'q': pd.to_numeric(msrb_raw['quantity'], errors='coerce').to_numpy(float)}); TAPE_SRC = 'the full MSRB tape'
+    else:
+        tape = pd.DataFrame({'cusip': trades_all['cusip'].astype('string').to_numpy(), 'ts': to_ns(trades_all['trade_ts']).to_numpy(), 'side': trades_all['side'].astype(str).to_numpy(), 'y': pd.to_numeric(trades_all['msrb_yield'], errors='coerce').to_numpy(float), 'q': pd.to_numeric(trades_all['msrb_quantity'], errors='coerce').to_numpy(float)}); TAPE_SRC = 'the matched prints (the msrb store carries no yield)'
+    tape = tape.dropna(subset=['cusip', 'ts', 'y']); tape = tape[tape['side'].isin(['P', 'S', 'D']) & (tape['y'] > -5.0) & (tape['y'] < 30.0)]
+    if np.nanmedian(tape['y']) > 50.0 * np.nanmedian(pd.to_numeric(mo['msrb_yield'], errors='coerce')):
+        tape['y'] = tape['y'] / 100.0; print('tape yields read as bp; rescaled to percent')
+    tape = tape.sort_values('ts').reset_index(drop=True); tape['cusip'] = tape['cusip'].astype('string')
+    print(f'print tape: {len(tape):,} prints from {TAPE_SRC}, {tape["cusip"].nunique():,} bonds, side mix {tape["side"].value_counts(normalize=True).round(3).to_dict()}')
+    _pr = tape[tape['side'].isin(['P', 'S'])].rename(columns={'side': 'exit_side', 'ts': 'exit_ts', 'y': 'y_exit'})[['cusip', 'exit_side', 'exit_ts', 'y_exit']].copy(); _pr['exit_side'] = _pr['exit_side'].astype(str); _pr['exit_date'] = _pr['exit_ts'].dt.normalize(); _pr = _pr.sort_values('exit_ts')
     _q = mo[['_id', 'cusip', 'trade_ts', 'side']].copy(); _q['trade_ts'] = to_ns(_q['trade_ts']); _q['exit_side'] = pd.Series(np.where(_q['side'] == 'P', 'S', 'P'), index=_q.index).astype(str); _q['cusip'] = _q['cusip'].astype('string'); _q = _q.sort_values('trade_ts')
     jx = pd.merge_asof(_q, _pr, left_on='trade_ts', right_on='exit_ts', by=['cusip', 'exit_side'], direction='forward', allow_exact_matches=False, tolerance=pd.Timedelta(days=CFG.rt_max_days)).set_index('_id')
     mo['y_exit'] = jx['y_exit'].reindex(mo['_id']).to_numpy(); mo['exit_date'] = jx['exit_date'].reindex(mo['_id']).to_numpy(); mo['days_to_exit'] = ((jx['exit_ts'] - jx['trade_ts']).dt.total_seconds() / 86400.0).reindex(mo['_id']).to_numpy()
@@ -2932,7 +2954,7 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
     _rt_hedged_share = float(np.isfinite(RT_HDG).sum() / max(np.isfinite(RT_RAW).sum(), 1))
     RT_HDG = np.where(np.isfinite(RT_HDG), RT_HDG, RT_RAW)          # v4.3: exits are mostly within a day, so the raw round trip stands in where the factor path is missing
     _rt_ok = np.isfinite(RT_HDG)
-    print(f'round trip: {np.isfinite(RT_RAW).mean():.1%} of customer prints have an opposite-side print in the same bond within {CFG.rt_max_days} days; {_rt_hedged_share:.0%} of those carry the factor path and are hedged, the rest use the raw exit; median days to exit {np.nanmedian(mo["days_to_exit"]):.1f}')
+    print(f'round trip (exits on {TAPE_SRC}): {np.isfinite(RT_RAW).mean():.1%} of customer prints have an opposite-side print in the same bond within {CFG.rt_max_days} days; {_rt_hedged_share:.0%} of those carry the factor path and are hedged, the rest use the raw exit; median days to exit {np.nanmedian(mo["days_to_exit"]):.1f}')
     BASE_EVAL = S_ARR * PM[H0] + HD[HR]                                                                            # evaluation markout base: P&L of a mid = BASE - o + delta
     BASE_RT = RT_HDG
 
@@ -3087,6 +3109,200 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
            size_side={'S': flat_records(cmS.reset_index()), 'A': flat_records(cmA.reset_index()), 'fill_S': flat_records(cfS.reset_index())})
 else:
     print('Section 11 skipped: needs Section 10.')
+
+# %% [markdown]
+# ### 11c. Marked to the next real trade: the evaluation-free markout at every horizon
+#
+# The markout of Section 11 marks a would-be fill to the closing evaluation. That is the market's systematic view of
+# the bond, and it is the surface the factor model is fitted on, so a ranking built on it is partly a ranking against
+# the model's own world. The real out-of-sample information is the next print. This section marks every would-be fill
+# to real trades only, from the **print tape**: every MSRB print in the universe with a yield, any side.
+#
+# **Four marks.** (i) The next print of **any side**, turned into a mid-equivalent: a dealer buy (P) sits above the
+# mid and a dealer sale (S) below it by about half the dealer round trip, so the mark is $y_P - \tfrac{1}{2}\text{RT}$ or
+# $y_S + \tfrac{1}{2}\text{RT}$, with the half round trip the median P minus S spread of same bond-day prints by the
+# mark's size bin, estimated on prior months; an inter-dealer print (D) is used as it is. (ii) The next **inter-dealer**
+# print only, the cleanest mid the tape offers. (iii) The next **opposite-side** print, which is the realised round
+# trip of Section 11. (iv) The next **same-side** print, which says where the same flow printed next. Each mark is
+# taken as the next print after the fill within 10 calendar days, and as the last print within 1, 5 and 10 business
+# days. The P&L of a rule on a print is the oriented distance from the print to the mark less the distance the quote
+# sat through the print, exactly as before, with nothing from the evaluation in it.
+#
+# **What is read.** Coverage by mark and horizon (a tape mark exists only where the bond traded again, and a sparse
+# bond is marked late or not at all). The re-ranking of every rule on the next-print mark, raw, with the usual bar,
+# beside the evaluation-based rank, and the rank agreement between the two. The P&L of S and the algo quote at every
+# horizon and mark, with the date-demeaned and factor-hedged versions as checks on the common move. The noise: the
+# dispersion of a fill's P&L under each mark, and the number of prints it takes to resolve a tenth of a basis point,
+# because scatter is the price of real information. Then S by side and by size under trade marks.
+
+# %%
+CELL_T('11c. Marked to the next real trade [1]')
+if HAS_TRADES and 'mo' in globals() and not mo.empty and 'tape' in globals():
+    t0 = time.perf_counter()
+    # ---- half the dealer round trip by size bin on prior months: same bond-day P and S prints on the tape
+    TD = mo['trade_date'].to_numpy()   # trade dates of the customer prints (11b defines the same)
+    _tp = tape.copy(); _tp['date'] = _tp['ts'].dt.normalize(); _tp['qg'] = qty_group(pd.Series(_tp['q'])).to_numpy()
+    _py = _tp[_tp['side'] == 'P'].groupby(['cusip', 'date'], observed=True).agg(yP=('y', 'median'), qg=('qg', 'first')); _sy = _tp[_tp['side'] == 'S'].groupby(['cusip', 'date'], observed=True)['y'].median().rename('yS')
+    _pairs = _py.join(_sy, how='inner').reset_index(); _pairs['spread'] = 100.0 * (_pairs['yP'] - _pairs['yS']); _pairs['month'] = _pairs['date'].dt.to_period('M'); _pairs = _pairs[_pairs['spread'].abs() <= 200]
+    HALF: dict = {}
+    for m in sorted(set(MONTH_ARR)):
+        prior = _pairs[_pairs['month'] < m]
+        HALF[m] = (prior.groupby('qg', observed=True)['spread'].median() / 2.0) if len(prior) >= CFG.trade_mark_min_pairs else None
+    _hs_last = HALF[max(HALF)] if HALF and HALF[max(HALF)] is not None else None
+    if _hs_last is not None:
+        print(f'half the dealer round trip by size bin of the mark print (bp; prior months, last fold; {len(_pairs):,} same bond-day P/S pairs on the tape):'); display(_hs_last.reindex(QTY_LABELS).round(1).to_frame('half spread (bp)').T)
+    else:
+        print('too few same bond-day P/S pairs on the tape to estimate the half spread; any-side marks are used unadjusted')
+
+    def half_spread_for(mark_side: np.ndarray, mark_q: np.ndarray) -> np.ndarray:
+        out = np.zeros(len(mark_side)); qg_ = qty_group(pd.Series(mark_q)).to_numpy()
+        for m in np.unique(MONTH_ARR):
+            hs = HALF.get(m); sel = MONTH_ARR == m
+            if hs is None or not sel.any():
+                continue
+            out[sel] = pd.Series(qg_[sel]).map(hs).fillna(float(hs.median())).to_numpy()
+        return np.where(mark_side == 'D', 0.0, out)
+
+    _qm = mo[['_id', 'cusip', 'trade_ts', 'side']].copy(); _qm['cusip'] = _qm['cusip'].astype('string'); _qm['trade_ts'] = to_ns(_qm['trade_ts']); _qm['side'] = _qm['side'].astype(str); _qm['opp'] = np.where(_qm['side'] == 'P', 'S', 'P')
+    _tape_m = tape.rename(columns={'ts': 'mark_ts', 'y': 'y_mark', 'side': 'mark_side', 'q': 'q_mark'}); _tape_m['mark_side'] = _tape_m['mark_side'].astype(str)
+    Y_PRINT = pd.to_numeric(mo['msrb_yield'], errors='coerce').to_numpy(float)
+    TAPE_KINDS = {'any side, mid-equivalent': 'any', 'inter-dealer only': 'D', 'opposite side (round trip)': 'opp', 'same side': 'same'}
+    TAPE_H = [None] + [int(h) for h in CFG.trade_mark_horizons]
+
+    def mark_tape(kind: str, h) -> tuple[np.ndarray, np.ndarray]:
+        """Oriented print-to-mark distance (bp; a rule's P&L = this - o) and days to the mark, for one mark kind and horizon (None = the next print)."""
+        q = _qm.copy(); by = ['cusip']
+        if kind == 'D':
+            tp = _tape_m[_tape_m['mark_side'] == 'D']
+        elif kind in ('opp', 'same'):
+            tp = _tape_m[_tape_m['mark_side'].isin(['P', 'S'])]; q['mark_side'] = q['opp'] if kind == 'opp' else q['side']; by = ['cusip', 'mark_side']
+        else:
+            tp = _tape_m
+        if h is None:
+            j = pd.merge_asof(q.sort_values('trade_ts'), tp.sort_values('mark_ts'), left_on='trade_ts', right_on='mark_ts', by=by, direction='forward', allow_exact_matches=False, tolerance=pd.Timedelta(days=CFG.rt_max_days))
+        else:
+            q['target'] = q['trade_ts'].dt.normalize() + pd.offsets.BDay(h) + pd.Timedelta(hours=23, minutes=59)
+            j = pd.merge_asof(q.sort_values('target'), tp.sort_values('mark_ts'), left_on='target', right_on='mark_ts', by=by, direction='backward')
+            j.loc[~(j['mark_ts'] > j['trade_ts']), ['y_mark', 'mark_ts']] = np.nan
+        j = j.set_index('_id').reindex(mo['_id'].to_numpy())
+        y_mark = j['y_mark'].to_numpy(float); ms = j['mark_side'].astype(str).to_numpy(); qm_ = j['q_mark'].to_numpy(float)
+        if kind == 'any':
+            adj = half_spread_for(ms, qm_) / 100.0; y_mark = np.where(ms == 'P', y_mark - adj, np.where(ms == 'S', y_mark + adj, y_mark))
+        days = ((j['mark_ts'] - pd.Series(_qm.set_index('_id')['trade_ts']).reindex(mo['_id'].to_numpy())).dt.total_seconds() / 86400.0).to_numpy(float)
+        return S_ARR * 100.0 * (Y_PRINT - y_mark), days
+
+    TM, TMD = {}, {}
+    for kname, kind in TAPE_KINDS.items():
+        for h in TAPE_H:
+            TM[(kname, h)], TMD[(kname, h)] = mark_tape(kind, h)
+    _hl = lambda h: 'next print' if h is None else f'last print within {h} bd'
+    cov = pd.DataFrame({_hl(h): {kname: float(np.isfinite(TM[(kname, h)]).mean()) for kname in TAPE_KINDS} for h in TAPE_H})
+    dte = pd.DataFrame({_hl(h): {kname: float(np.nanmedian(TMD[(kname, h)])) for kname in TAPE_KINDS} for h in TAPE_H})
+    print(f'Coverage of the trade marks (share of customer prints with a mark; {time.perf_counter() - t0:.0f}s):'); display(cov.round(3))
+    print('Median days from the fill to the mark:'); display(dte.round(1))
+    TRADE_REC = ('any side, mid-equivalent', None); BASE_TRADE = TM[TRADE_REC]
+
+    # ---- the re-ranking on the next real print, raw
+    def rerank_trade(base: np.ndarray, mask: np.ndarray) -> tuple[pd.DataFrame, dict]:
+        rows, daily = [], {}
+        for k_, c in PREDS.items():
+            o = S_ARR * mo[c].to_numpy(float); fill = o >= 0; pnl = base - o; ok = mask & np.isfinite(pnl) & np.isfinite(o); f_ok = fill & ok
+            v = np.where(f_ok, pnl, 0.0); d_ = pd.Series(v[ok]).groupby(TD[ok]).mean(); daily[k_] = d_
+            rows.append({'mid': k_, 'fill share': f_ok.sum() / max(ok.sum(), 1), 'P&L | fill (bp)': float(pnl[f_ok].mean()) if f_ok.any() else np.nan, 'median P&L | fill (bp)': float(np.median(pnl[f_ok])) if f_ok.any() else np.nan,
+                         'P&L per print (bp)': float(d_.mean()) if len(d_) else np.nan, '$ per month ($k)': float((pnl[f_ok] * DPB[f_ok]).sum() / 1e3 / max(int(pd.Series(MONTH_ARR[ok]).nunique()), 1))})
+        return pd.DataFrame(rows).set_index('mid'), daily
+
+    tr_all, tr_daily = rerank_trade(BASE_TRADE, ALL); _dS_t = tr_daily['S same-side EWMA']
+    for k_ in tr_all.index:
+        dv = (tr_daily[k_] - _dS_t).dropna(); dm = dv.groupby(pd.DatetimeIndex(dv.index).to_period('M')).mean()
+        tr_all.loc[k_, 'boot t vs S'] = block_bootstrap_t(dv.to_numpy(), CFG.block_days, CFG.n_boot, CFG.seed) if k_ != 'S same-side EWMA' else np.nan
+        tr_all.loc[k_, 'months above S'] = int((dm > 0).sum()) if k_ != 'S same-side EWMA' else np.nan
+    tr_all['beats S (bar)'] = ((tr_all['P&L per print (bp)'] - tr_all.loc['S same-side EWMA', 'P&L per print (bp)']) >= CFG.interaction_bar_bp) & (tr_all['boot t vs S'] > 3) & (tr_all['months above S'] >= min(4, months_mo))
+    for kname, h in [('inter-dealer only', None), ('opposite side (round trip)', None), ('any side, mid-equivalent', 1), ('any side, mid-equivalent', 5), ('any side, mid-equivalent', 10)]:
+        _t, _ = rerank_trade(TM[(kname, h)], ALL); tr_all[f'per print: {kname}, {_hl(h)}'] = _t['P&L per print (bp)']
+    tr_all['evaluation $ rank'] = rr_all['$ rank'].reindex(tr_all.index); tr_all['trade $ rank'] = tr_all['$ per month ($k)'].rank(ascending=False).astype(int); tr_all['MAE rank'] = rr_all['MAE rank'].reindex(tr_all.index)
+    tr_all = tr_all.sort_values('P&L per print (bp)', ascending=False)
+    _rho = float(pd.Series(tr_all['$ per month ($k)']).rank().corr(pd.Series(rr_all['$ per month ($k)']).reindex(tr_all.index).rank(), method='spearman'))
+    _rho_pp = float(tr_all['P&L per print (bp)'].rank().corr(rr_all['P&L per print (bp)'].reindex(tr_all.index).rank(), method='spearman'))
+    print(f'Re-ranking on the next real print (any side, mid-equivalent; raw, nothing from the evaluation), {months_mo} held-out months. Bar: +{CFG.interaction_bar_bp:.2f} bp per print over S, bootstrap t > 3, positive in >= 4 months. Spearman with the evaluation ranking: dollars {_rho:+.2f}, per print {_rho_pp:+.2f}:'); display(tr_all.round(3))
+
+    # ---- S and the algo quote at every mark and horizon; the common move: raw, date-demeaned, factor-hedged on the record mark
+    hz_rows = []
+    for k_ in ['S same-side EWMA', 'A algo quote']:
+        o = S_ARR * mo[PREDS[k_]].to_numpy(float); fill = o >= 0
+        for kname in TAPE_KINDS:
+            r_ = {'mid': k_, 'mark': kname}
+            for h in TAPE_H:
+                pnl = TM[(kname, h)] - o; ok = np.isfinite(pnl); r_[_hl(h)] = float(np.where(fill & ok, pnl, 0.0)[ok].mean()) if ok.any() else np.nan
+            hz_rows.append(r_)
+        pnl_e = BASE_EVAL - o; ok = np.isfinite(pnl_e); hz_rows.append({'mid': k_, 'mark': 'evaluation (Section 11, h = 5, hedged)', 'next print': np.nan, **{_hl(h): (float(np.where(fill & ok, pnl_e, 0.0)[ok].mean()) if h == HR else np.nan) for h in TAPE_H if h is not None}})
+    horizon_tab = pd.DataFrame(hz_rows).set_index(['mid', 'mark'])
+    print('P&L per print (bp) by mark and horizon, S and the algo quote (raw trade marks; the evaluation row for reference):'); display(horizon_tab.round(2))
+    # the common move on the record mark: the move from the print to the mark, raw, demeaned by trade date, and net of the factor-implied move to the mark date
+    _mv = BASE_TRADE.copy(); _mkt = pd.Series(_mv).groupby(TD).transform('mean').to_numpy(); _dd = _mv - _mkt
+    _md = _qm.set_index('_id')['trade_ts'].reindex(mo['_id'].to_numpy()) + pd.to_timedelta(np.nan_to_num(TMD[TRADE_REC], nan=0.0), unit='D')
+    _ex2 = pd.DataFrame({'_id': mo['_id'].to_numpy(), 'cusip': mo['cusip'].astype('string').to_numpy(), 'mark_date': to_ns(pd.Series(_md.to_numpy())).dt.normalize().to_numpy()}).dropna(); _ex2['cusip'] = _ex2['cusip'].astype('string'); _ex2['mark_date'] = to_ns(_ex2['mark_date']); _ex2 = _ex2.sort_values('mark_date')
+    jf2 = pd.merge_asof(_ex2, rp[['cusip', 'date', 'cum_fit']].rename(columns={'date': 'rdate'}), left_on='mark_date', right_on='rdate', by='cusip', direction='forward', tolerance=pd.Timedelta(days=7)).set_index('_id')
+    _cfm = jf2['cum_fit'].reindex(mo['_id'].to_numpy()).to_numpy(float); _hd = _mv + S_ARR * (_cfm - mo[f'cf_{H0}'].to_numpy(float))
+    cm_rows = []
+    for k_ in ['S same-side EWMA', 'A algo quote']:
+        o = S_ARR * mo[PREDS[k_]].to_numpy(float); fill = o >= 0
+        for sd_, msk in [('P', IS_P), ('S', IS_S), ('ALL', ALL)]:
+            r_ = {'mid': k_, 'side': sd_}
+            for lab, base in [('raw', _mv), ('date-demeaned', _dd), ('factor-hedged', _hd)]:
+                pnl = base - o; ok = msk & np.isfinite(pnl); r_[f'P&L per print, {lab} (bp)'] = float(np.where(fill & ok, pnl, 0.0)[ok].mean()) if ok.any() else np.nan
+            cm_rows.append(r_)
+    common_move = pd.DataFrame(cm_rows).set_index(['mid', 'side'])
+    print('The common move on the next-print mark: P&L per print raw, demeaned by trade date, and net of the factor-implied move to the mark (bp). A large gap between raw and the other two, with opposite signs by side, is the market, not the quote:'); display(common_move.round(2))
+
+    # ---- noise: the dispersion of a fill's P&L under each mark, and the prints needed to resolve a tenth of a basis point
+    nz_rows = []; oS = S_ARR * errS; fS = oS >= 0
+    for lab, base in [('evaluation, h = 5 (hedged)', BASE_EVAL), ('next print, any side (mid-equivalent)', BASE_TRADE), ('next inter-dealer print', TM[('inter-dealer only', None)]), ('next opposite-side print (round trip)', TM[('opposite side (round trip)', None)]), ('last print within 5 bd, any side', TM[('any side, mid-equivalent', 5)])]:
+        pnl = base - oS; ok = np.isfinite(pnl); d_ = pd.Series(np.where(fS & ok, pnl, 0.0)[ok]).groupby(TD[ok]).mean()
+        nz_rows.append({'mark': lab, 'coverage': float(ok.mean()), 'sd of P&L per fill (bp)': float(pnl[fS & ok].std()), 'sd of the daily mean (bp)': float(d_.std()), 'days': int(len(d_)), 'prints per day': float(ok.sum() / max(len(d_), 1)), 'prints to resolve 0.10 bp at t = 3': float((3.0 * pnl[fS & ok].std() / 0.10) ** 2) if (fS & ok).any() else np.nan})
+    noise = pd.DataFrame(nz_rows).set_index('mark')
+    print('Noise of each mark on S fills: a trade mark carries the bid-offer scatter of the next print, so it needs more prints for the same precision:'); display(noise.round(2))
+
+    # ---- S by side and by size on the next-print mark
+    sz_rows = []
+    for q_ in QTY_LABELS:
+        for sd_, msk in [('P', IS_P), ('S', IS_S)]:
+            sel = msk & (QTY_ARR == q_)
+            for k_ in ['S same-side EWMA', 'A algo quote']:
+                o = S_ARR * mo[PREDS[k_]].to_numpy(float); pnl = BASE_TRADE - o; ok = sel & np.isfinite(pnl); f_ok = ok & (o >= 0)
+                if ok.sum() >= 200:
+                    sz_rows.append({'qty_group': q_, 'side': sd_, 'mid': k_, 'prints': int(ok.sum()), 'fill share': float(f_ok.sum() / ok.sum()), 'P&L per print (bp)': float(np.where(f_ok, pnl, 0.0)[ok].mean()), '$ per month ($k)': float((pnl[f_ok] * DPB[f_ok]).sum() / 1e3 / months_mo)})
+    trade_size = pd.DataFrame(sz_rows).set_index(['qty_group', 'side', 'mid']).unstack('mid') if sz_rows else pd.DataFrame()
+    if len(trade_size):
+        print('By quantity bin and side on the next-print mark, S and the algo quote:'); display(trade_size.round(2))
+
+    # ---- figures
+    fig, ax = plt.subplots(2, 3, figsize=(20, 11))
+    cov.plot.bar(ax=ax[0, 0], width=0.8); ax[0, 0].set_title('Coverage: share of customer prints with a real-trade mark', fontsize=10); ax[0, 0].tick_params(axis='x', rotation=15, labelsize=8); ax[0, 0].legend(fontsize=7); ax[0, 0].set_ylim(0, 1)
+    _xh = ['next print'] + [f'{h} bd' for h in CFG.trade_mark_horizons]
+    for k_, ls_ in [('S same-side EWMA', '-'), ('A algo quote', '--')]:
+        for kname, c_ in zip(TAPE_KINDS, ['#4C72B0', '#2E8B57', '#DD8452', '#8C8C8C']):
+            ax[0, 1].plot(_xh, horizon_tab.loc[(k_, kname)].to_numpy(float), marker='o', ls=ls_, color=c_, label=f'{k_.split()[0]}: {kname}')
+    ax[0, 1].axhline(0, color='k', lw=0.5); ax[0, 1].set_ylabel('P&L per print (bp)'); ax[0, 1].set_title('S (solid) and the algo quote (dashed) by mark and horizon, raw trade marks', fontsize=10); ax[0, 1].legend(fontsize=6, ncol=2)
+    _tp_ = tr_all.sort_values('P&L per print (bp)'); y_ = np.arange(len(_tp_))
+    ax[0, 2].barh(y_, _tp_['P&L per print (bp)'], color=['#2E8B57' if b_ else ('#4C72B0' if i_ == 'S same-side EWMA' else '#8C8C8C') for i_, b_ in zip(_tp_.index, _tp_['beats S (bar)'])]); ax[0, 2].set_yticks(y_); ax[0, 2].set_yticklabels([f'{i_[:34]}  [eval $ rank {int(r_)}]' for i_, r_ in zip(_tp_.index, _tp_['evaluation $ rank'])], fontsize=6)
+    ax[0, 2].axvline(tr_all.loc['S same-side EWMA', 'P&L per print (bp)'], color='#4C72B0', ls=':', lw=1); ax[0, 2].set_xlabel('P&L per print on the next real print (bp)'); ax[0, 2].set_title('Re-ranking on the next real trade (blue = S; green = clears the bar)', fontsize=10)
+    ax[1, 0].scatter(rr_all['$ per month ($k)'].reindex(tr_all.index), tr_all['$ per month ($k)'], color='#4C72B0')
+    for i_ in tr_all.index:
+        ax[1, 0].annotate(MID_LETTER[i_], (rr_all.loc[i_, '$ per month ($k)'], tr_all.loc[i_, '$ per month ($k)']), fontsize=7, xytext=(3, 3), textcoords='offset points')
+    ax[1, 0].set_xlabel('evaluation markout, dollars per month (k)'); ax[1, 0].set_ylabel('next-print markout, dollars per month (k)'); ax[1, 0].set_title(f'Evaluation vs trade marks, dollars by rule (Spearman {_rho:+.2f})', fontsize=10)
+    for kname, c_ in zip(TAPE_KINDS, ['#4C72B0', '#2E8B57', '#DD8452', '#8C8C8C']):
+        d_ = pd.Series(TMD[(kname, None)]).dropna()
+        if len(d_):
+            ax[1, 1].hist(d_.clip(0, CFG.rt_max_days), bins=40, histtype='step', lw=1.4, color=c_, label=f'{kname} (median {d_.median():.1f} d)')
+    ax[1, 1].set_xlabel('days from the fill to the next print'); ax[1, 1].set_title('How soon the next real trade arrives, by mark', fontsize=10); ax[1, 1].legend(fontsize=7)
+    y2 = np.arange(len(noise)); ax[1, 2].barh(y2, noise['sd of P&L per fill (bp)'], color='#937860'); ax[1, 2].set_yticks(y2); ax[1, 2].set_yticklabels([f'{i_}  (coverage {c_:.0%})' for i_, c_ in zip(noise.index, noise['coverage'])], fontsize=7); ax[1, 2].set_xlabel('sd of P&L per S fill (bp)'); ax[1, 2].set_title('The price of real information: scatter per fill by mark', fontsize=10)
+    fig.suptitle('The quote marked to the next real trade instead of the evaluation', fontsize=12); plt.tight_layout(); savefig('11c_trade_markout')
+    record('trade_markout', tape_source=TAPE_SRC, tape_prints=int(len(tape)), coverage=flat_records(cov.reset_index()), days_to_mark=flat_records(dte.reset_index()), half_spread_last=_hs_last.round(3).to_dict() if _hs_last is not None else {},
+           rerank=tr_all.round(4).reset_index().to_dict(orient='records'), spearman_vs_evaluation={'dollars': _rho, 'per_print': _rho_pp}, by_horizon=flat_records(horizon_tab.reset_index()), common_move=flat_records(common_move.reset_index()), noise=noise.round(4).reset_index().to_dict(orient='records'),
+           by_size=flat_records(trade_size.reset_index()) if len(trade_size) else [])
+else:
+    print('Section 11c skipped: needs Section 11.')
 
 # %% [markdown]
 # ### 11b. Fill probability: the desk's curve, conditioned, modelled; the edge model; the quote engine in reduced form
@@ -3268,7 +3484,7 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty:
         imp_df = pd.concat(imps, axis=1).reset_index().rename(columns={'index': 'feature'}) if imps else pd.DataFrame(columns=['feature'])
         return {'pred': pred, 'imp': imp_df}
 
-    PF = cached('pfill_models', _pfill_models, deps=[EC_FP, PF_BASE, PF_IPCA, PF_DELTAS, CFG.pfill_trees, CFG.pfill_max_train, STAGE_KEYS.get('trades_std')], code=[fit_gbm, usable_features])
+    PF = cached('pfill_models', _pfill_models, deps=[EC_FP, PF_BASE, PF_IPCA, PF_DELTAS, CFG.pfill_trees, CFG.pfill_max_train, STAGE_KEYS.get('trades_std'), f'rt:{np.nansum(BASE_RT):.6g}:{int(np.isfinite(BASE_RT).sum())}:{TAPE_SRC}'], code=[fit_gbm, usable_features])   # v4.8: the round-trip target is a dependency (its exit source changed)
     pred = PF['pred'].set_index('_id').reindex(mo['_id'].to_numpy()) if len(PF['pred']) else pd.DataFrame(index=mo['_id'].to_numpy())
     def _mat(prefix: str) -> np.ndarray:
         cols = [f'{prefix}_{d:g}' for d in PF_DELTAS]
@@ -4539,6 +4755,16 @@ if 'markout' in REGISTRY:
     _ad = pd.DataFrame(REGISTRY['markout']['adverse_selection'])
     _adf = _ad[_ad['prints'] == 'would have filled'].set_index('side')
     summary_rows.append((f'Adverse selection on would-be fills (algo quote): edge at quote | factor-implied | residual move after {_hr}d, P / S (bp)', ' / '.join(f"{_adf.loc[s_, 'edge at our quote (bp)']:+.1f} | {_adf.loc[s_, f'factor-implied, h={_hr} (bp)']:+.1f} | {_adf.loc[s_, f'residual move, h={_hr} (bp)']:+.1f}" for s_ in _adf.index)))
+if 'trade_markout' in REGISTRY and REGISTRY['trade_markout']['rerank']:
+    _tr = pd.DataFrame(REGISTRY['trade_markout']['rerank']).set_index('mid'); _sp = REGISTRY['trade_markout']['spearman_vs_evaluation']
+    summary_rows.append(('Marked to the next real print (any side, mid-equivalent): P&L per print algo | S | SQ | F | D (bp); winner; Spearman with the evaluation ranking ($ | per print)', ' | '.join(f"{_tr.loc[k_, 'P&L per print (bp)']:+.2f}" for k_ in ['A algo quote', 'S same-side EWMA', 'SQ same-side EWMA + side x size intercept', 'F side intercept + rho x own EWMA', 'D level model with error features'] if k_ in _tr.index) + f"; {_tr.index[0]} ({_tr.iloc[0]['P&L per print (bp)']:+.2f}, bar {'PASS' if bool(_tr.iloc[0]['beats S (bar)']) else 'no'}); {_sp['dollars']:+.2f} | {_sp['per_print']:+.2f}"))
+    _cv = pd.DataFrame(REGISTRY['trade_markout']['coverage']).set_index('index') if 'index' in pd.DataFrame(REGISTRY['trade_markout']['coverage']).columns else pd.DataFrame(REGISTRY['trade_markout']['coverage'])
+    _hz = pd.DataFrame(REGISTRY['trade_markout']['by_horizon']).set_index(['mid', 'mark'])
+    if ('S same-side EWMA', 'any side, mid-equivalent') in _hz.index:
+        _r = _hz.loc[('S same-side EWMA', 'any side, mid-equivalent')]
+        summary_rows.append(('S on real-trade marks by horizon: next print | 1 bd | 5 bd | 10 bd (bp per print); inter-dealer next | opposite next', ' | '.join(f"{_r[c_]:+.2f}" for c_ in ['next print', 'last print within 1 bd', 'last print within 5 bd', 'last print within 10 bd'] if c_ in _r.index) + f"; {_hz.loc[('S same-side EWMA', 'inter-dealer only'), 'next print']:+.2f} | {_hz.loc[('S same-side EWMA', 'opposite side (round trip)'), 'next print']:+.2f}"))
+    _nz = pd.DataFrame(REGISTRY['trade_markout']['noise']).set_index('mark')
+    summary_rows.append(('Noise per S fill, sd (bp): evaluation h=5 | next print any side | next inter-dealer | next opposite side', ' | '.join(f"{_nz.loc[k_, 'sd of P&L per fill (bp)']:.1f}" for k_ in ['evaluation, h = 5 (hedged)', 'next print, any side (mid-equivalent)', 'next inter-dealer print', 'next opposite-side print (round trip)'] if k_ in _nz.index)))
 if 'markout_breakdown' in REGISTRY:
     _mc = pd.DataFrame(REGISTRY['markout_breakdown']['cells']).set_index('cell')
     if len(_mc):
