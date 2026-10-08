@@ -1,6 +1,12 @@
 # %% [markdown]
 # # Muni IPCA v4 — From Fair Mid to Markout: the Factor Model as Risk Layer, the Quote Judged in Dollars
 #
+# **v5.1.** Runtime. The v47 runtime table put ten minutes on the warm run, six of them in cells that recomputed what
+# nothing had changed: the beta-space trading map (a per-bond lambda over the full print history), the Section 10
+# fold loop, the 11c tape marks, the model panel and the three residual-dynamics cells of Section 7. Those now sit
+# behind the stage cache (keys on the data fingerprints, the config and the code) and the two lambdas are vectorised.
+# No number changes; the residual-dynamics and state-space work, which is on hold, is reused across runs.
+#
 # **v5.0.** One sample, one objective, paired dollars. Section 10 selects the mid on MAE and says so; that is the
 # accuracy criterion and it stays there. The economic comparison moves to Section 12e: every engine, with and without
 # the factor model in each of its three slots (the mid, the fill curve, the value of a fill), is run on one common
@@ -320,6 +326,7 @@ PRE_REGISTERED = {
     'v43_pfill': 'fill probability P(o >= delta | x) for the S quote at delta in {-3, 0, 3, 6, 10} bp; four estimators scored by Brier and log-loss on the next month: the desk curve (side, trailing 100-day empirical CDF), a side x size x cluster cell table on prior months (shrunk), a gradient-boosted classifier on trade features, and the same with IPCA and state-space features',
     'v43_edge_model': 'expected round-trip edge of a fill at delta 0, gradient-boosted on the same two feature sets, walk-forward; scored by out-of-sample R2 and realised edge by predicted decile',
     'v43_engine_bar': 'the reduced-form engine (concession per print = argmax over the delta grid of pfill(delta | x) x (expected edge + delta)) replaces S at 0 only if its round-trip P&L per print is higher by 0.10 bp with bootstrap t > 3 and positive in 4 of 5 months',
+    'v51_cache': 'the model panel, the residual ACF, the activity buckets, the level forecaster, the Section 10 fold loop and the 11c tape marks are stage-cached on data fingerprints, config and code; a cache hit reproduces the stored result, a miss recomputes it, nothing is switched by hand',
     'v50_mae_selection': 'Section 10 selects the mid on held-out MAE against the print; the selected mid is carried into the economic comparison as one policy, not as the quote of record',
     'v50_one_objective': 'the engines are compared on one common sample (prints with every mid, every fill curve, both edge models and a raw round-trip exit) and one declared objective: realised dollar P&L per month of the raw round trip (no hedge, no evaluation); the next-print mark is the secondary objective',
     'v50_paired_dollars': 'inference on dollars is the paired daily-dollar difference against S at 0 (and against the production proxy), block-bootstrapped in 5-day blocks with the month count; the dollar bar is a positive monthly difference with bootstrap t > 3 in >= 4 of the held-out months; the per-print basis-point bar is reported beside it, never in its place',
@@ -802,7 +809,16 @@ def build_model_panel(panel: pd.DataFrame, cfg: RunConfig) -> tuple[pd.DataFrame
 
 
 t0 = time.perf_counter()
-model, CHARS = build_model_panel(raw_panel, CFG)
+RAW_FP = f'{STEP3_FP}|{len(raw_panel)}x{raw_panel.shape[1]}|{CFG.start_date}:{CFG.end_date}'
+
+
+def _model_panel() -> pd.DataFrame:
+    m_, chars_ = build_model_panel(raw_panel, CFG)
+    return m_.assign(_chars=json.dumps(list(chars_)))      # the instrument list rides along as a constant column (parquet dictionary-encodes it)
+
+
+model = cached('model_panel', _model_panel, deps=[RAW_FP, STATE_DUMMIES, TARGET], code=[build_model_panel, term_characteristics, rating_with_fallback, rank_normalize])   # v5.1: 39 s on real data
+CHARS = list(json.loads(model['_chars'].iloc[0])); model = model.drop(columns=['_chars']); model['date'] = to_ns(model['date'])   # parquet stores the date in microseconds; every merge in the notebook keys on nanoseconds
 print(f'[{CFG.spec_version}] model rows {len(model):,} | cusips {model["cusip"].nunique():,} | dates {model["date"].nunique()} | L={len(CHARS)} | {time.perf_counter()-t0:.1f}s')
 print('instruments:', CHARS)
 print('mark_unchanged share:', round(float(model['mark_unchanged'].mean()), 4), '| rating source mix:', model['rating_source'].value_counts(normalize=True).round(3).to_dict())
@@ -1305,7 +1321,7 @@ smt = sm.assign(cusip=sm['cusip'].astype('string')).merge(_tc, on='cusip', how='
 if HAS_TRADES and 'msrb_side' in trades_raw.columns:
     _sd = trades_raw[['cusip', 'msrb_side']].copy(); _sd['cusip'] = _sd['cusip'].astype('string'); _sd['side'] = _sd['msrb_side'].astype('string').str.upper().str[0]
     _sd = _sd[_sd['side'].isin(['P', 'S'])]
-    _mix = _sd.groupby('cusip', observed=True)['side'].agg(lambda x: float((x == 'P').mean())).rename('p_share')
+    _mix = (_sd['side'] == 'P').astype(float).groupby(_sd['cusip'], observed=True).mean().rename('p_share')   # v5.1: vectorised; the per-bond lambda took two minutes on the full print history
     smt = smt.merge(_mix, on='cusip', how='left')
 panels = [(c, t, k, cm) for c, t, k, cm in [('trade_size_lag', 'by trade size (decayed mean log par of the bond\'s prints)', 'num', 'viridis'),
                                              ('p_share', 'by side mix of the bond\'s prints (share that are dealer buys; 0.5 = balanced)', 'num', 'coolwarm'),
@@ -1388,16 +1404,23 @@ CELL_T('7. Residual dynamics: autocorrelation, activity buckets, the [1]')
 resid = resid.sort_values(['cusip', 'date'], kind='stable').reset_index(drop=True)
 grp = resid.groupby('cusip', observed=True)
 resid['dispersion_day'] = resid['date'].isin(DISPERSION_DAYS)
-acf_rows = []
-for lag in range(1, CFG.longconv_lags + 1):
-    lagged = grp['pit_residual'].shift(lag); lagged_rp = grp['dispersion_day'].shift(lag)
-    ok = lagged.notna()
-    x, y = lagged[ok].to_numpy(), resid.loc[ok, 'pit_residual'].to_numpy()
-    ex = ok & ~resid['dispersion_day'] & ~lagged_rp.fillna(True).astype(bool)
-    xe, ye = lagged[ex].to_numpy(), resid.loc[ex, 'pit_residual'].to_numpy()
-    acf_rows.append({'lag': lag, 'pearson': np.corrcoef(x, y)[0, 1], 'spearman': pd.Series(x).corr(pd.Series(y), method='spearman'), 'pairs': int(ok.sum()), 'bartlett_ci': 1.96 / np.sqrt(max(int(ok.sum()), 1)),
-                     'pearson_ex_dispersion': np.corrcoef(xe, ye)[0, 1] if ex.sum() > 100 else np.nan, 'spearman_ex_dispersion': pd.Series(xe).corr(pd.Series(ye), method='spearman') if ex.sum() > 100 else np.nan})
-acf = pd.DataFrame(acf_rows).set_index('lag')
+RESID_FP = frame_fingerprint(resid, ['pit_residual', 'target_bp']) + f'|{STAGE_KEYS.get("walk_forward")}|disp:{sorted(str(d) for d in DISPERSION_DAYS)}'   # v5.1: keys the Section 7 stages
+
+
+def _residual_acf() -> pd.DataFrame:
+    acf_rows = []
+    for lag in range(1, CFG.longconv_lags + 1):
+        lagged = grp['pit_residual'].shift(lag); lagged_rp = grp['dispersion_day'].shift(lag)
+        ok = lagged.notna()
+        x, y = lagged[ok].to_numpy(), resid.loc[ok, 'pit_residual'].to_numpy()
+        ex = ok & ~resid['dispersion_day'] & ~lagged_rp.fillna(True).astype(bool)
+        xe, ye = lagged[ex].to_numpy(), resid.loc[ex, 'pit_residual'].to_numpy()
+        acf_rows.append({'lag': lag, 'pearson': np.corrcoef(x, y)[0, 1], 'spearman': pd.Series(x).corr(pd.Series(y), method='spearman'), 'pairs': int(ok.sum()), 'bartlett_ci': 1.96 / np.sqrt(max(int(ok.sum()), 1)),
+                         'pearson_ex_dispersion': np.corrcoef(xe, ye)[0, 1] if ex.sum() > 100 else np.nan, 'spearman_ex_dispersion': pd.Series(xe).corr(pd.Series(ye), method='spearman') if ex.sum() > 100 else np.nan})
+    return pd.DataFrame(acf_rows)
+
+
+acf = cached('residual_acf', _residual_acf, deps=[RESID_FP]).set_index('lag')
 display(acf)
 fig, ax = plt.subplots(1, 2, figsize=(15, 4))
 ax[0].bar(acf.index - 0.2, acf['pearson'], width=0.4, label='Pearson'); ax[0].bar(acf.index + 0.2, acf['spearman'], width=0.4, label='Spearman')
@@ -1411,13 +1434,19 @@ record('residual_diagnostics', acf_pearson=acf['pearson'].round(4).to_dict(), ac
 CELL_T('7. Residual dynamics: autocorrelation, activity buckets, the [2]')
 # Point-in-time activity buckets: trailing-window volatility of the target per bond, lagged one observation,
 # ranked into quintiles within each date. Every bond-day gets a bucket (no UNKNOWN), and nothing looks ahead.
-_m = model.sort_values(['cusip', 'date'], kind='stable')
-_m['target_abs_vol'] = (_m.groupby('cusip', observed=True)[TARGET]
-                          .transform(lambda s: s.rolling(CFG.activity_window, min_periods=max(5, CFG.activity_window // 2)).std().shift(1)))
-_m['activity_bucket'] = _m.groupby('date', observed=True)['target_abs_vol'].transform(
-    lambda s: pd.qcut(s.rank(method='first'), 5, labels=[f'L{i}' for i in range(1, 6)]).astype(str) if s.notna().sum() >= 50 else pd.Series('UNKNOWN', index=s.index))
-_m.loc[_m['target_abs_vol'].isna(), 'activity_bucket'] = 'UNKNOWN'
-resid = resid.merge(_m[['cusip', 'date', 'activity_bucket', 'target_abs_vol']], on=['cusip', 'date'], how='left')
+def _activity_buckets() -> pd.DataFrame:
+    _m = model[['cusip', 'date', TARGET]].sort_values(['cusip', 'date'], kind='stable')
+    # v5.1: the trailing sd is the grouped rolling (identical values to the per-bond transform, a fraction of its time), lagged one observation within the bond
+    _roll = _m.groupby('cusip', observed=True)[TARGET].rolling(CFG.activity_window, min_periods=max(5, CFG.activity_window // 2)).std().droplevel(0).reindex(_m.index)
+    _m['target_abs_vol'] = _roll.groupby(_m['cusip'], observed=True).shift(1).to_numpy()
+    _m['activity_bucket'] = _m.groupby('date', observed=True)['target_abs_vol'].transform(
+        lambda s: pd.qcut(s.rank(method='first'), 5, labels=[f'L{i}' for i in range(1, 6)]).astype(str) if s.notna().sum() >= 50 else pd.Series('UNKNOWN', index=s.index))
+    _m.loc[_m['target_abs_vol'].isna(), 'activity_bucket'] = 'UNKNOWN'
+    return _m[['cusip', 'date', 'activity_bucket', 'target_abs_vol']].reset_index(drop=True)
+
+
+ACT = cached('activity_buckets', _activity_buckets, deps=[PANEL_FP, TARGET])
+resid = resid.merge(ACT.assign(cusip=ACT['cusip'].astype(resid['cusip'].dtype), date=to_ns(ACT['date'])), on=['cusip', 'date'], how='left')
 resid['activity_bucket'] = resid['activity_bucket'].fillna('UNKNOWN')
 print('activity bucket mix (PIT trailing vol):', resid['activity_bucket'].value_counts(normalize=True).round(3).to_dict())
 resid['next_residual'] = resid.groupby('cusip', observed=True)['pit_residual'].shift(-1)
@@ -1437,11 +1466,15 @@ def ic_summary(ic: pd.Series) -> dict:
     return {'ic_mean': float(ic.mean()), 'ic_t': float(np.sqrt(ic.notna().sum()) * ic.mean() / ic.std()) if ic.std() > 0 else np.nan, 'dates': int(ic.notna().sum())}
 
 
-bucket_rows = []
-for b, g in pairs.groupby('activity_bucket', sort=True):
-    s = ic_summary(daily_rank_ic(g, 'pit_residual', 'next_residual'))
-    bucket_rows.append({'activity_bucket': b, 'rows': len(g), 'cusips': g['cusip'].nunique(), 'median_vol_bp': g['target_abs_vol'].median(), **s})
-bucket_ic = pd.DataFrame(bucket_rows).set_index('activity_bucket')
+def _bucket_ic() -> pd.DataFrame:
+    bucket_rows = []
+    for b, g in pairs.groupby('activity_bucket', sort=True):
+        s_ = ic_summary(daily_rank_ic(g, 'pit_residual', 'next_residual'))
+        bucket_rows.append({'activity_bucket': b, 'rows': len(g), 'cusips': g['cusip'].nunique(), 'median_vol_bp': g['target_abs_vol'].median(), **s_})
+    return pd.DataFrame(bucket_rows)
+
+
+bucket_ic = cached('bucket_ic', _bucket_ic, deps=[RESID_FP, STAGE_KEYS.get('activity_buckets')], code=[daily_rank_ic, ic_summary]).set_index('activity_bucket')
 display(bucket_ic)
 from scipy import stats  # noqa: E402
 
@@ -1460,8 +1493,9 @@ L = CFG.longconv_lags   # kept as the number of lags shown in the ACF and the im
 # Level signal: trailing mean of the residual (the bond's accumulated deviation from factor-implied fair value).
 # The flat rank autocorrelation out to lag 10 says this per-bond mean, not yesterday's increment, carries the information.
 W = CFG.level_signal_window
-resid['resid_mean'] = grp['pit_residual'].transform(lambda s: s.rolling(W, min_periods=max(5, W // 4)).mean())
-resid['resid_sd'] = grp['pit_residual'].transform(lambda s: s.rolling(W, min_periods=max(5, W // 4)).std())
+_gr = resid.groupby('cusip', observed=True)['pit_residual'].rolling(W, min_periods=max(5, W // 4))   # v5.1: grouped rolling on the current frame (same values as the per-bond transform)
+resid['resid_mean'] = _gr.mean().droplevel(0).reindex(resid.index).to_numpy()
+resid['resid_sd'] = _gr.std().droplevel(0).reindex(resid.index).to_numpy()
 pairs = resid.dropna(subset=['next_residual']).copy()
 pairs['target_month'] = pairs['next_date'].dt.to_period('M')
 months = sorted(pairs['target_month'].unique())
@@ -1510,13 +1544,20 @@ def forecaster_eval(name: str, cols: list[str], winsor: bool, alpha: float = 1.0
 
 from scipy.optimize import minimize  # noqa: E402
 
-fc_results, fc_preds, fc_coefs = [], {}, {}
 FC_SPECS = [(f'Trailing-{W} mean (level signal)', ['resid_mean'], True, None)]
-for name, cols, winsor, fitter in FC_SPECS:
-    t0 = time.perf_counter()
-    pred, summ, coefs = forecaster_eval(name, cols, winsor, fitter=fitter)
-    fc_results.append(summ); fc_preds[name] = pred; fc_coefs[name] = coefs
-    print(f'{name}: {time.perf_counter()-t0:.1f}s', '' if 'params' not in summ else summ['params'])
+
+
+def _level_forecaster() -> tuple[list, dict, dict]:
+    res_, preds_, coefs_ = [], {}, {}
+    for name, cols, winsor, fitter in FC_SPECS:
+        t0 = time.perf_counter()
+        pred, summ, coefs = forecaster_eval(name, cols, winsor, fitter=fitter)
+        res_.append(summ); preds_[name] = pred; coefs_[name] = coefs
+        print(f'{name}: {time.perf_counter()-t0:.1f}s', '' if 'params' not in summ else summ['params'])
+    return res_, preds_, coefs_
+
+
+fc_results, fc_preds, fc_coefs = cached('level_forecaster', _level_forecaster, deps=[RESID_FP, STAGE_KEYS.get('activity_buckets'), W, repr(FC_SPECS)], code=[forecaster_eval, summarise_forecast, fit_ridge, daily_rank_ic, ic_summary])   # v5.1
 
 # %% [markdown]
 # ### 7b. The signal of record: state-space filter, AR drift plus mark-noise
@@ -2547,110 +2588,115 @@ if HAS_TRADES and not tv.empty and 'cum_fitted_bp' in tv.columns:
     KF_BY_MONTH = {m: g.set_index('_id') for m, g in KFM.groupby('month')} if len(KFM) else {}
 
     # ---- the fold loop: S and K coefficients on prior months, every mid on the test month
-    parts, rho_rows = [], []; BIAS_PATH = {}
-    for m in MONTHS_EC[1:]:
-        tr, te = ec[ec['month'] < m], ec[ec['month'] == m].copy()
-        if len(tr) < 5_000 or te.empty:
-            continue
-        trh = tr[tr['has_err']]
-        rho_ewm = fm_slope(trh.dropna(subset=['ewm_algo_err_bp']), 'e_algo_bp', 'ewm_algo_err_bp', ['log_size'])['fm_beta']
-        te['e_C_bp'] = te['e_algo_bp'] - (rho_ewm * te['ewm_algo_err_bp']).fillna(0.0)
-        _ts = trh.dropna(subset=['ewm_side_err_bp'])
-        rho_s = fm_slope(_ts, 'e_algo_bp', 'ewm_side_err_bp', ['log_size'])['fm_beta'] if len(_ts) >= 2_000 else rho_ewm
-        te['e_S_bp'] = te['e_algo_bp'] - np.where(te['ewm_side_err_bp'].notna(), rho_s * te['ewm_side_err_bp'].fillna(0.0), rho_ewm * te['ewm_algo_err_bp'].fillna(0.0))
-        row = {'month': str(m), 'rho_pooled': rho_ewm, 'rho_same_side': rho_s}
-        # ---- v3.9 interaction ladder: the same-side memory with a persistence coefficient conditioned on the factor
-        #      model's coordinates and on trade/microstructure state. Every coefficient on prior months; the fallback
-        #      where a group is thin or a bond has no same-side history is S itself.
-        trs_ = trh.dropna(subset=['ewm_side_err_bp'])
-        _base_S = te['e_S_bp'].to_numpy()
+    def _fold_loop() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+        # v5.1: every mid on every test month, with its coefficients on the prior months; cached on the trade frame, the level and memory stages and the code
+        parts, rho_rows = [], []; BIAS_PATH = {}
+        for m in MONTHS_EC[1:]:
+            tr, te = ec[ec['month'] < m], ec[ec['month'] == m].copy()
+            if len(tr) < 5_000 or te.empty:
+                continue
+            trh = tr[tr['has_err']]
+            rho_ewm = fm_slope(trh.dropna(subset=['ewm_algo_err_bp']), 'e_algo_bp', 'ewm_algo_err_bp', ['log_size'])['fm_beta']
+            te['e_C_bp'] = te['e_algo_bp'] - (rho_ewm * te['ewm_algo_err_bp']).fillna(0.0)
+            _ts = trh.dropna(subset=['ewm_side_err_bp'])
+            rho_s = fm_slope(_ts, 'e_algo_bp', 'ewm_side_err_bp', ['log_size'])['fm_beta'] if len(_ts) >= 2_000 else rho_ewm
+            te['e_S_bp'] = te['e_algo_bp'] - np.where(te['ewm_side_err_bp'].notna(), rho_s * te['ewm_side_err_bp'].fillna(0.0), rho_ewm * te['ewm_algo_err_bp'].fillna(0.0))
+            row = {'month': str(m), 'rho_pooled': rho_ewm, 'rho_same_side': rho_s}
+            # ---- v3.9 interaction ladder: the same-side memory with a persistence coefficient conditioned on the factor
+            #      model's coordinates and on trade/microstructure state. Every coefficient on prior months; the fallback
+            #      where a group is thin or a bond has no same-side history is S itself.
+            trs_ = trh.dropna(subset=['ewm_side_err_bp'])
+            _base_S = te['e_S_bp'].to_numpy()
 
-        def apply_rho(rho_te) -> np.ndarray:
-            r = np.asarray(rho_te, float)
-            return np.where(te['ewm_side_err_bp'].notna(), te['e_algo_bp'] - r * te['ewm_side_err_bp'].fillna(0.0), _base_S)
+            def apply_rho(rho_te) -> np.ndarray:
+                r = np.asarray(rho_te, float)
+                return np.where(te['ewm_side_err_bp'].notna(), te['e_algo_bp'] - r * te['ewm_side_err_bp'].fillna(0.0), _base_S)
 
-        def rho_by_group(gcol: str, min_rows: int = 2_000):
-            rho = {}
-            for g_, gg in trs_.groupby(gcol, observed=True):
-                if len(gg) >= min_rows:
-                    v = fm_slope(gg, 'e_algo_bp', 'ewm_side_err_bp', ['log_size'])['fm_beta']
-                    if np.isfinite(v):
-                        rho[g_] = float(v)
-            return te[gcol].map(rho).astype(float).fillna(rho_s).to_numpy(), rho
+            def rho_by_group(gcol: str, min_rows: int = 2_000):
+                rho = {}
+                for g_, gg in trs_.groupby(gcol, observed=True):
+                    if len(gg) >= min_rows:
+                        v = fm_slope(gg, 'e_algo_bp', 'ewm_side_err_bp', ['log_size'])['fm_beta']
+                        if np.isfinite(v):
+                            rho[g_] = float(v)
+                return te[gcol].map(rho).astype(float).fillna(rho_s).to_numpy(), rho
 
-        def rho_interaction(cont_cols: list[str]):
-            X = ['ewm_side_err_bp'] + [f'_x_{c}' for c in cont_cols]
-            trx = trs_.copy(); tex = te.copy()
-            for c in cont_cols:
-                trx[f'_x_{c}'] = trx['ewm_side_err_bp'] * trx[c].astype(float).fillna(0.0); tex[f'_x_{c}'] = tex['ewm_side_err_bp'] * tex[c].astype(float).fillna(0.0)
-            if len(trx) < 5_000:
-                return np.full(len(te), rho_s), {}
-            b = fm_multi(trx, 'e_algo_bp', X, ['log_size']).set_index('score')['fm_beta']
-            r = b['ewm_side_err_bp'] + sum(b[f'_x_{c}'] * tex[c].astype(float).fillna(0.0) for c in cont_cols)
-            return np.where(np.isfinite(r), r, rho_s), b.to_dict()
+            def rho_interaction(cont_cols: list[str]):
+                X = ['ewm_side_err_bp'] + [f'_x_{c}' for c in cont_cols]
+                trx = trs_.copy(); tex = te.copy()
+                for c in cont_cols:
+                    trx[f'_x_{c}'] = trx['ewm_side_err_bp'] * trx[c].astype(float).fillna(0.0); tex[f'_x_{c}'] = tex['ewm_side_err_bp'] * tex[c].astype(float).fillna(0.0)
+                if len(trx) < 5_000:
+                    return np.full(len(te), rho_s), {}
+                b = fm_multi(trx, 'e_algo_bp', X, ['log_size']).set_index('score')['fm_beta']
+                r = b['ewm_side_err_bp'] + sum(b[f'_x_{c}'] * tex[c].astype(float).fillna(0.0) for c in cont_cols)
+                return np.where(np.isfinite(r), r, rho_s), b.to_dict()
 
-        r_b, b_beta = rho_interaction(beta_cols); te['e_Sb_bp'] = apply_rho(r_b); row.update({f'Sb_{k}': v for k, v in b_beta.items()})
-        r_c, rho_c = rho_by_group('beta_cluster'); te['e_Sc_bp'] = apply_rho(r_c); row.update({f'Sc_{k}': v for k, v in rho_c.items()})
-        if ec['abs_m'].notna().any():
-            r_m, b_m = rho_interaction(['abs_m']); te['e_Sm_bp'] = apply_rho(r_m); row.update({f'Sm_{k}': v for k, v in b_m.items()})
-        else:
-            te['e_Sm_bp'] = _base_S
-        r_a, rho_a = rho_by_group('side_age_bucket'); te['e_Sa_bp'] = apply_rho(r_a); row.update({f'Sa_{k}': v for k, v in rho_a.items()})
-        r_q, rho_q = rho_by_group('qty_group'); te['e_Sq_bp'] = apply_rho(r_q); row.update({f'Sq_{k}': v for k, v in rho_q.items()})
-        r_sc, rho_sc = rho_by_group('side_cluster'); te['e_Ssc_bp'] = apply_rho(r_sc)
-        if 'industry_bucket' in te.columns and te['industry_bucket'].notna().any():
-            r_i, rho_i = rho_by_group('industry_bucket'); te['e_Si_bp'] = apply_rho(r_i); row.update({f'Si_{k}': v for k, v in rho_i.items()})
-        else:
-            te['e_Si_bp'] = _base_S
-        kf = KF_BY_MONTH.get(str(m))
-        if kf is not None:
-            te['kf_pred_bp'] = kf['kf_pred_bp'].reindex(te['_id']).to_numpy(); trk = tr.assign(kf_pred_bp=kf['kf_pred_bp'].reindex(tr['_id']).to_numpy()).dropna(subset=['kf_pred_bp'])
-            rho_k = fm_slope(trk, 'e_algo_bp', 'kf_pred_bp', ['log_size'])['fm_beta'] if len(trk) >= 2_000 else 1.0
-            rho_k = float(rho_k) if np.isfinite(rho_k) else 1.0
-            te['e_K_bp'] = np.where(te['kf_pred_bp'].notna(), te['e_algo_bp'] - rho_k * te['kf_pred_bp'].fillna(0.0), te['e_S_bp'])
-            row.update({'rho_K': rho_k, 'kf_phi_daily': float(kf['phi_daily'].iloc[0]), 'kf_half_life_days': float(np.log(0.5) / np.log(kf['phi_daily'].iloc[0])) if kf['phi_daily'].iloc[0] < 1 else np.inf, 'kf_q': float(kf['q'].iloc[0]), 'kf_r': float(kf['r'].iloc[0])})
-        else:
-            te['e_K_bp'] = te['e_S_bp']
-        # ---- v4.0: legacy trials re-opened for the markout re-ranking (closed on MAE in v3.6)
-        rho_age = {b: fm_slope(g, 'e_algo_bp', 'last_algo_err_bp', ['log_size'])['fm_beta'] for b, g in trh.groupby('age_bucket') if len(g) >= 500}
-        te['e_B_bp'] = te['e_algo_bp'] - (te['age_bucket'].map(rho_age).astype(float) * te['last_algo_err_bp']).fillna(0.0)
-        side_med = tr.groupby('side')['e_algo_bp'].median(); te['side_bias'] = te['side'].map(side_med).fillna(0.0)
-        te['e_E_bp'] = te['e_algo_bp'] - te['side_bias']
-        trs2 = trh.assign(e_sd=trh['e_algo_bp'] - trh['side'].map(side_med).fillna(0.0)).dropna(subset=['ewm_algo_err_bp'])
-        rho_F = fm_slope(trs2, 'e_sd', 'ewm_algo_err_bp', ['log_size'])['fm_beta'] if len(trs2) >= 2_000 else rho_ewm
-        te['e_F_bp'] = te['e_E_bp'] - (rho_F * te['ewm_algo_err_bp']).fillna(0.0)
-        trb = tr.dropna(subset=beta_cols)
-        bG = fm_multi(trb, 'e_algo_bp', beta_cols, ['log_size']).set_index('score')['fm_beta'].reindex(beta_cols).fillna(0.0)
-        aG = float((trb['e_algo_bp'] - trb[beta_cols].to_numpy(float) @ bG.to_numpy(float)).mean())
-        te['e_G_bp'] = te['e_algo_bp'] - (aG + te[beta_cols].fillna(0.0).to_numpy(float) @ bG.to_numpy(float))
-        row.update({'rho_F': rho_F, 'side_bias_P': float(side_med.get('P', np.nan)), 'side_bias_S': float(side_med.get('S', np.nan)), 'side_bias_D': float(side_med.get('D', np.nan))})
+            r_b, b_beta = rho_interaction(beta_cols); te['e_Sb_bp'] = apply_rho(r_b); row.update({f'Sb_{k}': v for k, v in b_beta.items()})
+            r_c, rho_c = rho_by_group('beta_cluster'); te['e_Sc_bp'] = apply_rho(r_c); row.update({f'Sc_{k}': v for k, v in rho_c.items()})
+            if ec['abs_m'].notna().any():
+                r_m, b_m = rho_interaction(['abs_m']); te['e_Sm_bp'] = apply_rho(r_m); row.update({f'Sm_{k}': v for k, v in b_m.items()})
+            else:
+                te['e_Sm_bp'] = _base_S
+            r_a, rho_a = rho_by_group('side_age_bucket'); te['e_Sa_bp'] = apply_rho(r_a); row.update({f'Sa_{k}': v for k, v in rho_a.items()})
+            r_q, rho_q = rho_by_group('qty_group'); te['e_Sq_bp'] = apply_rho(r_q); row.update({f'Sq_{k}': v for k, v in rho_q.items()})
+            r_sc, rho_sc = rho_by_group('side_cluster'); te['e_Ssc_bp'] = apply_rho(r_sc)
+            if 'industry_bucket' in te.columns and te['industry_bucket'].notna().any():
+                r_i, rho_i = rho_by_group('industry_bucket'); te['e_Si_bp'] = apply_rho(r_i); row.update({f'Si_{k}': v for k, v in rho_i.items()})
+            else:
+                te['e_Si_bp'] = _base_S
+            kf = KF_BY_MONTH.get(str(m))
+            if kf is not None:
+                te['kf_pred_bp'] = kf['kf_pred_bp'].reindex(te['_id']).to_numpy(); trk = tr.assign(kf_pred_bp=kf['kf_pred_bp'].reindex(tr['_id']).to_numpy()).dropna(subset=['kf_pred_bp'])
+                rho_k = fm_slope(trk, 'e_algo_bp', 'kf_pred_bp', ['log_size'])['fm_beta'] if len(trk) >= 2_000 else 1.0
+                rho_k = float(rho_k) if np.isfinite(rho_k) else 1.0
+                te['e_K_bp'] = np.where(te['kf_pred_bp'].notna(), te['e_algo_bp'] - rho_k * te['kf_pred_bp'].fillna(0.0), te['e_S_bp'])
+                row.update({'rho_K': rho_k, 'kf_phi_daily': float(kf['phi_daily'].iloc[0]), 'kf_half_life_days': float(np.log(0.5) / np.log(kf['phi_daily'].iloc[0])) if kf['phi_daily'].iloc[0] < 1 else np.inf, 'kf_q': float(kf['q'].iloc[0]), 'kf_r': float(kf['r'].iloc[0])})
+            else:
+                te['e_K_bp'] = te['e_S_bp']
+            # ---- v4.0: legacy trials re-opened for the markout re-ranking (closed on MAE in v3.6)
+            rho_age = {b: fm_slope(g, 'e_algo_bp', 'last_algo_err_bp', ['log_size'])['fm_beta'] for b, g in trh.groupby('age_bucket') if len(g) >= 500}
+            te['e_B_bp'] = te['e_algo_bp'] - (te['age_bucket'].map(rho_age).astype(float) * te['last_algo_err_bp']).fillna(0.0)
+            side_med = tr.groupby('side')['e_algo_bp'].median(); te['side_bias'] = te['side'].map(side_med).fillna(0.0)
+            te['e_E_bp'] = te['e_algo_bp'] - te['side_bias']
+            trs2 = trh.assign(e_sd=trh['e_algo_bp'] - trh['side'].map(side_med).fillna(0.0)).dropna(subset=['ewm_algo_err_bp'])
+            rho_F = fm_slope(trs2, 'e_sd', 'ewm_algo_err_bp', ['log_size'])['fm_beta'] if len(trs2) >= 2_000 else rho_ewm
+            te['e_F_bp'] = te['e_E_bp'] - (rho_F * te['ewm_algo_err_bp']).fillna(0.0)
+            trb = tr.dropna(subset=beta_cols)
+            bG = fm_multi(trb, 'e_algo_bp', beta_cols, ['log_size']).set_index('score')['fm_beta'].reindex(beta_cols).fillna(0.0)
+            aG = float((trb['e_algo_bp'] - trb[beta_cols].to_numpy(float) @ bG.to_numpy(float)).mean())
+            te['e_G_bp'] = te['e_algo_bp'] - (aG + te[beta_cols].fillna(0.0).to_numpy(float) @ bG.to_numpy(float))
+            row.update({'rho_F': rho_F, 'side_bias_P': float(side_med.get('P', np.nan)), 'side_bias_S': float(side_med.get('S', np.nan)), 'side_bias_D': float(side_med.get('D', np.nan))})
 
-        # ---- v4.0: side x size intercepts. The v51 EDA found the algo's error falls monotonically with trade size on the
-        #      bid (+8 bp on odd lots to -2 bp on blocks): a level effect per side and size that no persistence rule can
-        #      carry. The intercept is the Fama-MacBeth daily mean of the error by (side, quantity bin) on prior months,
-        #      shrunk to the side median with weight n / (n + cell_min_trades). AQ puts it on the algo quote; SQ puts it on
-        #      the same-side memory, estimated on the error S leaves on the training months.
-        def cell_intercept(frame: pd.DataFrame, col: str) -> pd.Series:
-            # v4.1: medians. The v4.0 mean over-shifted the offer (mean -5.9 bp against a median of -0.4 bp): the fill-relevant
-            # location of the error is its median, which is also the tau = 0.5 row of the Section 12 grid.
-            g = frame.groupby(['side', 'qty_group'], observed=True)[col]
-            cell = g.median(); n_cell = g.size().reindex(cell.index).fillna(0.0)
-            side_m = frame.groupby('side', observed=True)[col].median()
-            w = n_cell / (n_cell + CFG.cell_min_trades)
-            return (w * cell + (1.0 - w) * pd.Series(cell.index.get_level_values(0).map(side_m).to_numpy(), index=cell.index)).rename('bias')
+            # ---- v4.0: side x size intercepts. The v51 EDA found the algo's error falls monotonically with trade size on the
+            #      bid (+8 bp on odd lots to -2 bp on blocks): a level effect per side and size that no persistence rule can
+            #      carry. The intercept is the Fama-MacBeth daily mean of the error by (side, quantity bin) on prior months,
+            #      shrunk to the side median with weight n / (n + cell_min_trades). AQ puts it on the algo quote; SQ puts it on
+            #      the same-side memory, estimated on the error S leaves on the training months.
+            def cell_intercept(frame: pd.DataFrame, col: str) -> pd.Series:
+                # v4.1: medians. The v4.0 mean over-shifted the offer (mean -5.9 bp against a median of -0.4 bp): the fill-relevant
+                # location of the error is its median, which is also the tau = 0.5 row of the Section 12 grid.
+                g = frame.groupby(['side', 'qty_group'], observed=True)[col]
+                cell = g.median(); n_cell = g.size().reindex(cell.index).fillna(0.0)
+                side_m = frame.groupby('side', observed=True)[col].median()
+                w = n_cell / (n_cell + CFG.cell_min_trades)
+                return (w * cell + (1.0 - w) * pd.Series(cell.index.get_level_values(0).map(side_m).to_numpy(), index=cell.index)).rename('bias')
 
-        _key_te = pd.MultiIndex.from_arrays([te['side'].astype(str).to_numpy(), te['qty_group'].astype(str).to_numpy()])
-        bias_A = cell_intercept(tr, 'e_algo_bp')
-        te['e_AQ_bp'] = te['e_algo_bp'] - pd.Series(bias_A.reindex(_key_te).to_numpy(), index=te.index).fillna(te['side_bias'])
-        tr_S = tr.assign(e_S_tr=tr['e_algo_bp'] - np.where(tr['ewm_side_err_bp'].notna(), rho_s * tr['ewm_side_err_bp'].fillna(0.0), rho_ewm * tr['ewm_algo_err_bp'].fillna(0.0)))
-        bias_S = cell_intercept(tr_S, 'e_S_tr')
-        te['e_SQ_bp'] = te['e_S_bp'] - pd.Series(bias_S.reindex(_key_te).to_numpy(), index=te.index).fillna(0.0)
-        BIAS_PATH[str(m)] = {'A': bias_A, 'S': bias_S}
-        lp = lvl_pred.reindex(te['_id'])
-        te['e_D_bp'] = te['spread_bp'] - lp['yD'].to_numpy(); te['e_Dminus_bp'] = te['spread_bp'] - lp['yDm'].to_numpy(); te['y_mid_D'] = te['MmdYld'] + lp['yD'].to_numpy() / 100.0
-        rho_rows.append(row); parts.append(te)
-        print(f'  {m}: train {len(tr):,} | test {len(te):,} | rho pooled {rho_ewm:+.2f} | rho same-side {rho_s:+.2f}' + (f' | rho_K {row["rho_K"]:+.2f}' if 'rho_K' in row else ''))
-    ecp = pd.concat(parts, ignore_index=True); rho_path = pd.DataFrame(rho_rows).set_index('month')
+            _key_te = pd.MultiIndex.from_arrays([te['side'].astype(str).to_numpy(), te['qty_group'].astype(str).to_numpy()])
+            bias_A = cell_intercept(tr, 'e_algo_bp')
+            te['e_AQ_bp'] = te['e_algo_bp'] - pd.Series(bias_A.reindex(_key_te).to_numpy(), index=te.index).fillna(te['side_bias'])
+            tr_S = tr.assign(e_S_tr=tr['e_algo_bp'] - np.where(tr['ewm_side_err_bp'].notna(), rho_s * tr['ewm_side_err_bp'].fillna(0.0), rho_ewm * tr['ewm_algo_err_bp'].fillna(0.0)))
+            bias_S = cell_intercept(tr_S, 'e_S_tr')
+            te['e_SQ_bp'] = te['e_S_bp'] - pd.Series(bias_S.reindex(_key_te).to_numpy(), index=te.index).fillna(0.0)
+            BIAS_PATH[str(m)] = {'A': bias_A, 'S': bias_S}
+            lp = lvl_pred.reindex(te['_id'])
+            te['e_D_bp'] = te['spread_bp'] - lp['yD'].to_numpy(); te['e_Dminus_bp'] = te['spread_bp'] - lp['yDm'].to_numpy(); te['y_mid_D'] = te['MmdYld'] + lp['yD'].to_numpy() / 100.0
+            rho_rows.append(row); parts.append(te)
+            print(f'  {m}: train {len(tr):,} | test {len(te):,} | rho pooled {rho_ewm:+.2f} | rho same-side {rho_s:+.2f}' + (f' | rho_K {row["rho_K"]:+.2f}' if 'rho_K' in row else ''))
+        return pd.concat(parts, ignore_index=True), pd.DataFrame(rho_rows), BIAS_PATH
+
+    ecp, rho_path, BIAS_PATH = cached('fold_loop', _fold_loop, deps=[EC_FP, STAGE_KEYS.get('level_models'), STAGE_KEYS.get('side_state_space_memory'), STAGE_KEYS.get('beta_space_embedding'), repr(beta_cols), repr([str(m) for m in MONTHS_EC])], code=[fm_slope, fm_multi, block_bootstrap_t, qty_group])
+    rho_path = rho_path.set_index('month')
     for c in ['e_D_bp', 'e_Dminus_bp']:
         ecp[c] = ecp[c].fillna(ecp['e_algo_bp'])
     print('Error-correction coefficients and state-space parameters by month (estimated on prior months):'); display(rho_path.round(3))
@@ -3228,10 +3274,13 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'tape' in globals():
         days = ((j['mark_ts'] - pd.Series(_qm.set_index('_id')['trade_ts']).reindex(mo['_id'].to_numpy())).dt.total_seconds() / 86400.0).to_numpy(float)
         return S_ARR * 100.0 * (Y_PRINT - y_mark), days
 
-    TM, TMD = {}, {}
-    for kname, kind in TAPE_KINDS.items():
-        for h in TAPE_H:
-            TM[(kname, h)], TMD[(kname, h)] = mark_tape(kind, h)
+    def _trade_marks() -> dict:
+        return {(kname, h): mark_tape(kind, h) for kname, kind in TAPE_KINDS.items() for h in TAPE_H}
+
+    TAPE_FP = frame_fingerprint(tape, ['y', 'q']) + f'|{TAPE_SRC}|{tape["ts"].min()}:{tape["ts"].max()}'
+    MO_FP = frame_fingerprint(mo, ['msrb_yield', 'par', 'e_S_bp']) + f'|{EC_FP}'
+    _tm = cached('trade_marks', _trade_marks, deps=[TAPE_FP, MO_FP, repr(TAPE_H), repr(TAPE_KINDS)], code=[mark_tape, half_spread_for, qty_group])   # v5.1: sixteen merge_asof passes over the tape, 58 s on real data
+    TM = {k: v[0] for k, v in _tm.items()}; TMD = {k: v[1] for k, v in _tm.items()}
     _hl = lambda h: 'next print' if h is None else f'last print within {h} bd'
     cov = pd.DataFrame({_hl(h): {kname: float(np.isfinite(TM[(kname, h)]).mean()) for kname in TAPE_KINDS} for h in TAPE_H})
     dte = pd.DataFrame({_hl(h): {kname: float(np.nanmedian(TMD[(kname, h)])) for kname in TAPE_KINDS} for h in TAPE_H})
