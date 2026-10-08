@@ -82,7 +82,7 @@ class Config:
     dh_env: str = 'FICC'
     dh_heap_gb: int = 16
     pit_ratings: bool = True             # rating as of partition end instead of latest
-    sources: tuple[str, ...] = ('panel', 'closing_marks', 'msrb', 'algosignal_msrb', 'track_static', 'track_charges')
+    sources: tuple[str, ...] = ('panel', 'closing_marks', 'msrb', 'algosignal_msrb', 'track_static', 'track_charges', 'track_rfq')
 
     # OneTick
     ot_context: str = 'MUNI_PROD'
@@ -390,6 +390,14 @@ else:
     mdp_track_charges_part = _mdp_track.view(_mdp_ckeep)
 """
 
+DH_TRACK_RFQ_PARTITION = r"""
+# ---- track_rfq partition {key}: [{a}, {b}) -- every column of muni_algo_trade_track (the RFQ log: production optimal yield, pfill key, pfill, charges, print) ----
+if mdp_track_has_date:
+    mdp_track_rfq_part = _mdp_track.where(['date >= `{a}`', 'date < `{b}`'])
+else:
+    mdp_track_rfq_part = _mdp_track
+"""
+
 DH_ALGOSIGNAL_PARTITION = r"""
 # ---- algosignal partition {key}: [{a}, {b}) ----
 _mdp_s = db.historical_table('muni_offline', 'algosignal_msrb_match').where(['date >= `{a}`', 'date < `{b}`'])
@@ -447,6 +455,8 @@ class DeephavenClient:
             script, name = DH_ALGOSIGNAL_PARTITION.format(key=part.key, a=part.start_str, b=part.end_str, want=ALGOSIGNAL_WANT), 'mdp_algosignal_part'
         elif source == 'track_static':
             script, name = DH_TRACK_STATIC_PARTITION.format(want=TRACK_STATIC_WANT), 'mdp_track_static_part'
+        elif source == 'track_rfq':
+            script, name = DH_TRACK_RFQ_PARTITION.format(key=part.key, a=part.start_str, b=part.end_str), 'mdp_track_rfq_part'
         elif source == 'track_charges':
             script, name = DH_TRACK_CHARGES_PARTITION.format(key=part.key, a=part.start_str, b=part.end_str, keys=TRACK_CHARGE_KEYS), 'mdp_track_charges_part'
         else:
@@ -524,7 +534,19 @@ def normalize_track_charges(table: pa.Table) -> pd.DataFrame:
     return df.drop_duplicates().reset_index(drop=True)
 
 
-NORMALIZERS = {'panel': normalize_panel, 'msrb': normalize_msrb, 'algosignal_msrb': normalize_algosignal, 'track_static': normalize_track_static, 'track_charges': normalize_track_charges}
+def normalize_track_rfq(table: pa.Table) -> pd.DataFrame:
+    """The full RFQ log: datetimes made naive, cusip as string, everything else left as pulled (the notebook detects the columns it needs)."""
+    df = table.to_pandas(self_destruct=True)
+    df.columns = [str(c) for c in df.columns]
+    for col in df.columns:
+        if str(df[col].dtype).startswith('datetime'):
+            df[col] = _to_naive_datetime(df[col])
+    if 'cusip' in df.columns:
+        df['cusip'] = df['cusip'].astype('string')
+    return df.drop_duplicates().reset_index(drop=True)
+
+
+NORMALIZERS = {'panel': normalize_panel, 'msrb': normalize_msrb, 'algosignal_msrb': normalize_algosignal, 'track_static': normalize_track_static, 'track_charges': normalize_track_charges, 'track_rfq': normalize_track_rfq}
 
 
 def pull_deephaven(cfg: Config, sources: Sequence[str], force: bool = False, dry_run: bool = False) -> dict[str, Any]:

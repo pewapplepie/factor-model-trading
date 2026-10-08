@@ -1,6 +1,18 @@
 # %% [markdown]
 # # Muni IPCA v4 — From Fair Mid to Markout: the Factor Model as Risk Layer, the Quote Judged in Dollars
 #
+# **v4.6.** The production ledger. The RFQ log (`muni_algo_trade_track`) carries what production actually did on
+# every bid-side request: its optimal yield from the optimizer with the production fill curve, the pfill key it
+# pooled on and the pfill it assigned, the charges, and the print if the request traded. Section 12d reads it as
+# the ground truth the replica of 12c could only approximate: production's concession distribution, the
+# calibration of its pooled fill curve by key and by key component, a like-for-like test of the grouping (the
+# production key rebuilt, the beta-space cluster in its place, the cluster shifted by the bond's residual deviance
+# against its peers, and the gradient-boosted model), all scored at production's own quote on the requests it
+# received; then production's quote against the algo mid, S, SQ and the engine on the same requests (win rate,
+# cover, P&L), and a production proxy for the universe built from production's own concessions by key. The
+# concession grid widens to -8 bp (the replica sat on the -3 bp floor in the v45 run) and the fill models gain
+# knots at -8 and -5 bp. Charge detection is numeric-only.
+#
 # **v4.5.** The objective test of Section 12c is read the way the desk reads it: **win rate by side** (the share of
 # bid and of offer prints the quote at $x^*$ would have won), **distance to the print** (how far the quote sat from
 # the MSRB level, the cover: on wins the bp given up through the print, on misses the bp short of it), and P&L, for
@@ -87,7 +99,7 @@
 # 9. Transaction join (PIT-safe) and mark quality; 9b trade size and side; 9c where prints sit relative to our quote and to the evaluation
 # 10. Quote rules: the same-side memory, the interaction ladder, the re-opened legacy trials, the side x size intercepts, the level model; the direction-aware view
 # 11. Markout: would-have-filled P&L, edge and adverse selection, fill and P&L curves, the re-ranking in dollars, the cell-optimal concession, the realised round trip; 11b fill probability (the desk's curve, conditioned, modelled), the edge model, the quote engine in reduced form
-# 12. Quantile grid: the conditional distribution of the oriented error for the optimizer, with its calibration; 12b the residual side: forecast as concession modifier, mark noise as width scalar; 12c the production objective pfill(x) x (x + charge), rebuilt and tested piece by piece against expected P&L; win rate, cover distance and P&L by side and by characteristic
+# 12. Quantile grid: the conditional distribution of the oriented error for the optimizer, with its calibration; 12b the residual side: forecast as concession modifier, mark noise as width scalar; 12c the production objective pfill(x) x (x + charge), rebuilt and tested piece by piece against expected P&L; win rate, cover distance and P&L by side and by characteristic; 12d the production ledger: the RFQs we received, production's quote, pfill and key; the grouping test; the production proxy for the universe
 # 13. Where the P&L lives: markout by characteristic, factor beta, cluster, side and size; the side heatmaps; the cells that carry the dollars
 # 14. Results registry and summary
 # 15. Robustness
@@ -220,7 +232,7 @@ class RunConfig:
     width_scalar_bar: float = 0.01                       # the mark-noise width scalar replaces the pooled grid if the tail calibration error falls by this much on both sides
     # v4.3 fill probability and the reduced-form quote engine
     pfill_window_days: int = 100                         # the desk's curve: trailing window of the empirical CDF of the basis, by side
-    pfill_deltas: tuple[float, ...] = (-3.0, 0.0, 3.0, 6.0, 10.0)   # concessions at which fill probability is modelled and scored
+    pfill_deltas: tuple[float, ...] = (-8.0, -5.0, -3.0, 0.0, 3.0, 6.0, 10.0)   # concessions at which fill probability is modelled and scored (v4.6: knots at -8 and -5 so the objective grid can reach production's range)
     pfill_trees: int = 150                               # gradient-boosted fill and edge models per fold
     pfill_max_train: int = 200_000                       # training rows per fold are subsampled to this many for speed
     pfill_min_train: int = 5_000                         # a fold needs this many training prints for the fill and edge models
@@ -229,7 +241,11 @@ class RunConfig:
     premia_max_abs_ret_bp: float = 3000.0                # a holding-period return beyond this (30% of price) is a data error and is dropped
     charge_units: str = 'auto'                           # units of the charge columns: 'bp' (of yield), 'pct' (percent of yield, x100), 'price' (price points, converted with duration), 'auto' (detected, printed)
     charge_max_age_days: float = 1.0                     # a per-trade charge joins a print as of the print's time within this many days, else the bond's last charge, else the side median
-    objective_grid_bp: tuple[float, float, float] = (-3.0, 11.0, 1.0)   # concessions the production objective chooses from (start, stop, step); fill models are interpolated onto it
+    objective_grid_bp: tuple[float, float, float] = (-8.0, 11.0, 1.0)   # concessions the production objective chooses from (start, stop, step); fill models are interpolated onto it (v4.6: floor -8, the replica sat on -3 in the v45 run)
+    # v4.6 production ledger
+    rfq_join_minutes: float = 60.0                       # an RFQ joins its print by trade id, else by cusip x side within this many minutes after the request and the same quantity
+    grouping_bar: float = 0.05                           # a fill-curve grouping replaces the production key if it removes this share of the logged pfill's Brier at production's quote, in >= 4 held-out months
+    proxy_min_rfqs: int = 200                            # a pfill key needs this many requests for its own median concession in the production proxy, else the side x size median
     cell_min_trades: int = 500                           # a side x size cell intercept / concession needs this many training trades, else the side value
     grid_taus: tuple[float, ...] = (0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95)
     grid_shrink_k: float = 500.0                         # a cell's quantiles shrink toward the side x size marginal with weight n / (n + k)
@@ -264,6 +280,9 @@ PRE_REGISTERED = {
     'v43_pfill': 'fill probability P(o >= delta | x) for the S quote at delta in {-3, 0, 3, 6, 10} bp; four estimators scored by Brier and log-loss on the next month: the desk curve (side, trailing 100-day empirical CDF), a side x size x cluster cell table on prior months (shrunk), a gradient-boosted classifier on trade features, and the same with IPCA and state-space features',
     'v43_edge_model': 'expected round-trip edge of a fill at delta 0, gradient-boosted on the same two feature sets, walk-forward; scored by out-of-sample R2 and realised edge by predicted decile',
     'v43_engine_bar': 'the reduced-form engine (concession per print = argmax over the delta grid of pfill(delta | x) x (expected edge + delta)) replaces S at 0 only if its round-trip P&L per print is higher by 0.10 bp with bootstrap t > 3 and positive in 4 of 5 months',
+    'v46_rfq_ledger': 'the RFQ log is the ground truth for the bid: production optimal yield, pfill key, pfill, charges, print; a request is scored only when it printed and joined to the matched-print frame (trade id, else cusip x side x time within rfq_join_minutes and the same quantity); win = the print crossed the quote (the logged won flag replaces it where present); cover = oriented distance of the print from the quote',
+    'v46_grouping_bar': 'a fill-curve grouping replaces the production key only if, at production\'s own quote on the requests it received, it removes >= 5% of the logged pfill\'s Brier in >= 4 of the held-out months; candidates: the production-style key rebuilt (coupon bin x rating group x call group x size), the beta-space cluster in its place, the cluster shifted by the bond\'s oriented residual deviance against its cluster peers, the gradient-boosted model',
+    'v46_production_proxy': 'for the universe, production is represented by the algo mid plus the median production concession of the bond\'s pfill key (key prefix from the bond\'s own requests, size token from its quantity), else the side x size median; validated on the overlap against production\'s logged quote before use',
     'v45_win_rate_cover': 'win rate = share of customer prints on a side that crossed the quote at x*; cover distance = |print - quote at x*| in bp of yield, split into bp given up through the print on wins and bp short of the print on misses; both on the same prints for every variant, with the daily difference from production bootstrapped',
     'v44_production_objective': 'concession per print x* = argmax over the grid of pfill_side(x) x (x + total charge), with pfill the trailing 100-day empirical CDF of the basis on the same side and the charge the liquidity + risk + manual charges of the trade (sign and units detected and printed); fill iff the print crossed the quote shifted by x*',
     'v44_objective_variants': 'the three parts of the objective swapped one at a time and together: the mid (algo quote -> same-side memory S), the fill curve (desk curve -> quantile grid -> gradient-boosted model with IPCA and state-space features), the value of a fill (x + charge -> expected round-trip P&L from the edge model with the selection adjustment)',
@@ -3028,6 +3047,11 @@ else:
 # same-side memory); (iv) the same classifier with the factor model added: the three betas, the cluster, the residual
 # of record, the state-space signal, the mark-noise estimate, the trailing residual vol. The gap between (iii) and
 # (iv) is the factor model's contribution to the fill model, which is the second of the two places it can matter.
+# v4.6 adds two pooled estimators that are the question the desk asked: (v) a production-style key (coupon bin x
+# rating group x call group x size, the static grouping production pools on) and (vi) the beta-space cluster in its
+# place, with each cell's curve shifted by the bond's oriented residual deviance against its cluster peers (the slope
+# of the basis on the deviance, estimated in the cell on prior months). (v) is what production does; (vi) is the
+# factor model as a dynamic grouping. Section 12d scores the same four on production's own requests.
 #
 # **The edge model, on the new target.** The level model D predicted fair price; here the same machinery predicts
 # what a quote engine needs: the realised round-trip edge of a fill at $\delta = 0$ ($\text{RT} - o$ on the prints S
@@ -3081,24 +3105,51 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty:
     # ---- (2) four estimators of pfill for the S quote, walk-forward, scored on the next month
     desk_S = rolling_ecdf_pfill(TD, O_S, SIDE_ARR, TD, SIDE_ARR, PF_DELTAS, CFG.pfill_window_days)
 
-    def cell_pfill(tr_mask: np.ndarray, te_mask: np.ndarray) -> np.ndarray:
-        out = np.full((int(te_mask.sum()), len(PF_DELTAS)), np.nan)
-        kdf = pd.DataFrame({'side': SIDE_ARR, 'qty': QTY_ARR, 'cl': CL_ARR}); trk = kdf[tr_mask]; tek = kdf[te_mask]
-        n_cell = trk.groupby(['side', 'qty', 'cl']).size(); w = n_cell / (n_cell + CFG.grid_shrink_k)
-        key3 = pd.MultiIndex.from_frame(tek[['side', 'qty', 'cl']]); key2 = pd.MultiIndex.from_frame(tek[['side', 'qty']])
-        for j, dlt in enumerate(PF_DELTAS):
-            t2 = trk.assign(y=(O_S[tr_mask] >= dlt).astype(float))
-            cell = t2.groupby(['side', 'qty', 'cl'])['y'].mean(); marg = t2.groupby(['side', 'qty'])['y'].mean(); sidem = t2.groupby('side')['y'].mean()
-            c = cell.reindex(key3).to_numpy(float); ww = w.reindex(key3).to_numpy(float); m2 = marg.reindex(key2).to_numpy(float); ms = sidem.reindex(tek['side']).to_numpy(float)
-            m2 = np.where(np.isfinite(m2), m2, ms); c = np.where(np.isfinite(c), c, m2); ww = np.where(np.isfinite(ww), ww, 0.0)
-            out[:, j] = ww * c + (1.0 - ww) * m2
-        return out
+    def cell_pfill(tr_mask: np.ndarray, te_mask: np.ndarray, group: np.ndarray, shift: np.ndarray | None = None, o: np.ndarray | None = None, deltas: list[float] | None = None) -> np.ndarray:
+        """Pooled fill curve P(o >= delta | side, size, group) from the training prints, shrunk toward side x size with weight n / (n + k).
+        With `shift` (an oriented deviance d per print) each cell's curve moves with the bond: pfill(x | d) = share of training prints in the
+        cell with o - b d_train >= x - b d_test, b the cell's slope of o on d (shrunk toward 0 with the same weight). Default o is the S quote."""
+        o = O_S if o is None else o; deltas = PF_DELTAS if deltas is None else list(deltas); dl = np.asarray(deltas, float)
+        kdf = pd.DataFrame({'side': SIDE_ARR, 'qty': QTY_ARR, 'g': np.asarray(group).astype(str)}); trk = kdf[tr_mask].reset_index(drop=True); tek = kdf[te_mask].reset_index(drop=True)
+        o_tr = o[tr_mask]; okt = np.isfinite(o_tr); d_tr = shift[tr_mask] if shift is not None else None; d_te = shift[te_mask] if shift is not None else None
+        out = np.full((len(tek), len(dl)), np.nan); marg_mat = np.full((len(tek), len(dl)), np.nan)
+        key2 = pd.MultiIndex.from_frame(tek[['side', 'qty']])
+        for j, dlt in enumerate(dl):
+            t2 = trk.assign(y=(o_tr >= dlt).astype(float)); t2 = t2[okt]
+            marg = t2.groupby(['side', 'qty'])['y'].mean(); sidem = t2.groupby('side')['y'].mean()
+            m2 = marg.reindex(key2).to_numpy(float); ms = sidem.reindex(tek['side']).to_numpy(float); marg_mat[:, j] = np.where(np.isfinite(m2), m2, ms)
+        ktr = (trk['side'] + '|' + trk['qty'] + '|' + trk['g']).to_numpy(); kte = (tek['side'] + '|' + tek['qty'] + '|' + tek['g']).to_numpy()
+        tr_idx = pd.Series(np.arange(len(trk))).groupby(ktr).indices; te_idx = pd.Series(np.arange(len(tek))).groupby(kte).indices
+        cell_mat = np.full((len(tek), len(dl)), np.nan); ww = np.zeros(len(tek))
+        for k_, it in te_idx.items():
+            itr = tr_idx.get(k_)
+            if itr is None:
+                continue
+            itr = itr[okt[itr]]
+            if len(itr) < 5:
+                continue
+            ww[it] = len(itr) / (len(itr) + CFG.grid_shrink_k); oc = o_tr[itr]
+            if shift is None:
+                cell_mat[it, :] = (oc[:, None] >= dl[None, :]).mean(axis=0)[None, :]
+            else:
+                dc = d_tr[itr]; vd = float(np.var(dc)); b = (float(np.cov(oc, dc)[0, 1]) / vd if vd > 1e-9 else 0.0) * (len(itr) / (len(itr) + CFG.grid_shrink_k))
+                a_ = np.sort(oc - b * dc); thr = dl[None, :] - b * d_te[it][:, None]
+                cell_mat[it, :] = 1.0 - np.searchsorted(a_, thr, 'left') / len(a_)
+        c = np.where(np.isfinite(cell_mat), cell_mat, marg_mat)
+        return ww[:, None] * c + (1.0 - ww[:, None]) * marg_mat
 
-    cellp = np.full((len(mo), len(PF_DELTAS)), np.nan)
+    # v4.6 grouping variables: the production-style key (coupon bin x rating group x call group) and the oriented residual deviance
+    _cpn = pd.to_numeric(mo['cpn'], errors='coerce'); _cpnb = np.where(_cpn.isna(), 'cpn?', 'cpn' + np.clip(np.round(_cpn.fillna(4.0)), 3, 5).astype(int).astype(str))
+    _rsc = pd.to_numeric(mo['rating_score'], errors='coerce'); _rg = np.where(_rsc >= 18, 'AAA-AA', np.where(_rsc >= 15, 'A', np.where(_rsc.notna(), 'BBB-', 'NR')))
+    _cg = mo['call_structure'].astype(str).replace({'bullet': 'B', 'priced-to-call': 'PC', 'callable, to maturity': 'CM'}).to_numpy() if 'call_structure' in mo.columns else np.full(len(mo), 'na')
+    PK_ARR = np.char.add(np.char.add(np.char.add(_cpnb.astype(str), '|'), np.char.add(_rg.astype(str), '|')), _cg.astype(str))
+    DEV_ARR = np.clip(S_ARR * (pd.to_numeric(mo['pit_residual'], errors='coerce') / pd.to_numeric(mo['target_abs_vol'], errors='coerce').replace(0, np.nan)).fillna(0.0).to_numpy(float), -3.0, 3.0)
+    print(f'production-style key on the universe: {len(np.unique(PK_ARR))} coupon x rating x call groups (x side x size); residual deviance d = s x residual / vol, clipped to +/- 3')
+    cellp = np.full((len(mo), len(PF_DELTAS)), np.nan); cellk = np.full((len(mo), len(PF_DELTAS)), np.nan); cellshift = np.full((len(mo), len(PF_DELTAS)), np.nan)
     for m in MONTHS_MO[1:]:
         trm = MONTH_ARR < m; tem = MONTH_ARR == m
         if trm.sum() >= CFG.pfill_min_train and tem.any():
-            cellp[tem] = cell_pfill(trm, tem)
+            cellp[tem] = cell_pfill(trm, tem, CL_ARR); cellk[tem] = cell_pfill(trm, tem, PK_ARR); cellshift[tem] = cell_pfill(trm, tem, CL_ARR, DEV_ARR)
     PF_BASE = [c for c in ['side_P', 'log_size', 'modified_duration_lag1', 'rating_score', 'years_to_worst', 'extension', 'is_callable', 'cpn', 'recency_days_c', 'prints_20d', 'last_print_spread_bp', 'MinuteFromSignal', 'dMmdSprdSide', 'ewm_side_err_bp', 'n_side_prints', 'side_err_age_days', 'trade_size_lag', 'print_freq_lag'] if c in mo.columns]
     PF_IPCA = PF_BASE + [c for c in beta_cols + ['beta_cluster', 'pit_residual', 'abs_resid_z', 'ssm_signal', 'ssm_drift', 'eta_abs', 'target_abs_vol', 'residual_age_days'] if c in mo.columns and c not in PF_BASE]
 
@@ -3163,7 +3214,7 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty:
     def _mat(prefix: str) -> np.ndarray:
         cols = [f'{prefix}_{d:g}' for d in PF_DELTAS]
         return pred[cols].to_numpy(float) if all(c in pred.columns for c in cols) else np.full((len(mo), len(PF_DELTAS)), np.nan)
-    METHODS = {'desk: side, trailing window': desk_S, 'cell: side x size x cluster, prior months': cellp, 'GBM: trade and quote features': _mat('pf_trade'), 'GBM: + IPCA and state-space': _mat('pf_ipca')}
+    METHODS = {'desk: side, trailing window': desk_S, 'cell: side x size x production-style key': cellk, 'cell: side x size x cluster, prior months': cellp, 'cell: cluster, shifted by residual deviance': cellshift, 'GBM: trade and quote features': _mat('pf_trade'), 'GBM: + IPCA and state-space': _mat('pf_ipca')}
     common = tested.copy()
     for mt in METHODS.values():
         common &= np.isfinite(mt).all(axis=1)
@@ -3273,7 +3324,7 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty:
                 x2 = np.arange(len(desk_cal_cl)); ax[0, 1].plot(x2, desk_cal_cl[('predicted', sd_)], ls='--', marker='.', color=c_, label=f'{sd_}: predicted'); ax[0, 1].plot(x2, desk_cal_cl[('realised', sd_)], marker='o', color=c_, label=f'{sd_}: realised')
         ax[0, 0].set_xticks(np.arange(len(desk_cal_size))); ax[0, 0].set_xticklabels(desk_cal_size.index, rotation=30, fontsize=8); ax[0, 0].set_title('The desk curve on the algo quote at delta 0: pooled prediction vs realised fills, by size', fontsize=10); ax[0, 0].legend(fontsize=7); ax[0, 0].set_ylabel('fill probability')
         ax[0, 1].set_xticks(np.arange(len(desk_cal_cl))); ax[0, 1].set_xticklabels([str(i_)[:14] for i_ in desk_cal_cl.index], rotation=30, fontsize=7); ax[0, 1].set_title('... by beta-space cluster', fontsize=10); ax[0, 1].legend(fontsize=7)
-        for name, c_ in zip(METHODS, ['#8C8C8C', '#937860', '#4C72B0', '#2E8B57']):
+        for name, c_ in zip(METHODS, ['#8C8C8C', '#C44E52', '#937860', '#8172B2', '#4C72B0', '#2E8B57']):
             ax[0, 2].plot(PF_DELTAS, brier_tab.loc[name], marker='o', color=c_, label=name)
         ax[0, 2].set_xlabel('concession delta (bp)'); ax[0, 2].set_ylabel('Brier score (next month)'); ax[0, 2].set_title('Fill-probability estimators for the S quote: Brier by concession', fontsize=10); ax[0, 2].legend(fontsize=7)
         for (name, sd_), g in pf_cal.groupby(['method', 'side']):
@@ -3569,7 +3620,15 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'METHODS' in globals() 
     XGa = np.arange(*CFG.objective_grid_bp).astype(float); XG = [float(x_) for x_ in XGa]
     # ---- (1) charges per print: the per-trade track store as of the print, else charge columns on the matched trades, else the static track, else zero
     def _charge_cols(frame) -> list:
-        return [c for c in frame.columns if 'charge' in str(c).lower()] if frame is not None else []
+        """Numeric columns whose name contains 'charge' (v4.6: comment / note / key / flag columns and non-numeric columns are left out)."""
+        if frame is None:
+            return []
+        out = []
+        for c in frame.columns:
+            cl = str(c).lower()
+            if 'charge' in cl and not any(t_ in cl for t_ in ('comment', 'note', 'desc', 'reason', 'key', 'flag', 'type', 'name')) and pd.to_numeric(frame[c], errors='coerce').notna().any():
+                out.append(c)
+        return out
     _cdir = PIPE.path(PIPE.data_dir, 'track_charges')
     trk_ch = PIPE.store('track_charges').read(categorical=False) if _cdir.exists() and any(_cdir.glob('*.parquet')) else None
     CH = pd.DataFrame(index=mo['_id'].to_numpy()); charge_src = 'none'; ccols = []
@@ -3858,6 +3917,320 @@ else:
     print('Section 12c skipped: needs Sections 11b and 12.')
 
 # %% [markdown]
+# ### 12d. The production ledger: the RFQs we received, production's own quote, its pfill and its key
+#
+# Section 12c had to replicate production from the match table, and the v45 run showed the replica is not production:
+# its concession sat on the grid floor and its charges were the bond's last request, not the request's. The RFQ log
+# (`muni_algo_trade_track`) removes the approximation on the bid side. For every request we received it carries the
+# **optimal yield** the optimizer quoted with the production fill curve, the **pfill key** it pooled on (coupon bin x
+# call group x rating group x quantity group) and the **pfill** it assigned, the charges, and the MSRB print if the
+# request traded anywhere (no print = nobody traded it). Production's concession is $x_{\text{prod}} = s \cdot 100\,
+# (y_{\text{opt}} - y_{\text{algo}})$.
+#
+# Four readings, in order. (1) **What production does**: the concession distribution by size and key, and how often a
+# request prints. (2) **Is the pooled curve calibrated where it is used**: the realised crossing share at production's
+# own quote against the logged pfill, by key and by key component. (3) **The grouping test** the desk asked for, at
+# production's quote on the requests it received: the production-style key rebuilt from our data, the beta-space
+# cluster in its place, the cluster shifted by the bond's residual deviance against its peers, the desk curve and the
+# gradient-boosted model, each giving $\Pr(o_A \ge x_{\text{prod}})$ per request and scored by Brier against the logged
+# pfill with the pre-registered bar. (4) **Production's quote against ours on the same requests**: the algo mid at
+# zero, S, SQ, S with production's own concession, and the engine, on win rate, cover and realised round-trip P&L.
+# The section closes with the **production proxy for the universe**: the algo mid plus the median production
+# concession of the bond's key, validated on the overlap against the logged quote, then run through Section 12c's
+# machinery on every customer print so the universe comparison no longer depends on the replica.
+#
+# A request is scored only when it printed and joined to a matched print (trade id, else cusip x side x time within
+# `rfq_join_minutes` and the same quantity); requests that did not print are reported, never scored. The win is the
+# crossing proxy of Section 11 unless the track carries a won flag, in which case the flag is the win and the proxy's
+# agreement with it is reported. Column roles are detected from the track's names and can be overridden in
+# `TRACK_RFQ_COLUMNS`.
+
+# %%
+CELL_T('12d. The production ledger: the RFQs we received [1]')
+TRACK_RFQ_COLUMNS: dict[str, str] = {}   # optional overrides by role, e.g. {'time': 'rfq_time', 'optimal_yield': 'opt_yld', 'won': 'is_filled'}
+HAS_RFQ = False
+if HAS_TRADES and 'mo' in globals() and not mo.empty and 'okm' in globals() and okm.sum() >= 200:
+    _rdir = PIPE.path(PIPE.data_dir, 'track_rfq')
+    rfq_raw = PIPE.store('track_rfq').read(categorical=False) if _rdir.exists() and any(_rdir.glob('*.parquet')) else None
+    if rfq_raw is None or rfq_raw.empty:
+        print('Section 12d: no track_rfq store under the pipeline root. Pull it (mdp.pull(mdp.Config(root=..., sources=("track_rfq",)))) and rerun; the production ledger is skipped on this run.')
+    else:
+        CAND = {'time': ['rfq_time', 'rfq_ts', 'timestamp', 'ts', 'time', 'quote_time', 'signal_ts', 'signal_time', 'tradetime', 'trade_time', 'date'],
+                'quantity': ['quantity', 'msrb_quantity', 'qty', 'size', 'par', 'par_amount', 'notional'],
+                'algo_yield': ['algo_yield', 'algo_signal_yield', 'signal_yield', 'mid_yield', 'model_yield', 'algo_yld', 'yield_mid', 'fair_yield', 'mid'],
+                'optimal_yield': ['optimal_yield', 'opt_yield', 'optimal_yld', 'opt_yld', 'quote_yield', 'our_yield', 'bid_yield', 'optimal'],
+                'pfill': ['pfill', 'p_fill', 'prob_fill', 'fill_prob', 'pfill_value', 'pfill_prob'],
+                'pfill_key': ['pfill_key', 'pf_key', 'pfillkey', 'pfill_group', 'pfill_bin'],
+                'msrb_yield': ['msrb_yield', 'msrb_yld', 'print_yield', 'trade_yield'],
+                'msrb_trade_id': ['msrb_trade_id', 'trade_id', 'msrb_id'],
+                'won': ['won', 'is_won', 'filled', 'is_filled', 'traded', 'executed', 'win', 'done', 'hit'],
+                'side': ['side', 'msrb_side', 'signal_side', 'quote_side', 'rfq_side'],
+                'cover': ['cover', 'cover_yield', 'cover_yld', 'cover_bp']}
+        cols_l = {str(c).lower(): c for c in rfq_raw.columns}
+
+        def _pick(role: str):
+            if TRACK_RFQ_COLUMNS.get(role) in rfq_raw.columns:
+                return TRACK_RFQ_COLUMNS[role]
+            return next((cols_l[c] for c in CAND[role] if c in cols_l), None)
+
+        RC = {r: _pick(r) for r in CAND}
+        print(f'track_rfq: {len(rfq_raw):,} rows, {rfq_raw.shape[1]} columns: {list(rfq_raw.columns)}'); print('column roles detected (override with TRACK_RFQ_COLUMNS):', RC)
+        _need = [r for r in ['time', 'optimal_yield', 'algo_yield'] if RC[r] is None]
+        if _need or 'cusip' not in rfq_raw.columns:
+            print(f'Section 12d: cannot identify {_need or ["cusip"]} on the track from its column names; set TRACK_RFQ_COLUMNS and rerun. The production ledger is skipped on this run.')
+        else:
+            HAS_RFQ = True
+
+# %%
+CELL_T('12d. The production ledger: the RFQs we received [2]')
+if HAS_RFQ:
+    rq = pd.DataFrame({'cusip': rfq_raw['cusip'].astype('string'), 'rfq_ts': to_ns(rfq_raw[RC['time']])})
+    for role in ['quantity', 'algo_yield', 'optimal_yield', 'pfill', 'msrb_yield', 'cover']:
+        rq[role] = pd.to_numeric(rfq_raw[RC[role]], errors='coerce').to_numpy() if RC[role] else np.nan
+    rq['pfill_key'] = rfq_raw[RC['pfill_key']].astype('string').fillna('NA').to_numpy() if RC['pfill_key'] else 'NA'
+    if RC['side']:
+        _sv = rfq_raw[RC['side']].astype('string').str.upper().str.strip(); print('track side values:', _sv.value_counts(dropna=False).head(8).to_dict())
+        _smap = {'P': 'P', 'B': 'P', 'BUY': 'P', 'BID': 'P', 'PURCHASE': 'P', 'DEALER BUY': 'P', 'S': 'S', 'SELL': 'S', 'OFFER': 'S', 'ASK': 'S', 'O': 'S', 'DEALER SELL': 'S'}
+        rq['side'] = _sv.map(_smap).fillna('P').to_numpy()
+    else:
+        rq['side'] = 'P'
+    _tidn = lambda v: v.astype('string').str.strip().str.replace(r'\.0$', '', regex=True)
+    rq['msrb_trade_id'] = _tidn(rfq_raw[RC['msrb_trade_id']]).to_numpy() if RC['msrb_trade_id'] else pd.array([pd.NA] * len(rq), dtype='string')
+    if RC['won']:
+        _w = rfq_raw[RC['won']]
+        rq['won'] = (_w.astype('string').str.lower().isin(['true', '1', 'y', 'yes', 't', 'won', 'filled', 'done', 'win']).astype(float) if (_w.dtype == object or str(_w.dtype).startswith('string') or str(_w.dtype) == 'bool') else pd.to_numeric(_w, errors='coerce').fillna(0.0).clip(0, 1)).to_numpy(float)
+    else:
+        rq['won'] = np.nan
+    n0 = len(rq); rq = rq.dropna(subset=['cusip', 'rfq_ts', 'optimal_yield', 'algo_yield'])
+    rq = rq[(rq['rfq_ts'] >= pd.Timestamp(CFG.first_oos_date)) & (rq['rfq_ts'] < pd.Timestamp(CFG.end_date) + pd.Timedelta(days=1)) & rq['side'].isin(['P', 'S'])].reset_index(drop=True)
+    rq['s'] = np.where(rq['side'] == 'P', 1.0, -1.0); rq['x_prod'] = rq['s'] * 100.0 * (rq['optimal_yield'] - rq['algo_yield'])
+    _nx = len(rq); rq = rq[rq['x_prod'].abs() <= 100.0].reset_index(drop=True)          # a concession beyond 100 bp is a data error
+    if _nx - len(rq):
+        print(f'{_nx - len(rq):,} requests dropped for |x_prod| > 100 bp (check the yield units of the optimal and algo yield columns if this is large)')
+    rq['has_print'] = rq['msrb_yield'].notna(); rq['month'] = rq['rfq_ts'].dt.to_period('M'); rq['qty_group'] = qty_group(rq['quantity']).to_numpy()
+    print(f'RFQ ledger: {len(rq):,} requests in the held-out window ({n0:,} rows on the track); side mix {rq["side"].value_counts(normalize=True).round(3).to_dict()}; {rq["has_print"].mean():.1%} printed; '
+          f'pfill logged on {rq["pfill"].notna().mean():.0%}, key on {(rq["pfill_key"] != "NA").mean():.0%}; won flag {"present" if RC["won"] else "absent"}')
+    led = rq.groupby('month').agg(requests=('cusip', 'size'), bonds=('cusip', 'nunique'), printed=('has_print', 'mean'), median_x_prod=('x_prod', 'median'), mean_pfill=('pfill', 'mean'), logged_win=('won', 'mean'))
+    print('By month: requests, bonds, share that printed, production median concession (bp; positive = less aggressive than the algo mid), mean logged pfill, logged win share:'); display(led.round(3))
+    xq = rq.groupby(['side', 'qty_group'], observed=True)['x_prod'].quantile([0.1, 0.25, 0.5, 0.75, 0.9]).unstack(); xq.columns = [f'q{int(round(c * 100))}' for c in xq.columns]; xq['n'] = rq.groupby(['side', 'qty_group'], observed=True).size()
+    print('Production concession x_prod by side x quantity bin (bp): the range the optimizer actually uses, which the universe grid has to cover:'); display(xq.round(2))
+    _share_in = float(((rq['x_prod'] >= XGa[0]) & (rq['x_prod'] <= XGa[-1])).mean()); print(f'{_share_in:.0%} of production concessions fall inside the universe grid [{XGa[0]:g}, {XGa[-1]:g}] bp.')
+    keys_top = rq.loc[rq['pfill_key'] != 'NA', 'pfill_key'].value_counts()
+    if len(keys_top):
+        print(f'{len(keys_top)} distinct pfill keys; the 10 most used:'); display(keys_top.head(10).to_frame('requests'))
+
+    # ---- join printed requests to the matched-print frame: trade id first, then cusip x side x time (same quantity)
+    mo_k = pd.DataFrame({'_id': mo['_id'].to_numpy(), 'cusip': mo['cusip'].astype('string').to_numpy(), 'side': mo['side'].astype(str).to_numpy(), 'trade_ts': to_ns(mo['trade_ts']).to_numpy(), 'qty_mo': pd.to_numeric(mo['msrb_quantity'], errors='coerce').to_numpy(float)})
+    mo_k['cusip'] = mo_k['cusip'].astype('string')
+    if 'msrb_trade_id' in mo.columns:
+        mo_k['tid'] = _tidn(mo['msrb_trade_id']).to_numpy()
+    rp = rq[rq['has_print']].copy().reset_index(drop=True); rp['_rid'] = np.arange(len(rp)); rp['_id'] = np.nan; how = []
+    if RC['msrb_trade_id'] and 'tid' in mo_k.columns and rp['msrb_trade_id'].notna().any():
+        _m1 = mo_k.dropna(subset=['tid']).drop_duplicates(['cusip', 'tid'])[['_id', 'cusip', 'tid']].rename(columns={'tid': 'msrb_trade_id'})
+        j1 = rp[['_rid', 'cusip', 'msrb_trade_id']].merge(_m1, on=['cusip', 'msrb_trade_id'], how='left'); rp['_id'] = j1['_id'].to_numpy(); how.append('trade id')
+    _miss = rp['_id'].isna()
+    if _miss.any():
+        a_ = rp.loc[_miss, ['_rid', 'cusip', 'side', 'rfq_ts', 'quantity']].copy(); a_['side'] = a_['side'].astype(str); a_ = a_.sort_values('rfq_ts')
+        b_ = mo_k[['_id', 'cusip', 'side', 'trade_ts', 'qty_mo']].sort_values('trade_ts')
+        j2 = pd.merge_asof(a_, b_, left_on='rfq_ts', right_on='trade_ts', by=['cusip', 'side'], direction='forward', tolerance=pd.Timedelta(minutes=CFG.rfq_join_minutes))
+        okq = j2['qty_mo'].isna() | j2['quantity'].isna() | ((j2['qty_mo'] - j2['quantity']).abs() <= 1.0)
+        j2.loc[~okq, '_id'] = np.nan; rp['_id'] = rp['_id'].fillna(rp['_rid'].map(j2.set_index('_rid')['_id'])); how.append('cusip x side x time, same quantity')
+    rp = rp.dropna(subset=['_id']).copy(); rp['_id'] = rp['_id'].astype(int)
+    pos_map = pd.Series(np.arange(len(mo)), index=mo['_id'].to_numpy()); rp['pos'] = pos_map.reindex(rp['_id'].to_numpy()).to_numpy()
+    rp = rp.dropna(subset=['pos']).copy(); rp['pos'] = rp['pos'].astype(int); rp = rp.drop_duplicates('pos').reset_index(drop=True)
+    n_printed = int(rq['has_print'].sum()); print(f'{len(rp):,} of {n_printed:,} printed requests joined to the matched-print frame by {" then ".join(how)} ({len(rp) / max(n_printed, 1):.0%}).')
+    P = rp['pos'].to_numpy(); sP = S_ARR[P]; ypP = pd.to_numeric(mo['msrb_yield'], errors='coerce').to_numpy(float)[P]; TDP = TD[P]
+    o_prod = sP * 100.0 * (ypP - rp['optimal_yield'].to_numpy(float)); o_algo_t = sP * 100.0 * (ypP - rp['algo_yield'].to_numpy(float)); x_prodP = rp['x_prod'].to_numpy(float)
+    okr = okm[P] & np.isfinite(BASE_RT[P]) & np.isfinite(o_prod); nmr = max(int(pd.Series(MONTH_ARR[P][okr]).nunique()), 1)
+    _yd = np.abs(ypP - rp['msrb_yield'].to_numpy(float)); print(f'{int(okr.sum()):,} joined requests carry every input ({nmr} months); the track print and the matched print agree on yield within 0.5 bp on {float((_yd[okr] <= 0.005).mean()):.0%} of them.')
+    if okr.sum() < 200:
+        print('Section 12d: too few scorable requests; the ledger analyses are skipped on this run.'); HAS_RFQ = False
+
+# %%
+CELL_T('12d. The production ledger: the RFQs we received [3]')
+if HAS_RFQ:
+    winP = o_prod >= 0
+    # ---- (2) calibration of the logged pfill at production's own quote, by key and by key component
+    g = pd.DataFrame({'key': rp['pfill_key'].astype(str).to_numpy(), 'pf': rp['pfill'].to_numpy(float), 'win': winP.astype(float), 'won': rp['won'].to_numpy(float), 'month': MONTH_ARR[P].astype(str), 'qty_group': QTY_ARR[P], 'x_prod': x_prodP})[okr]
+    _parts = g['key'].str.split('_'); g['cpn_bin'] = _parts.str[0]; g['qty_tok'] = _parts.str[-1]; g['call_grp'] = np.where(_parts.str.len() >= 3, _parts.str[1], 'n/a'); g['rating_grp'] = np.where(_parts.str.len() == 4, _parts.str[2], 'n/a')
+    has_pf = g['pf'].notna()
+    if has_pf.mean() > 0.2:
+        _bp = float(np.mean((g.loc[has_pf, 'pf'] - g.loc[has_pf, 'win']) ** 2))
+        print(f'Logged pfill at production\'s quote: mean {g.loc[has_pf, "pf"].mean():.3f} vs realised crossing share {g.loc[has_pf, "win"].mean():.3f} on {int(has_pf.sum()):,} requests; Brier {_bp:.4f}' + (f'; logged win share {np.nanmean(g["won"]):.3f}, crossing proxy agrees with the won flag on {float((g["win"] == g["won"]).mean()):.0%}' if RC['won'] else ''))
+        cal_key = g[has_pf].groupby('key').agg(requests=('win', 'size'), mean_pfill=('pf', 'mean'), realised=('win', 'mean'), median_x_prod=('x_prod', 'median')); cal_key['gap'] = cal_key['realised'] - cal_key['mean_pfill']
+        _min_key = max(50, CFG.n_min_cell // 20); cal_key = cal_key[cal_key['requests'] >= _min_key].sort_values('requests', ascending=False)
+        print(f'Calibration by pfill key (keys with >= {_min_key} scorable requests; gap = realised - logged):'); display(cal_key.head(20).round(3))
+        comp_tabs = {}
+        for cn in ['cpn_bin', 'call_grp', 'rating_grp', 'qty_tok']:
+            t_ = g[has_pf].groupby(cn).agg(requests=('win', 'size'), mean_pfill=('pf', 'mean'), realised=('win', 'mean')); t_['gap'] = t_['realised'] - t_['mean_pfill']; comp_tabs[cn] = t_[t_['requests'] >= max(50, CFG.n_min_cell // 20)]
+        print('Calibration by key component (coupon bin | call group | rating group | quantity token):'); display(pd.concat(comp_tabs, names=['component', 'level']).round(3))
+    else:
+        cal_key = pd.DataFrame(); comp_tabs = {}; print('The track carries no usable pfill column; the calibration of the logged curve is skipped.')
+
+    # ---- (3) the grouping test at production's quote: Pr(o_A >= x_prod) per request from each estimator, scored against the logged pfill
+    def interp_at(Pm: np.ndarray, grid: np.ndarray, x: np.ndarray) -> np.ndarray:
+        xc = np.clip(x, grid[0], grid[-1]); j = np.clip(np.searchsorted(grid, xc, 'right') - 1, 0, len(grid) - 2); w = (xc - grid[j]) / (grid[j + 1] - grid[j]); r = np.arange(len(xc))
+        return (1.0 - w) * Pm[r, j] + w * Pm[r, j + 1]
+
+    cellA = {}
+    for gname, grp, shf in [('cell: side x size x production-style key', PK_ARR, None), ('cell: side x size x cluster', CL_ARR, None), ('cell: cluster, shifted by residual deviance', CL_ARR, DEV_ARR)]:
+        arr = np.full((len(mo), len(XG)), np.nan)
+        for m in MONTHS_MO[1:]:
+            trm = MONTH_ARR < m; tem = MONTH_ARR == m
+            if trm.sum() >= CFG.pfill_min_train and tem.any():
+                arr[tem] = cell_pfill(trm, tem, grp, shf, o=O_A, deltas=XG)
+        cellA[gname] = arr
+    EST = {'logged pfill (production)': rp['pfill'].to_numpy(float), 'desk curve (side, trailing window)': interp_at(desk_A_x[P], XGa, x_prodP)}
+    for gname, arr in cellA.items():
+        EST[gname] = interp_at(arr[P], XGa, x_prodP)
+    EST['GBM: + IPCA and state-space'] = interp_at(gbm_A_x[P], XGa, x_prodP)
+    okg = okr.copy()
+    for v_ in EST.values():
+        okg &= np.isfinite(v_)
+    grp_rows = []; _mP = MONTH_ARR[P].astype(str); _base_b = None
+    for name, v_ in EST.items():
+        p_ = np.clip(v_, 1e-4, 1 - 1e-4); y_ = winP.astype(float)
+        bm = pd.Series((p_[okg] - y_[okg]) ** 2).groupby(_mP[okg]).mean()
+        if name == 'logged pfill (production)':
+            _base_b = bm
+        rel = (1.0 - bm / _base_b) if _base_b is not None else pd.Series(np.nan, index=bm.index)
+        grp_rows.append({'estimator': name, 'requests': int(okg.sum()), 'Brier': float(np.mean((p_[okg] - y_[okg]) ** 2)), 'log-loss': float(-np.mean(y_[okg] * np.log(p_[okg]) + (1 - y_[okg]) * np.log(1 - p_[okg]))), 'mean predicted': float(p_[okg].mean()), 'realised': float(y_[okg].mean()),
+                         'Brier removed vs logged': float(1.0 - np.mean((p_[okg] - y_[okg]) ** 2) / np.mean((np.clip(EST['logged pfill (production)'], 1e-4, 1 - 1e-4)[okg] - y_[okg]) ** 2)), 'months >= bar': int((rel >= CFG.grouping_bar).sum()), 'months': int(len(bm))})
+    grouping = pd.DataFrame(grp_rows).set_index('estimator')
+    grouping['passes bar'] = (grouping['Brier removed vs logged'] >= CFG.grouping_bar) & (grouping['months >= bar'] >= min(4, int(grouping['months'].max())))
+    print(f'The grouping test at production\'s own quote on {int(okg.sum()):,} requests: Pr(o_A >= x_prod) from each estimator, scored on the realised crossing. Bar: >= {CFG.grouping_bar:.0%} of the logged pfill\'s Brier removed in >= 4 held-out months:'); display(grouping.round(4))
+
+    # ---- (4) production's quote against ours on the same requests
+    RPOL = {'production (logged optimal yield)': o_prod, 'algo mid at 0 (track algo yield)': o_algo_t, 'A at 0 (match-table algo yield)': O_A[P], 'S at 0': O_S[P], 'SQ at 0': sP * errSQ[P], 'S + production concession x_prod': O_S[P] - x_prodP}
+    for pname, lab in [('A, GBM + IPCA fill model, x + charge', 'A, GBM fill model, x + charge (12c)'), ('S, GBM + IPCA fill model, expected P&L (the Section 11b engine)', 'engine: S, GBM + IPCA, expected P&L (12c)')]:
+        if pname in XSTAR:
+            xs = XSTAR[pname][P]; base_o = O_A[P] if pname.startswith('A') else O_S[P]; RPOL[lab] = np.where(np.isfinite(xs), base_o - xs, -np.inf)
+
+    def rfq_metrics(oq: np.ndarray, mask: np.ndarray) -> dict:
+        ok = mask; quoted = ok & np.isfinite(oq); win = quoted & (oq >= 0); miss = quoted & ~(oq >= 0); pnl = np.where(win, BASE_RT[P] - oq, 0.0)
+        d_ = pd.Series(pnl[ok]).groupby(TDP[ok]).mean(); dw = pd.Series(win[ok].astype(float)).groupby(TDP[ok]).mean()
+        return {'requests': int(ok.sum()), 'win rate (print crossed)': float(win.sum() / max(ok.sum(), 1)), 'declined': float(1.0 - quoted.sum() / max(ok.sum(), 1)), '|quote - print| (bp)': float(np.abs(oq[quoted]).mean()) if quoted.any() else np.nan,
+                'within 2 bp': float((np.abs(oq[quoted]) <= 2.0).mean()) if quoted.any() else np.nan, 'through the print | win (bp)': float(oq[win].mean()) if win.any() else np.nan, 'short of the print | miss (bp)': float(-oq[miss].mean()) if miss.any() else np.nan,
+                'RT P&L | win (bp)': float((BASE_RT[P] - oq)[win].mean()) if win.any() else np.nan, 'RT P&L per request (bp)': float(d_.mean()) if len(d_) else np.nan, '$ per month ($k)': float((pnl[win] * DPB[P][win]).sum() / 1e3 / nmr), '_d': d_, '_w': dw}
+
+    rr_rows, rr_daily = [], {}
+    for name, oq in RPOL.items():
+        r_ = rfq_metrics(oq, okr); rr_daily[name] = (r_.pop('_d'), r_.pop('_w')); rr_rows.append({'policy': name, **r_})
+    rfq_tab = pd.DataFrame(rr_rows).set_index('policy'); _pn = 'production (logged optimal yield)'
+    if RC['won']:
+        rfq_tab.loc[_pn, 'logged win rate'] = float(np.nanmean(rp['won'].to_numpy(float)[okr]))
+    for name in rfq_tab.index:
+        if name == _pn:
+            continue
+        dp = (rr_daily[name][0] - rr_daily[_pn][0]).dropna(); dw = (rr_daily[name][1] - rr_daily[_pn][1]).dropna(); dm = dp.groupby(pd.DatetimeIndex(dp.index).to_period('M')).mean()
+        rfq_tab.loc[name, 'RT P&L boot t vs production'] = block_bootstrap_t(dp.to_numpy(), CFG.block_days, CFG.n_boot, CFG.seed); rfq_tab.loc[name, 'win rate boot t vs production'] = block_bootstrap_t(dw.to_numpy(), CFG.block_days, CFG.n_boot, CFG.seed); rfq_tab.loc[name, 'months above production'] = int((dm > 0).sum())
+    rfq_tab['beats production (bar)'] = ((rfq_tab['RT P&L per request (bp)'] - rfq_tab.loc[_pn, 'RT P&L per request (bp)']) >= CFG.interaction_bar_bp) & (rfq_tab['RT P&L boot t vs production'] > 3) & (rfq_tab['months above production'] >= min(4, nmr))
+    print(f'Production\'s logged quote against ours on the same {int(okr.sum()):,} requests (bid side unless the track carries offers): win rate, cover, realised round trip; bar vs production as before:'); display(rfq_tab.round(3))
+    _gap_rfq = float(np.nanmean((rp['pfill'].to_numpy(float) * (x_prodP + CHG[P]))[okr])) if rp['pfill'].notna().mean() > 0.2 else np.nan
+    if np.isfinite(_gap_rfq):
+        print(f'Production\'s own expectation on these requests, pfill x (x_prod + charge): {_gap_rfq:+.2f} bp per request; the round trip paid {rfq_tab.loc[_pn, "RT P&L per request (bp)"]:+.2f}.')
+    KEYR = [_pn, 'S at 0'] + [k_ for k_ in ['engine: S, GBM + IPCA, expected P&L (12c)'] if k_ in RPOL]
+    by_q_rows = []
+    _min_cell = max(50, CFG.n_min_cell // 20)
+    for q_ in QTY_LABELS:
+        sel = okr & (QTY_ARR[P] == q_)
+        if sel.sum() < _min_cell:
+            continue
+        for name in KEYR:
+            r_ = rfq_metrics(RPOL[name], sel); by_q_rows.append({'qty_group': q_, 'policy': name, 'requests': r_['requests'], 'win rate': r_['win rate (print crossed)'], '|quote - print| (bp)': r_['|quote - print| (bp)'], 'RT P&L per request (bp)': r_['RT P&L per request (bp)']})
+    by_q = pd.DataFrame(by_q_rows).set_index(['qty_group', 'policy']).unstack('policy') if by_q_rows else pd.DataFrame()
+    if len(by_q):
+        print('By quantity bin: production vs S at 0 vs the engine on the requests (win rate, cover, P&L per request):'); display(by_q.round(3))
+    ch_rows = []
+    if '_dimv' in globals():
+        for dname, arr in _dimv.items():
+            for lvl in (_dimo.get(dname) or sorted(pd.unique(arr[P][okr]))):
+                sel = okr & (arr[P] == lvl)
+                if sel.sum() < _min_cell:
+                    continue
+                for name in KEYR:
+                    r_ = rfq_metrics(RPOL[name], sel); ch_rows.append({'dimension': dname, 'cell': str(lvl), 'policy': name, 'requests': r_['requests'], 'win rate': r_['win rate (print crossed)'], 'RT P&L per request (bp)': r_['RT P&L per request (bp)']})
+    rfq_char = pd.DataFrame(ch_rows)
+    if len(rfq_char):
+        _pv = rfq_char.pivot_table(index=['dimension', 'cell'], columns='policy', values=['win rate', 'RT P&L per request (bp)'], aggfunc='first')
+        for k_ in KEYR[1:]:
+            _pv[('delta P&L vs production (bp)', k_)] = _pv[('RT P&L per request (bp)', k_)] - _pv[('RT P&L per request (bp)', _pn)]
+        print('By characteristic: production vs S at 0 vs the engine on the requests:'); display(_pv.round(3))
+
+    # ---- (5) the production proxy for the universe: the algo mid plus the median production concession of the bond's key
+    kk = rq[rq['pfill_key'] != 'NA'].copy()
+    if len(kk) >= CFG.proxy_min_rfqs:
+        kk['prefix'] = kk['pfill_key'].str.rsplit('_', n=1).str[0]; kk['qtok'] = kk['pfill_key'].str.rsplit('_', n=1).str[-1]
+        bond_prefix = kk.groupby('cusip')['prefix'].agg(lambda x: x.value_counts().index[0]); qtok_map = kk.groupby('qty_group', observed=True)['qtok'].agg(lambda x: x.value_counts().index[0])
+        med_key = kk.groupby('pfill_key')['x_prod'].agg(['median', 'size']); med_key = med_key.loc[med_key['size'] >= CFG.proxy_min_rfqs, 'median']
+        u_prefix = pd.Series(mo['cusip'].astype('string').to_numpy()).map(bond_prefix); u_qtok = pd.Series(QTY_ARR).map(qtok_map); u_key = (u_prefix.astype('string') + '_' + u_qtok.astype('string'))
+        x_key = u_key.map(med_key).to_numpy(float); proxy_src = 'key'
+    else:
+        x_key = np.full(len(mo), np.nan); print('too few requests with a pfill key for a key-level proxy; the side x size medians are used throughout')
+    med_sq = rq.groupby(['side', 'qty_group'], observed=True)['x_prod'].median()
+    _sq_side = SIDE_ARR if (rq['side'] == 'S').any() else np.full(len(mo), 'P')           # no offers on the track: the offer takes the bid's medians (flagged)
+    x_sq = med_sq.reindex(pd.MultiIndex.from_arrays([_sq_side, QTY_ARR])).to_numpy(float); x_sq = np.where(np.isfinite(x_sq), x_sq, float(rq['x_prod'].median()))
+    x_proxy = np.where(np.isfinite(x_key), x_key, x_sq); _cov_key = float(np.isfinite(x_key[okm]).mean())
+    # validation on the overlap: the proxy and the 12c replica against production's logged concession on the same requests
+    _val = pd.DataFrame({'proxy (median x_prod by key)': x_proxy[P], 'replica (12c, desk curve x (x + charge))': XSTAR[PRODN][P] if PRODN in XSTAR else np.nan, 'logged x_prod': x_prodP})[okr]
+    val_rows = []
+    for c_ in ['proxy (median x_prod by key)', 'replica (12c, desk curve x (x + charge))']:
+        okv = np.isfinite(_val[c_]) & np.isfinite(_val['logged x_prod'])
+        val_rows.append({'representation': c_, 'requests': int(okv.sum()), 'MAE vs logged x_prod (bp)': float((_val.loc[okv, c_] - _val.loc[okv, 'logged x_prod']).abs().mean()), 'corr': float(_val.loc[okv, c_].corr(_val.loc[okv, 'logged x_prod'])) if okv.sum() > 10 else np.nan, 'mean (bp)': float(_val.loc[okv, c_].mean()), 'logged mean (bp)': float(_val.loc[okv, 'logged x_prod'].mean())})
+    proxy_val = pd.DataFrame(val_rows).set_index('representation')
+    print(f'The production proxy on the universe: a key-level median concession for {_cov_key:.0%} of customer prints, the side x size median for the rest{" (the offer side takes the bid medians: the track carries no offers)" if not (rq["side"] == "S").any() else ""}. Validation on the overlap against the logged concession:'); display(proxy_val.round(3))
+    upol = {'production proxy: A + median x_prod by key': (errA, x_proxy), 'production replica (12c): A, desk curve, x + charge': (errA, XSTAR[PRODN]), 'A at 0': (errA, 0.0), 'S at 0': (errS, 0.0)}
+    if 'S, GBM + IPCA fill model, expected P&L (the Section 11b engine)' in XSTAR:
+        upol['engine: S, GBM + IPCA, expected P&L'] = (errS, XSTAR['S, GBM + IPCA fill model, expected P&L (the Section 11b engine)'])
+    u_rows, u_daily = [], {}
+    for name, (err_, xs) in upol.items():
+        for sd_, msk in [('ALL', okm), ('P', okm & IS_P), ('S', okm & IS_S)]:
+            r_ = pnl_policy(err_, xs, msk, BASE_RT); d_ = r_.pop('_daily')
+            if sd_ == 'ALL':
+                u_daily[name] = d_
+            u_rows.append({'policy': name, 'side': sd_, 'fill share': r_['fill share'], 'RT P&L per print (bp)': r_['P&L per print (bp)'], '$ per month ($k)': r_['$ per month ($k)']})
+    universe = pd.DataFrame(u_rows).set_index(['policy', 'side']).unstack('side'); _up = 'production proxy: A + median x_prod by key'
+    for name in upol:
+        universe.loc[name, ('boot t vs proxy', 'ALL')] = block_bootstrap_t((u_daily[name] - u_daily[_up]).dropna().to_numpy(), CFG.block_days, CFG.n_boot, CFG.seed) if name != _up else np.nan
+    print(f'The universe ({int(okm.sum()):,} customer prints, both sides) with production represented by the proxy instead of the replica:'); display(universe.round(3))
+
+    # ---- figures
+    fig, ax = plt.subplots(2, 3, figsize=(20, 11))
+    for sd_, c_ in [('P', '#4C72B0'), ('S', '#DD8452')]:
+        v_ = rq.loc[rq['side'] == sd_, 'x_prod']
+        if len(v_):
+            ax[0, 0].hist(v_.clip(-30, 30), bins=60, alpha=0.6, color=c_, label=f'{sd_}: production x_prod ({len(v_):,} requests)')
+    if PRODN in XSTAR:
+        ax[0, 0].hist(np.clip(XSTAR[PRODN][P][okr], -30, 30), bins=60, histtype='step', color='k', lw=1.2, label='12c replica x* on the same requests')
+    ax[0, 0].axvline(0, color='k', lw=0.6); ax[0, 0].set_xlabel('concession on the algo mid (bp; positive = less aggressive)'); ax[0, 0].set_title('What production actually quotes vs what the replica assumed', fontsize=10); ax[0, 0].legend(fontsize=7)
+    if len(cal_key):
+        ax[0, 1].scatter(cal_key['mean_pfill'], cal_key['realised'], s=np.sqrt(cal_key['requests']) * 2, alpha=0.6, color='#4C72B0'); ax[0, 1].plot([0, 1], [0, 1], 'k:', lw=0.8); ax[0, 1].set_xlabel('mean logged pfill at production\'s quote'); ax[0, 1].set_ylabel('realised crossing share'); ax[0, 1].set_title('Calibration of the production fill curve by pfill key (area = requests)', fontsize=10)
+    elif comp_tabs and any(len(v_) for v_ in comp_tabs.values()):
+        _ct = pd.concat({k_: v_['gap'] for k_, v_ in comp_tabs.items() if len(v_)}); _ct.index = [f'{a_}: {b_}' for a_, b_ in _ct.index]
+        ax[0, 1].barh(np.arange(len(_ct)), _ct.to_numpy(float), color=['#2E8B57' if v_ >= 0 else '#C44E52' for v_ in _ct]); ax[0, 1].set_yticks(np.arange(len(_ct))); ax[0, 1].set_yticklabels(_ct.index, fontsize=7); ax[0, 1].axvline(0, color='k', lw=0.6); ax[0, 1].set_xlabel('realised crossing share - logged pfill'); ax[0, 1].set_title('Calibration gap of the production fill curve by key component', fontsize=10)
+    else:
+        ax[0, 1].set_axis_off()
+    _gp = grouping.sort_values('Brier', ascending=False); y_ = np.arange(len(_gp))
+    ax[0, 2].barh(y_, _gp['Brier'], color=['#2E8B57' if b_ else ('#4C72B0' if i_.startswith('logged') else '#8C8C8C') for i_, b_ in zip(_gp.index, _gp['passes bar'])]); ax[0, 2].set_yticks(y_); ax[0, 2].set_yticklabels([f'{i_}  ({r_:+.1%})' for i_, r_ in zip(_gp.index, _gp['Brier removed vs logged'])], fontsize=7); ax[0, 2].set_xlabel('Brier at production\'s quote'); ax[0, 2].set_title('The grouping test on production\'s own requests (blue = logged pfill; green = clears the bar)', fontsize=10)
+    _rt = rfq_tab.sort_values('RT P&L per request (bp)'); y_ = np.arange(len(_rt))
+    ax[1, 0].barh(y_, _rt['win rate (print crossed)'], color=['#4C72B0' if i_ == _pn else '#8C8C8C' for i_ in _rt.index]); ax[1, 0].set_yticks(y_); ax[1, 0].set_yticklabels([i_[:44] for i_ in _rt.index], fontsize=7); ax[1, 0].set_title('Win rate on the requests (blue = production)', fontsize=10); ax[1, 0].axvline(rfq_tab.loc[_pn, 'win rate (print crossed)'], color='#4C72B0', ls=':', lw=1)
+    ax[1, 1].barh(y_, _rt['RT P&L per request (bp)'], color=['#2E8B57' if b_ else ('#4C72B0' if i_ == _pn else '#8C8C8C') for i_, b_ in zip(_rt.index, _rt['beats production (bar)'])]); ax[1, 1].set_yticks(y_); ax[1, 1].set_yticklabels([f'(t {t_:+.1f})' if np.isfinite(t_) else '' for t_ in _rt['RT P&L boot t vs production']], fontsize=7); ax[1, 1].set_title('Realised round-trip P&L per request (bp; green = clears the bar)', fontsize=10); ax[1, 1].axvline(rfq_tab.loc[_pn, 'RT P&L per request (bp)'], color='#4C72B0', ls=':', lw=1)
+    if len(by_q):
+        for name, c_ in zip(KEYR, ['#4C72B0', '#DD8452', '#2E8B57']):
+            if ('RT P&L per request (bp)', name) in by_q.columns:
+                ax[1, 2].plot(np.arange(len(by_q)), by_q[('RT P&L per request (bp)', name)], marker='o', color=c_, label=name[:40])
+        ax[1, 2].set_xticks(np.arange(len(by_q))); ax[1, 2].set_xticklabels(by_q.index, rotation=30, fontsize=8); ax[1, 2].axhline(0, color='k', lw=0.5); ax[1, 2].set_ylabel('RT P&L per request (bp)'); ax[1, 2].set_title('By quantity bin: production vs S at 0 vs the engine', fontsize=10); ax[1, 2].legend(fontsize=7)
+    else:
+        ax[1, 2].set_axis_off()
+    fig.suptitle('The production ledger: what production quoted, whether its fill curve is calibrated, and how its quote compares with ours on the same requests', fontsize=12); plt.tight_layout(); savefig('12d_rfq_ledger')
+    record('rfq_ledger', roles=RC, requests=int(len(rq)), printed=int(n_printed), joined=int(len(rp)), scored=int(okr.sum()), months=nmr, by_month=led.round(4).reset_index().astype({'month': str}).to_dict(orient='records'), x_prod_by_cell=flat_records(xq.reset_index()), share_x_prod_in_grid=_share_in,
+           calibration_by_key=cal_key.round(4).reset_index().to_dict(orient='records') if len(cal_key) else [], calibration_by_component={k_: v_.round(4).reset_index().to_dict(orient='records') for k_, v_ in comp_tabs.items()},
+           grouping=grouping.round(5).reset_index().to_dict(orient='records'), policies=rfq_tab.round(4).reset_index().to_dict(orient='records'), by_qty=flat_records(by_q.reset_index()) if len(by_q) else [], by_characteristic=rfq_char.round(4).to_dict(orient='records') if len(rfq_char) else [],
+           proxy_validation=proxy_val.round(4).reset_index().to_dict(orient='records'), proxy_key_coverage=_cov_key, universe=flat_records(universe.reset_index()))
+elif 'rfq_raw' in globals() and rfq_raw is not None and not rfq_raw.empty:
+    print('Section 12d: the ledger could not be scored on this run (see the messages above).')
+
+# %% [markdown]
 # ## 13. Where the P&L lives: markout by characteristic, factor coordinate, side and size
 #
 # The same segmentation the fair-mid work used, now scored in the currency the desk uses. Every customer print
@@ -4067,7 +4440,7 @@ if 'markout_breakdown' in REGISTRY:
     summary_rows.append(('Cell-optimal concession, walk-forward: S at 0 | S + delta* per side | S + delta* per side x size ($k/month)', ' | '.join(f"{_cc.loc[k_, '$ per month ($k)']:,.0f}" for k_ in ['S same-side EWMA, delta 0', 'S + delta* per side (walk-forward)', 'S + delta* per side x size cell (walk-forward)'] if k_ in _cc.index)))
 if 'pfill' in REGISTRY and REGISTRY['pfill']['engine']:
     _br = pd.DataFrame(REGISTRY['pfill']['brier_relative_to_desk']).set_index('method')
-    summary_rows.append(('Fill model for the S quote: Brier removed vs the desk curve at delta 0 (cell | GBM trade | GBM + IPCA)', ' | '.join(f"{_br.loc[m_, '0']:+.1%}" if '0' in _br.columns else f"{_br.loc[m_, 0.0]:+.1%}" for m_ in ['cell: side x size x cluster, prior months', 'GBM: trade and quote features', 'GBM: + IPCA and state-space'] if m_ in _br.index)))
+    summary_rows.append(('Fill model for the S quote: Brier removed vs the desk curve at delta 0 (production-style key | cluster | cluster + deviance shift | GBM trade | GBM + IPCA)', ' | '.join(f"{_br.loc[m_, '0']:+.1%}" if '0' in _br.columns else f"{_br.loc[m_, 0.0]:+.1%}" for m_ in ['cell: side x size x production-style key', 'cell: side x size x cluster, prior months', 'cell: cluster, shifted by residual deviance', 'GBM: trade and quote features', 'GBM: + IPCA and state-space'] if m_ in _br.index)))
     _dc = pd.DataFrame(REGISTRY['pfill']['desk_calibration_by_size']).set_index('qty_group')
     _gaps = [abs(_dc.loc[q_, f'realised | {s_}'] - _dc.loc[q_, f'predicted | {s_}']) for q_ in _dc.index for s_ in ['P', 'S'] if f'realised | {s_}' in _dc.columns and np.isfinite(_dc.loc[q_, f'realised | {s_}'])]
     if _gaps:
@@ -4091,6 +4464,20 @@ if 'production_objective' in REGISTRY and REGISTRY['production_objective']['poli
                 summary_rows.append((f'{_lab}: win rate bid | offer; |quote - print| bid | offer (bp); RT P&L per print bid | offer (bp)', f"{_bsr.loc[(_pn, 'P'), 'win rate']:.0%} | {_bsr.loc[(_pn, 'S'), 'win rate']:.0%}; {_bsr.loc[(_pn, 'P'), '|quote - print| (bp)']:.1f} | {_bsr.loc[(_pn, 'S'), '|quote - print| (bp)']:.1f}; {_bsr.loc[(_pn, 'P'), 'RT P&L per print (bp)']:+.2f} | {_bsr.loc[(_pn, 'S'), 'RT P&L per print (bp)']:+.2f}"))
     _win = _po[_po['beats production (bar, round trip)'].astype(bool)]
     summary_rows.append(('Variants that clear the bar against production (round trip)', '; '.join(f"{i_}: {r_['round trip: P&L per print (bp)']:+.2f} bp" for i_, r_ in _win.iterrows()) if len(_win) else 'none'))
+if 'rfq_ledger' in REGISTRY and REGISTRY['rfq_ledger'].get('policies'):
+    _rl = REGISTRY['rfq_ledger']; _rp = pd.DataFrame(_rl['policies']).set_index('policy'); _pn_ = 'production (logged optimal yield)'
+    summary_rows.append(('RFQ ledger: requests | printed | joined | scored (months)', f"{_rl['requests']:,} | {_rl['printed']:,} | {_rl['joined']:,} | {_rl['scored']:,} ({_rl['months']})"))
+    _gr = pd.DataFrame(_rl['grouping']).set_index('estimator')
+    if 'logged pfill (production)' in _gr.index:
+        summary_rows.append(('Logged pfill at production\'s quote: mean predicted | realised | Brier', f"{_gr.loc['logged pfill (production)', 'mean predicted']:.3f} | {_gr.loc['logged pfill (production)', 'realised']:.3f} | {_gr.loc['logged pfill (production)', 'Brier']:.4f}"))
+    summary_rows.append(('Grouping test at production\'s quote: Brier removed vs logged pfill (desk | production-style key | cluster | cluster + deviance | GBM + IPCA); bar', ' | '.join(f"{_gr.loc[k_, 'Brier removed vs logged']:+.1%}{' PASS' if bool(_gr.loc[k_, 'passes bar']) else ''}" for k_ in ['desk curve (side, trailing window)', 'cell: side x size x production-style key', 'cell: side x size x cluster', 'cell: cluster, shifted by residual deviance', 'GBM: + IPCA and state-space'] if k_ in _gr.index)))
+    summary_rows.append(('On the requests: production | S at 0 | engine: win rate; |quote - print| bp; RT P&L per request bp (boot t)', ' | '.join(f"{_rp.loc[k_, 'win rate (print crossed)']:.0%}; {_rp.loc[k_, '|quote - print| (bp)']:.1f}; {_rp.loc[k_, 'RT P&L per request (bp)']:+.2f}" + (f" (t {_rp.loc[k_, 'RT P&L boot t vs production']:+.1f})" if k_ != _pn_ and np.isfinite(_rp.loc[k_, 'RT P&L boot t vs production']) else '') for k_ in [_pn_, 'S at 0', 'engine: S, GBM + IPCA, expected P&L (12c)'] if k_ in _rp.index)))
+    _pv_ = pd.DataFrame(_rl['proxy_validation']).set_index('representation')
+    summary_rows.append(('Production representation vs the logged concession on the overlap, MAE bp (proxy | 12c replica)', ' | '.join(f"{_pv_.loc[k_, 'MAE vs logged x_prod (bp)']:.2f}" for k_ in _pv_.index)))
+    _uv = pd.DataFrame(_rl['universe']).set_index('policy')
+    _c_all = 'RT P&L per print (bp) | ALL'
+    if _c_all in _uv.columns:
+        summary_rows.append(('Universe with the production proxy: proxy | replica | S at 0 | engine, RT P&L per print (bp)', ' | '.join(f"{_uv.loc[k_, _c_all]:+.2f}" for k_ in ['production proxy: A + median x_prod by key', 'production replica (12c): A, desk curve, x + charge', 'S at 0', 'engine: S, GBM + IPCA, expected P&L'] if k_ in _uv.index)))
 if 'residual_side' in REGISTRY:
     _sp = pd.DataFrame(REGISTRY['residual_side']['policy']).set_index('input'); _sl = pd.DataFrame(REGISTRY['residual_side']['slopes'])
     summary_rows.append(('Residual signal as concession modifier (delta bp per print over S + side concession, boot t, bar)', '; '.join(f"{i_}: {r_['delta (bp)']:+.2f} (t {r_['boot t of delta']:+.1f}) {'PASS' if r_['passes bar'] else 'no'}" for i_, r_ in _sp.iterrows())))
