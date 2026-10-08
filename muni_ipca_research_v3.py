@@ -1,6 +1,16 @@
 # %% [markdown]
 # # Muni IPCA v4 — From Fair Mid to Markout: the Factor Model as Risk Layer, the Quote Judged in Dollars
 #
+# **v4.9.** What the first real ledger run taught. The logged probability on the track is in percent and is read as such.
+# The track's won flag lets the crossing proxy be checked: the share of crossed prints production actually won and the
+# share of wins that crossed, overall and by size, so the would-have-filled numbers of the universe carry a known
+# correction. Production's logged concession sits at +10 to +40 bp above the algo mid, which says the optimal yield
+# carries the charges inside it: a second replica puts the charge inside the quote, and the fill-model knots and the
+# objective grid run to +30 bp so the replica can reach production's range. The evaluation markout covers only a third
+# of customer prints at five days (a bond needs an evaluation in the week after the trade), the next-print mark 84%,
+# so every markout result now states its coverage and the trade-based marks are the record. The trade-mark demeaning
+# check uses the unoriented move, which the oriented version got wrong.
+#
 # **v4.8.** The quote marked to the next real trade. The evaluation markout of Section 11 marks a would-be fill to the
 # closing evaluation, which is the market's systematic view and the surface the factor model is fitted on. The real
 # out-of-sample information is the next print. Section 11c builds the print tape from every MSRB print in the universe
@@ -253,7 +263,7 @@ class RunConfig:
     width_scalar_bar: float = 0.01                       # the mark-noise width scalar replaces the pooled grid if the tail calibration error falls by this much on both sides
     # v4.3 fill probability and the reduced-form quote engine
     pfill_window_days: int = 100                         # the desk's curve: trailing window of the empirical CDF of the basis, by side
-    pfill_deltas: tuple[float, ...] = (-8.0, -5.0, -3.0, 0.0, 3.0, 6.0, 10.0)   # concessions at which fill probability is modelled and scored (v4.6: knots at -8 and -5 so the objective grid can reach production's range)
+    pfill_deltas: tuple[float, ...] = (-8.0, -5.0, -3.0, 0.0, 3.0, 6.0, 10.0, 15.0, 20.0, 30.0)   # concessions at which fill probability is modelled and scored (v4.9: to +30 bp; production's logged concession runs to +40)
     pfill_trees: int = 150                               # gradient-boosted fill and edge models per fold
     pfill_max_train: int = 200_000                       # training rows per fold are subsampled to this many for speed
     pfill_min_train: int = 5_000                         # a fold needs this many training prints for the fill and edge models
@@ -262,7 +272,7 @@ class RunConfig:
     premia_max_abs_ret_bp: float = 3000.0                # a holding-period return beyond this (30% of price) is a data error and is dropped
     charge_units: str = 'auto'                           # units of the charge columns: 'bp' (of yield), 'pct' (percent of yield, x100), 'price' (price points, converted with duration), 'auto' (detected, printed)
     charge_max_age_days: float = 1.0                     # a per-trade charge joins a print as of the print's time within this many days, else the bond's last charge, else the side median
-    objective_grid_bp: tuple[float, float, float] = (-8.0, 11.0, 1.0)   # concessions the production objective chooses from (start, stop, step); fill models are interpolated onto it (v4.6: floor -8, the replica sat on -3 in the v45 run)
+    objective_grid_bp: tuple[float, float, float] = (-8.0, 31.0, 1.0)   # concessions the production objective chooses from (start, stop, step); fill models are interpolated onto it (v4.9: to +30 bp, production's range)
     # v4.6 production ledger
     rfq_join_minutes: float = 60.0                       # an RFQ joins its print by trade id, else by cusip x side within this many minutes after the request and the same quantity
     grouping_bar: float = 0.05                           # a fill-curve grouping replaces the production key if it removes this share of the logged pfill's Brier at production's quote, in >= 4 held-out months
@@ -301,6 +311,8 @@ PRE_REGISTERED = {
     'v43_pfill': 'fill probability P(o >= delta | x) for the S quote at delta in {-3, 0, 3, 6, 10} bp; four estimators scored by Brier and log-loss on the next month: the desk curve (side, trailing 100-day empirical CDF), a side x size x cluster cell table on prior months (shrunk), a gradient-boosted classifier on trade features, and the same with IPCA and state-space features',
     'v43_edge_model': 'expected round-trip edge of a fill at delta 0, gradient-boosted on the same two feature sets, walk-forward; scored by out-of-sample R2 and realised edge by predicted decile',
     'v43_engine_bar': 'the reduced-form engine (concession per print = argmax over the delta grid of pfill(delta | x) x (expected edge + delta)) replaces S at 0 only if its round-trip P&L per print is higher by 0.10 bp with bootstrap t > 3 and positive in 4 of 5 months',
+    'v49_proxy_check': 'on the requests production received, a print that crossed the logged quote is compared with the logged won flag: P(won | crossed) is the competition correction to the would-have-filled proxy and P(crossed | won) its coverage; both reported overall and by size; the universe numbers are read with that correction, not restated',
+    'v49_replica_b': 'a second replica of the production objective puts the charge inside the quote: fill iff the print crossed the algo mid shifted by charge + x, value x + charge; the replica whose concession distribution is closer to the logged one on the overlap is the one the universe comparison reads',
     'v48_trade_markout': 'a would-be fill is marked to the next real MSRB print in the bond within 10 calendar days: any side, converted to a mid-equivalent by half the dealer round trip of the mark\'s size bin (median P - S spread of same bond-day prints on prior months; inter-dealer prints unadjusted), and separately to the next inter-dealer, opposite-side and same-side print; and to the last print within 1, 5, 10 business days; the trade-based ranking of record is the next-print mark, raw; date-demeaned and factor-hedged shown as checks; the bar is unchanged',
     'v47_benchmark': 'the market is the equal-weighted covered universe held long over the same period (price: total return; yield space: minus the mean daily yield change); every portfolio reports beta and alpha on it, excess return, up and down capture and the share of periods above it; a portfolio that fell less with beta below one is defensive, with beta near one and positive alpha is selection, with beta below zero is a short',
     'v46_rfq_ledger': 'the RFQ log is the ground truth for the bid: production optimal yield, pfill key, pfill, charges, print; a request is scored only when it printed and joined to the matched-print frame (trade id, else cusip x side x time within rfq_join_minutes and the same quantity); win = the print crossed the quote (the logged won flag replaces it where present); cover = oriented distance of the print from the quote',
@@ -2911,7 +2923,8 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
     rr_all['MAE rank'] = scoreboard['MAE rank'].reindex(rr_all.index); rr_all['$ rank'] = rr_all['$ per month ($k)'].rank(ascending=False).astype(int)
     rr_all[f'P&L per print h={CFG.markout_horizons[1]} (bp)'] = rr_h1['P&L per print (bp)']; rr_all[f'P&L per print h={CFG.markout_horizons[-1]} (bp)'] = rr_h10['P&L per print (bp)']
     rr_all = rr_all.sort_values('$ per month ($k)', ascending=False)
-    print(f'Markout re-ranking at delta = 0, factor-hedged, marked {HR} business days after the trade ({months_mo} held-out months, {len(mo):,} customer prints). Dollars are per month; the bar is dollars above S, bootstrap t > 3, positive in >= 4 months:'); display(rr_all.round(3))
+    _cov_eval = float((np.isfinite(PM[H0]) & np.isfinite(HD[HR])).mean())
+    print(f'Markout re-ranking at delta = 0, factor-hedged, marked {HR} business days after the trade ({months_mo} held-out months, {len(mo):,} customer prints, of which {_cov_eval:.0%} carry an evaluation and the residual path at h = {HR}; the rules are compared on those). Dollars are per month; the bar is dollars above S, bootstrap t > 3, positive in >= 4 months:'); display(rr_all.round(3))
     print('By side (record horizon, factor-hedged):'); display(pd.concat({'P dealer buys (bid)': rr_P[['fill share', 'edge at quote | fill (bp)', 'residual move after | fill (bp)', 'P&L per print (bp)', '$ per month ($k)']],
                                                            'S dealer sells (offer)': rr_S[['fill share', 'edge at quote | fill (bp)', 'residual move after | fill (bp)', 'P&L per print (bp)', '$ per month ($k)']]}, axis=1).reindex(rr_all.index).round(3))
 
@@ -3103,7 +3116,7 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
     plt.tight_layout(); savefig('11_markout_round_trip')
 
     mo[['_id', 'cusip', 'trade_date', 'side', 'qty_group', 'par', 'dollar_per_bp', 'y_exit', 'days_to_exit', 'cf_exit'] + [f'pm_{h}' for h in CFG.markout_horizons] + [f'y_mark_{h}' for h in CFG.markout_horizons] + [f'cr_{h}' for h in CFG.markout_horizons] + [f'cf_{h}' for h in CFG.markout_horizons] + list(PREDS.values())].to_parquet(ARTIFACTS / 'markout_v4.parquet', index=False)
-    record('markout', horizons=list(CFG.markout_horizons), record_h=HR, months=months_mo, prints=int(len(mo)), hedged=True, adverse_selection=flat_records(adverse.reset_index()), trend_check=flat_records(trend_check.reset_index()), rerank=rr_all.round(4).reset_index().to_dict(orient='records'),
+    record('markout', horizons=list(CFG.markout_horizons), record_h=HR, months=months_mo, prints=int(len(mo)), hedged=True, coverage_eval=_cov_eval, coverage_rt=float(_rt_ok.mean()), adverse_selection=flat_records(adverse.reset_index()), trend_check=flat_records(trend_check.reset_index()), rerank=rr_all.round(4).reset_index().to_dict(orient='records'),
            round_trip={'coverage': float(_rt_ok.mean()), 'median_days_to_exit': float(np.nanmedian(mo['days_to_exit'])), 'all': rt_all.round(4).reset_index().to_dict(orient='records'), 'side_split': flat_records(side_cmp.reset_index()), 'side_dollars_S': flat_records(rt_side_dollars.reset_index()), 'concession': rt_concession.round(4).reset_index().to_dict(orient='records'), 'delta_star_by_month': flat_records(_dsr.reset_index())},
            rerank_by_side={'P': rr_P.round(4).reset_index().to_dict(orient='records'), 'S': rr_S.round(4).reset_index().to_dict(orient='records')}, curves=curves.round(4).to_dict(orient='records'),
            best_delta_full_window=best_delta.round(4).reset_index().to_dict(orient='records'), concession=concession.round(4).reset_index().to_dict(orient='records'), delta_star=dstar.round(4).to_dict(orient='records'),
@@ -3240,7 +3253,8 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'tape' in globals():
     horizon_tab = pd.DataFrame(hz_rows).set_index(['mid', 'mark'])
     print('P&L per print (bp) by mark and horizon, S and the algo quote (raw trade marks; the evaluation row for reference):'); display(horizon_tab.round(2))
     # the common move on the record mark: the move from the print to the mark, raw, demeaned by trade date, and net of the factor-implied move to the mark date
-    _mv = BASE_TRADE.copy(); _mkt = pd.Series(_mv).groupby(TD).transform('mean').to_numpy(); _dd = _mv - _mkt
+    _mv = BASE_TRADE.copy(); _un = -S_ARR * _mv                                   # the unoriented move from the print to its mark (bp; positive = yield rose), free of the half spread
+    _mkt = pd.Series(_un).groupby(TD).transform('mean').to_numpy(); _dd = _mv + S_ARR * _mkt   # the day's mean move taken out of every print's mark: market-neutral, model-free
     _md = _qm.set_index('_id')['trade_ts'].reindex(mo['_id'].to_numpy()) + pd.to_timedelta(np.nan_to_num(TMD[TRADE_REC], nan=0.0), unit='D')
     _ex2 = pd.DataFrame({'_id': mo['_id'].to_numpy(), 'cusip': mo['cusip'].astype('string').to_numpy(), 'mark_date': to_ns(pd.Series(_md.to_numpy())).dt.normalize().to_numpy()}).dropna(); _ex2['cusip'] = _ex2['cusip'].astype('string'); _ex2['mark_date'] = to_ns(_ex2['mark_date']); _ex2 = _ex2.sort_values('mark_date')
     jf2 = pd.merge_asof(_ex2, rp[['cusip', 'date', 'cum_fit']].rename(columns={'date': 'rdate'}), left_on='mark_date', right_on='rdate', by='cusip', direction='forward', tolerance=pd.Timedelta(days=7)).set_index('_id')
@@ -3254,7 +3268,7 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'tape' in globals():
                 pnl = base - o; ok = msk & np.isfinite(pnl); r_[f'P&L per print, {lab} (bp)'] = float(np.where(fill & ok, pnl, 0.0)[ok].mean()) if ok.any() else np.nan
             cm_rows.append(r_)
     common_move = pd.DataFrame(cm_rows).set_index(['mid', 'side'])
-    print('The common move on the next-print mark: P&L per print raw, demeaned by trade date, and net of the factor-implied move to the mark (bp). A large gap between raw and the other two, with opposite signs by side, is the market, not the quote:'); display(common_move.round(2))
+    print('The common move on the next-print mark: P&L per print raw, with the day\'s mean yield move to the mark taken out (model-free), and net of the factor-implied move to the mark (bp). A large gap between raw and the other two, with opposite signs by side, is the market, not the quote:'); display(common_move.round(2))
 
     # ---- noise: the dispersion of a fill's P&L under each mark, and the prints needed to resolve a tenth of a basis point
     nz_rows = []; oS = S_ARR * errS; fS = oS >= 0
@@ -3983,6 +3997,9 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'METHODS' in globals() 
 
     _h = trades_all[['side', 'trade_date', 'e_algo_bp']].dropna(); _h = _h[_h['side'].isin(['P', 'S'])]
     desk_A_x = rolling_ecdf_pfill(to_ns(_h['trade_date']).to_numpy(), np.where(_h['side'].to_numpy() == 'P', 1.0, -1.0) * _h['e_algo_bp'].to_numpy(float), _h['side'].astype(str).to_numpy(), TD, SIDE_ARR, XG, CFG.pfill_window_days)
+    # v4.9: replica B puts the charge inside the quote, so the desk curve is needed out to grid + charge
+    XW = [float(x_) for x_ in np.arange(XGa[0], XGa[-1] + 60.0, 1.0)]; XWa = np.asarray(XW)
+    desk_A_w = rolling_ecdf_pfill(to_ns(_h['trade_date']).to_numpy(), np.where(_h['side'].to_numpy() == 'P', 1.0, -1.0) * _h['e_algo_bp'].to_numpy(float), _h['side'].astype(str).to_numpy(), TD, SIDE_ARR, XW, CFG.pfill_window_days)
     desk_S_x = rolling_ecdf_pfill(TD, O_S, SIDE_ARR, TD, SIDE_ARR, XG, CFG.pfill_window_days)
     gbm_S_x = interp_rows(_mat('pf_ipca'), PFD, XGa); gbm_A_x = interp_rows(_mat('pf_ipcaA'), PFD, XGa)
     grid_S_x = np.full((len(mo), len(XG)), np.nan); TAUa = np.asarray(TAUS, float); _nt = len(TAUa)
@@ -4031,7 +4048,12 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'METHODS' in globals() 
             dec = has & (best < 0); xs = np.where(dec, np.inf, xs); best = np.where(dec, 0.0, best)
         return xs, best
 
+    # replica B: the quote sits at the algo mid plus the charge plus x; the fill curve is read at x + charge and the value is x + charge
+    _cshift = np.clip(CHG, 0.0, 60.0); _pB = np.full((len(mo), len(XGa)), np.nan); _rows = np.arange(len(mo))
+    for g_i, x in enumerate(XGa):
+        xs_ = np.clip(x + _cshift, XWa[0], XWa[-1]); j = np.clip(np.searchsorted(XWa, xs_, 'right') - 1, 0, len(XWa) - 2); w = (xs_ - XWa[j]) / (XWa[j + 1] - XWa[j]); _pB[:, g_i] = (1.0 - w) * desk_A_w[_rows, j] + w * desk_A_w[_rows, j + 1]
     POL = {'production: A, desk curve, x + charge': (errA, O_A, desk_A_x, V_charge, False),
+           'production B: A + charge + x, desk curve at x + charge, value x + charge': (errA, O_A, _pB, V_charge, False),
            'A, desk curve, expected P&L (edge model on A)': (errA, O_A, desk_A_x, V_exp_A, True),
            'A, GBM + IPCA fill model, x + charge': (errA, O_A, gbm_A_x, V_charge, False),
            'A, GBM + IPCA fill model, expected P&L': (errA, O_A, gbm_A_x, V_exp_A, True),
@@ -4048,7 +4070,10 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'METHODS' in globals() 
     else:
         obj_rows, obj_daily, XSTAR = [], {}, {}
         for name, (err_, o_, pf_, v_, dec_) in POL.items():
-            xs, val = choose(pf_, v_, dec_); XSTAR[name] = xs
+            xs, val = choose(pf_, v_, dec_)
+            if name.startswith('production B'):
+                xs = np.where(np.isfinite(xs), xs + _cshift, xs)        # the effective concession on the algo mid is x* plus the charge
+            XSTAR[name] = xs
             r_rt = pnl_policy(err_, xs, okm, BASE_RT); r_ev = pnl_policy(err_, xs, okm, BASE_EVAL); obj_daily[name] = (r_rt.pop('_daily'), r_ev.pop('_daily'))
             fill_ = okm & (o_ >= xs); _fin = okm & np.isfinite(xs)
             obj_rows.append({'policy': name, 'mean x* (bp)': float(np.mean(xs[_fin])) if _fin.any() else np.nan, 'share declined': float(np.isinf(xs[okm]).mean()), 'fill share': r_rt['fill share'], 'objective value per print (expected)': float(np.nanmean(val[okm])),
@@ -4074,6 +4099,8 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'METHODS' in globals() 
                              {'swap': 'value of a fill: x + charge -> expected round-trip P&L (algo quote, desk curve)', 'delta RT P&L per print (bp)': objective.loc['A, desk curve, expected P&L (edge model on A)', 'round trip: P&L per print (bp)'] - objective.loc[PRODN, 'round trip: P&L per print (bp)'], 'boot t': objective.loc['A, desk curve, expected P&L (edge model on A)', 'round trip: boot t vs production']},
                              {'swap': 'all three: S, GBM + IPCA, expected P&L', 'delta RT P&L per print (bp)': objective.loc['S, GBM + IPCA fill model, expected P&L (the Section 11b engine)', 'round trip: P&L per print (bp)'] - objective.loc[PRODN, 'round trip: P&L per print (bp)'], 'boot t': objective.loc['S, GBM + IPCA fill model, expected P&L (the Section 11b engine)', 'round trip: boot t vs production']}]).set_index('swap')
         print('What each replacement is worth on its own (round-trip P&L per print vs the production rule):'); display(comp.round(3))
+        _pB_name = 'production B: A + charge + x, desk curve at x + charge, value x + charge'
+        print(f'Replica B (the charge inside the quote): mean effective concession {float(np.nanmean(XSTAR[_pB_name][okm])):+.1f} bp on the algo mid, fill share {objective.loc[_pB_name, "fill share"]:.0%}, round trip {objective.loc[_pB_name, "round trip: P&L per print (bp)"]:+.2f} bp per print. Section 12d says which replica production\'s logged concession is closer to.')
         xmix = pd.DataFrame({name: pd.Series(XSTAR[name][okm]).value_counts(normalize=True).sort_index() for name in POL}).fillna(0.0); xmix.index = ['no quote' if np.isinf(i_) else f'x = {float(i_):g}' for i_ in xmix.index]
         print('Concession chosen, share of prints by policy:'); display(xmix.round(3))
 
@@ -4271,6 +4298,10 @@ if HAS_RFQ:
     rq = pd.DataFrame({'cusip': rfq_raw['cusip'].astype('string'), 'rfq_ts': to_ns(rfq_raw[RC['time']])})
     for role in ['quantity', 'algo_yield', 'optimal_yield', 'pfill', 'msrb_yield', 'cover', 'final_quote_yield']:
         rq[role] = pd.to_numeric(rfq_raw[RC[role]], errors='coerce').to_numpy() if RC[role] else np.nan
+    if RC['pfill']:
+        _pf = rq['pfill'].to_numpy(float); _pct = np.isfinite(_pf) & (_pf > 1.0)
+        if _pct.any():
+            rq['pfill'] = np.where(_pct, _pf / 100.0, _pf); print(f'logged probability: {float(_pct.mean()):.0%} of rows above 1 read as percent and rescaled; {float((np.isfinite(_pf) & (_pf <= 1.0)).mean()):.0%} already a fraction (a mix means the column changed scale during the sample: check the by-month table)')
     rq['print_ts'] = to_ns(rfq_raw[RC['print_time']]).to_numpy() if RC['print_time'] else pd.NaT
     def _flag(role: str):
         if not RC[role]:
@@ -4318,6 +4349,9 @@ if HAS_RFQ:
     HAS_ALGO_Y = bool(RC['algo_yield']) and rq['x_prod'].notna().mean() > 0.5
     led = rq.groupby('month').agg(requests=('cusip', 'size'), bonds=('cusip', 'nunique'), printed=('has_print', 'mean'), median_x_prod=('x_prod', 'median'), mean_pfill=('pfill', 'mean'), logged_win=('won', 'mean'))
     print('By month: requests, bonds, share that printed, production median concession (bp; positive = less aggressive than the algo mid), mean logged pfill, logged win share:'); display(led.round(3))
+    _rq_med = led['requests'].median()
+    if (led['requests'] > 2.5 * _rq_med).any():
+        print(f'note: {list(led.index[led["requests"] > 2.5 * _rq_med].astype(str))} carry more than 2.5x the median month\'s requests; the population of the track changed there (a new venue or auto-quoting), and the win share and pfill in those months are not comparable with the earlier ones')
     def _xq_table(frame: pd.DataFrame, label: str) -> pd.DataFrame:
         t_ = frame.dropna(subset=['x_prod']); xq_ = t_.groupby(['side', 'qty_group'], observed=True)['x_prod'].quantile([0.1, 0.25, 0.5, 0.75, 0.9]).unstack(); xq_.columns = [f'q{int(round(c * 100))}' for c in xq_.columns]; xq_['n'] = t_.groupby(['side', 'qty_group'], observed=True).size()
         print(f'Production concession x_prod by side x quantity bin (bp; {label}): the range the optimizer actually uses, which the universe grid has to cover:'); display(xq_.round(2))
@@ -4358,6 +4392,8 @@ if HAS_RFQ:
     pos_map = pd.Series(np.arange(len(mo)), index=mo['_id'].to_numpy()); rp['pos'] = pos_map.reindex(rp['_id'].to_numpy()).to_numpy()
     rp = rp.dropna(subset=['pos']).copy(); rp['pos'] = rp['pos'].astype(int); rp = rp.drop_duplicates('pos').reset_index(drop=True)
     n_printed = int(rq['has_print'].sum()); print(f'{len(rp):,} of {n_printed:,} printed requests joined to the matched-print frame by {" then ".join(how)} ({len(rp) / max(n_printed, 1):.0%}).')
+    _in_univ = rq.loc[rq['has_print'], 'cusip'].isin(set(mo['cusip'].astype('string').unique())).mean(); _in_panel = rq.loc[rq['has_print'], 'cusip'].isin(set(model['cusip'].astype('string').unique())).mean()
+    print(f'why: {_in_panel:.0%} of printed requests are on bonds in the modelled universe (the covered panel) and {_in_univ:.0%} on bonds with a matched customer print in the held-out months; the rest cannot join. The scored requests are production\'s requests on our universe, not all of production.')
     P = rp['pos'].to_numpy(); sP = S_ARR[P]; ypP = pd.to_numeric(mo['msrb_yield'], errors='coerce').to_numpy(float)[P]; TDP = TD[P]
     _yalgo_mo = pd.to_numeric(mo['algo_signal_yield'], errors='coerce').to_numpy(float)[P]
     if not HAS_ALGO_Y:
@@ -4385,6 +4421,18 @@ if HAS_RFQ:
     g = pd.DataFrame({'key': rp['pfill_key'].astype(str).to_numpy(), 'pf': rp['pfill'].to_numpy(float), 'win': winP.astype(float), 'won': rp['won'].to_numpy(float), 'month': MONTH_ARR[P].astype(str), 'qty_group': QTY_ARR[P], 'x_prod': x_prodP})[okr]
     _parts = g['key'].str.split('_'); g['cpn_bin'] = _parts.str[0]; g['qty_tok'] = _parts.str[-1]; g['call_grp'] = np.where(_parts.str.len() >= 3, _parts.str[1], 'n/a'); g['rating_grp'] = np.where(_parts.str.len() == 4, _parts.str[2], 'n/a')
     has_pf = g['pf'].notna()
+    # ---- the crossing proxy against the logged won flag: the competition correction the universe numbers need
+    if RC['won'] and np.isfinite(g['won'].to_numpy(float)).mean() > 0.5:
+        _w = g['won'].to_numpy(float) > 0.5; _c = g['win'].to_numpy(float) > 0.5
+        proxy_rows = [{'cell': 'ALL', 'requests': int(len(g)), 'crossed': float(_c.mean()), 'won': float(_w.mean()), 'P(won | crossed)': float(_w[_c].mean()) if _c.any() else np.nan, 'P(crossed | won)': float(_c[_w].mean()) if _w.any() else np.nan, 'agreement': float((_w == _c).mean())}]
+        for q_ in QTY_LABELS:
+            sel = (g['qty_group'].to_numpy() == q_)
+            if sel.sum() >= max(50, CFG.n_min_cell // 20):
+                proxy_rows.append({'cell': q_, 'requests': int(sel.sum()), 'crossed': float(_c[sel].mean()), 'won': float(_w[sel].mean()), 'P(won | crossed)': float(_w[sel & _c].mean()) if (sel & _c).any() else np.nan, 'P(crossed | won)': float(_c[sel & _w].mean()) if (sel & _w).any() else np.nan, 'agreement': float((_w[sel] == _c[sel]).mean())})
+        proxy_check = pd.DataFrame(proxy_rows).set_index('cell')
+        print('The crossing proxy against the logged won flag at production\'s quote. P(won | crossed) is the share of prints that crossed our quote that we actually won (competition and the winner\'s curse); P(crossed | won) the share of real wins the proxy sees. The would-have-filled numbers of Sections 11 to 12c overstate fills by about 1 / P(won | crossed) at this quote level:'); display(proxy_check.round(3))
+    else:
+        proxy_check = pd.DataFrame()
     if has_pf.mean() > 0.2:
         _bp = float(np.mean((g.loc[has_pf, 'pf'] - g.loc[has_pf, 'win']) ** 2))
         print(f'Logged pfill at production\'s quote: mean {g.loc[has_pf, "pf"].mean():.3f} vs realised crossing share {g.loc[has_pf, "win"].mean():.3f} on {int(has_pf.sum()):,} requests; Brier {_bp:.4f}' + (f'; logged win share {np.nanmean(g["won"]):.3f}, crossing proxy agrees with the won flag on {float((g["win"] == g["won"]).mean()):.0%}' if RC['won'] else ''))
@@ -4513,14 +4561,17 @@ if HAS_RFQ:
     x_sq = med_sq.reindex(pd.MultiIndex.from_arrays([_sq_side, QTY_ARR])).to_numpy(float); x_sq = np.where(np.isfinite(x_sq), x_sq, float(_xsrc['x_prod'].dropna().median()) if _xsrc['x_prod'].notna().any() else 0.0)
     x_proxy = np.where(np.isfinite(x_key), x_key, x_sq); _cov_key = float(np.isfinite(x_key[okm]).mean())
     # validation on the overlap: the proxy and the 12c replica against production's logged concession on the same requests
-    _val = pd.DataFrame({'proxy (median x_prod by key)': x_proxy[P], 'replica (12c, desk curve x (x + charge))': XSTAR[PRODN][P] if PRODN in XSTAR else np.nan, 'logged x_prod': x_prodP})[okr]
+    _pBn = 'production B: A + charge + x, desk curve at x + charge, value x + charge'
+    _val = pd.DataFrame({'proxy (median x_prod by key)': x_proxy[P], 'replica (12c, desk curve x (x + charge))': XSTAR[PRODN][P] if PRODN in XSTAR else np.nan, 'replica B (12c, the charge inside the quote)': XSTAR[_pBn][P] if _pBn in XSTAR else np.nan, 'logged x_prod': x_prodP})[okr]
     val_rows = []
-    for c_ in ['proxy (median x_prod by key)', 'replica (12c, desk curve x (x + charge))']:
+    for c_ in ['proxy (median x_prod by key)', 'replica (12c, desk curve x (x + charge))', 'replica B (12c, the charge inside the quote)']:
         okv = np.isfinite(_val[c_]) & np.isfinite(_val['logged x_prod'])
         val_rows.append({'representation': c_, 'requests': int(okv.sum()), 'MAE vs logged x_prod (bp)': float((_val.loc[okv, c_] - _val.loc[okv, 'logged x_prod']).abs().mean()), 'corr': float(_val.loc[okv, c_].corr(_val.loc[okv, 'logged x_prod'])) if okv.sum() > 10 else np.nan, 'mean (bp)': float(_val.loc[okv, c_].mean()), 'logged mean (bp)': float(_val.loc[okv, 'logged x_prod'].mean())})
     proxy_val = pd.DataFrame(val_rows).set_index('representation')
     print(f'The production proxy on the universe: a key-level median concession for {_cov_key:.0%} of customer prints, the side x size median for the rest{" (the offer side takes the bid medians: the track carries no offers)" if not (rq["side"] == "S").any() else ""}. Validation on the overlap against the logged concession:'); display(proxy_val.round(3))
     upol = {'production proxy: A + median x_prod by key': (errA, x_proxy), 'production replica (12c): A, desk curve, x + charge': (errA, XSTAR[PRODN]), 'A at 0': (errA, 0.0), 'S at 0': (errS, 0.0)}
+    if _pBn in XSTAR:
+        upol['production replica B (12c): the charge inside the quote'] = (errA, XSTAR[_pBn])
     if 'S, GBM + IPCA fill model, expected P&L (the Section 11b engine)' in XSTAR:
         upol['engine: S, GBM + IPCA, expected P&L'] = (errS, XSTAR['S, GBM + IPCA fill model, expected P&L (the Section 11b engine)'])
     u_rows, u_daily = [], {}
@@ -4567,7 +4618,7 @@ if HAS_RFQ:
     record('rfq_ledger', roles=RC, requests=int(len(rq)), printed=int(n_printed), joined=int(len(rp)), scored=int(okr.sum()), months=nmr, by_month=led.round(4).reset_index().astype({'month': str}).to_dict(orient='records'), x_prod_by_cell=flat_records(xq.reset_index()) if len(xq) else [], share_x_prod_in_grid=_share_in,
            calibration_by_key=cal_key.round(4).reset_index().to_dict(orient='records') if len(cal_key) else [], calibration_by_component={k_: v_.round(4).reset_index().to_dict(orient='records') for k_, v_ in comp_tabs.items()},
            grouping=grouping.round(5).reset_index().to_dict(orient='records'), policies=rfq_tab.round(4).reset_index().to_dict(orient='records'), by_qty=flat_records(by_q.reset_index()) if len(by_q) else [], by_characteristic=rfq_char.round(4).to_dict(orient='records') if len(rfq_char) else [],
-           proxy_validation=proxy_val.round(4).reset_index().to_dict(orient='records'), proxy_key_coverage=_cov_key, universe=flat_records(universe.reset_index()))
+           proxy_validation=proxy_val.round(4).reset_index().to_dict(orient='records'), proxy_key_coverage=_cov_key, universe=flat_records(universe.reset_index()), proxy_check=proxy_check.round(4).reset_index().to_dict(orient='records') if len(proxy_check) else [])
 elif 'rfq_raw' in globals() and rfq_raw is not None and not rfq_raw.empty:
     print('Section 12d: the ledger could not be scored on this run (see the messages above).')
 
@@ -4764,6 +4815,10 @@ if 'markout' in REGISTRY:
     _ad = pd.DataFrame(REGISTRY['markout']['adverse_selection'])
     _adf = _ad[_ad['prints'] == 'would have filled'].set_index('side')
     summary_rows.append((f'Adverse selection on would-be fills (algo quote): edge at quote | factor-implied | residual move after {_hr}d, P / S (bp)', ' / '.join(f"{_adf.loc[s_, 'edge at our quote (bp)']:+.1f} | {_adf.loc[s_, f'factor-implied, h={_hr} (bp)']:+.1f} | {_adf.loc[s_, f'residual move, h={_hr} (bp)']:+.1f}" for s_ in _adf.index)))
+if 'markout' in REGISTRY and 'coverage_eval' in REGISTRY['markout']:
+    _cvt = pd.DataFrame(REGISTRY['trade_markout']['coverage']) if 'trade_markout' in REGISTRY and REGISTRY['trade_markout'].get('coverage') else None
+    _np_cov = float(_cvt.set_index('index').loc['any side, mid-equivalent', 'next print']) if _cvt is not None and 'index' in _cvt.columns and 'next print' in _cvt.columns else np.nan
+    summary_rows.append(('Coverage of the markout metrics (share of customer prints scored): evaluation h = record | round trip | next real print', f"{REGISTRY['markout']['coverage_eval']:.0%} | {REGISTRY['markout']['coverage_rt']:.0%} | {_np_cov:.0%}"))
 if 'trade_markout' in REGISTRY and REGISTRY['trade_markout']['rerank']:
     _tr = pd.DataFrame(REGISTRY['trade_markout']['rerank']).set_index('mid'); _sp = REGISTRY['trade_markout']['spearman_vs_evaluation']
     summary_rows.append(('Marked to the next real print (any side, mid-equivalent): P&L per print algo | S | SQ | F | D (bp); winner; Spearman with the evaluation ranking ($ | per print)', ' | '.join(f"{_tr.loc[k_, 'P&L per print (bp)']:+.2f}" for k_ in ['A algo quote', 'S same-side EWMA', 'SQ same-side EWMA + side x size intercept', 'F side intercept + rho x own EWMA', 'D level model with error features'] if k_ in _tr.index) + f"; {_tr.index[0]} ({_tr.iloc[0]['P&L per print (bp)']:+.2f}, bar {'PASS' if bool(_tr.iloc[0]['beats S (bar)']) else 'no'}); {_sp['dollars']:+.2f} | {_sp['per_print']:+.2f}"))
@@ -4824,7 +4879,10 @@ if 'rfq_ledger' in REGISTRY and REGISTRY['rfq_ledger'].get('policies'):
     summary_rows.append(('Grouping test at production\'s quote: Brier removed vs logged pfill (desk | production-style key | cluster | cluster + deviance | GBM + IPCA); bar', ' | '.join(f"{_gr.loc[k_, 'Brier removed vs logged']:+.1%}{' PASS' if bool(_gr.loc[k_, 'passes bar']) else ''}" for k_ in ['desk curve (side, trailing window)', 'cell: side x size x production-style key', 'cell: side x size x cluster', 'cell: cluster, shifted by residual deviance', 'GBM: + IPCA and state-space'] if k_ in _gr.index)))
     summary_rows.append(('On the requests: production | S at 0 | engine: win rate; |quote - print| bp; RT P&L per request bp (boot t)', ' | '.join(f"{_rp.loc[k_, 'win rate (print crossed)']:.0%}; {_rp.loc[k_, '|quote - print| (bp)']:.1f}; {_rp.loc[k_, 'RT P&L per request (bp)']:+.2f}" + (f" (t {_rp.loc[k_, 'RT P&L boot t vs production']:+.1f})" if k_ != _pn_ and np.isfinite(_rp.loc[k_, 'RT P&L boot t vs production']) else '') for k_ in [_pn_, 'S at 0', 'engine: S, GBM + IPCA, expected P&L (12c)'] if k_ in _rp.index)))
     _pv_ = pd.DataFrame(_rl['proxy_validation']).set_index('representation')
-    summary_rows.append(('Production representation vs the logged concession on the overlap, MAE bp (proxy | 12c replica)', ' | '.join(f"{_pv_.loc[k_, 'MAE vs logged x_prod (bp)']:.2f}" for k_ in _pv_.index)))
+    summary_rows.append(('Production representation vs the logged concession on the overlap, MAE bp (proxy | 12c replica | replica B)', ' | '.join(f"{_pv_.loc[k_, 'MAE vs logged x_prod (bp)']:.2f}" for k_ in _pv_.index)))
+    if _rl.get('proxy_check'):
+        _pc = pd.DataFrame(_rl['proxy_check']).set_index('cell')
+        summary_rows.append(('Crossing proxy vs the logged won flag at production\'s quote: crossed | won | P(won | crossed) | P(crossed | won)', f"{_pc.loc['ALL', 'crossed']:.1%} | {_pc.loc['ALL', 'won']:.1%} | {_pc.loc['ALL', 'P(won | crossed)']:.0%} | {_pc.loc['ALL', 'P(crossed | won)']:.0%}"))
     _uv = pd.DataFrame(_rl['universe']).set_index('policy')
     _c_all = 'RT P&L per print (bp) | ALL'
     if _c_all in _uv.columns:
