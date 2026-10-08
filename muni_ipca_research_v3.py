@@ -1,6 +1,17 @@
 # %% [markdown]
 # # Muni IPCA v4 — From Fair Mid to Markout: the Factor Model as Risk Layer, the Quote Judged in Dollars
 #
+# **v5.2.** Portfolio research on the fixed window (Section 8c). The sample cannot be extended, so 8c asks what
+# about 125 held-out days and fifty thousand bonds can say about expected returns: every held-out day forms quintile
+# sorts on a zoo of point-in-time signals (the Kelly-Palhares-Pruitt expected return, carry, the bond's own momentum
+# and reversal, the factor-implied move, residual value, the state-space forecast, low volatility, illiquidity,
+# credit, term and mark staleness), held 1 to 20 business days, ranked raw and within duration quintile, with
+# Newey-West and block-bootstrap inference. A random-signal placebo through the same pipeline sets the bar; the
+# tangency portfolio is read against a trailing trend and its own sign flip, and each refit's premium estimate
+# against the next month's realisation. The EDA (correlation, persistence, coverage, the zero mass of evaluated
+# returns, quintile bands, IC across horizons and months, calendar-time portfolios, drawdowns, factor loadings,
+# where the top sorts earn) is six figures. Nothing in 8b changes.
+#
 # **v5.1.** Runtime. The v47 runtime table put ten minutes on the warm run, six of them in cells that recomputed what
 # nothing had changed: the beta-space trading map (a per-bond lambda over the full print history), the Section 10
 # fold loop, the 11c tape marks, the model panel and the three residual-dynamics cells of Section 7. Those now sit
@@ -285,6 +296,12 @@ class RunConfig:
     # v4.4 factor premia (Section 8b) and the production objective (Section 12c)
     premia_freqs: tuple[str, ...] = ('monthly', 'weekly')   # rebalancing frequencies of the expected-return long-short
     premia_max_abs_ret_bp: float = 3000.0                # a holding-period return beyond this (30% of price) is a data error and is dropped
+    # v5.2 portfolio research on the fixed window (Section 8c)
+    zoo_horizons: tuple[int, ...] = (1, 5, 10, 20)       # holding periods in business days of the daily-formed quintile sorts
+    zoo_hold_days: int = 5                               # the holding period of record: calendar-time long-shorts, quintile bands, the placebo
+    zoo_placebo_draws: int = 100                         # random signals per placebo kind
+    zoo_placebo_bonds: int = 10_000                      # bond subsample the placebo runs on
+    zoo_trend_windows: tuple[int, ...] = (20, 60)        # trailing windows of the time-series-momentum tangency placebo
     charge_units: str = 'auto'                           # units of the charge columns: 'bp' (of yield), 'pct' (percent of yield, x100), 'price' (price points, converted with duration), 'auto' (detected, printed)
     charge_max_age_days: float = 1.0                     # a per-trade charge joins a print as of the print's time within this many days, else the bond's last charge, else the side median
     objective_grid_bp: tuple[float, float, float] = (-8.0, 31.0, 1.0)   # concessions the production objective chooses from (start, stop, step); fill models are interpolated onto it (v4.9: to +30 bp, production's range)
@@ -326,6 +343,9 @@ PRE_REGISTERED = {
     'v43_pfill': 'fill probability P(o >= delta | x) for the S quote at delta in {-3, 0, 3, 6, 10} bp; four estimators scored by Brier and log-loss on the next month: the desk curve (side, trailing 100-day empirical CDF), a side x size x cluster cell table on prior months (shrunk), a gradient-boosted classifier on trade features, and the same with IPCA and state-space features',
     'v43_edge_model': 'expected round-trip edge of a fill at delta 0, gradient-boosted on the same two feature sets, walk-forward; scored by out-of-sample R2 and realised edge by predicted decile',
     'v43_engine_bar': 'the reduced-form engine (concession per print = argmax over the delta grid of pfill(delta | x) x (expected edge + delta)) replaces S at 0 only if its round-trip P&L per print is higher by 0.10 bp with bootstrap t > 3 and positive in 4 of 5 months',
+    'v52_zoo_design': 'Section 8c: every held-out date forms quintiles on each signal from data up to that date and holds them h business days (h = 1, 5, 10, 20; h = 5 is the holding period of record); the long-short is top minus bottom quintile, equal-weighted; the ranking of record is within duration quintile, the raw ranking is shown beside it; the target is the evaluated-price total return of 8b; inference is Newey-West with h - 1 lags and the moving-block bootstrap',
+    'v52_zoo_bar': 'random signals (independent per bond-day, and fixed per bond) go through the identical pipeline; the single pre-registered test (the state-space signal, duration-neutral, h = 5) must exceed the placebo 97.5th percentile of |t| on the long-short Newey-West t; the zoo is exploratory and its best |t| is read against sqrt(2 ln N) for N tests; a zoo finding is a hypothesis for the next window, never a result',
+    'v52_tangency_placebo': 'the tangency portfolio of 8b is compared with its sign-flipped weights, with a trailing 20- and 60-day trend in the factor realisations (time-series momentum, no model) and with equal weight; each refit premium estimate is checked for sign agreement with the realised mean of its test month',
     'v51_cache': 'the model panel, the residual ACF, the activity buckets, the level forecaster, the Section 10 fold loop and the 11c tape marks are stage-cached on data fingerprints, config and code; a cache hit reproduces the stored result, a miss recomputes it, nothing is switched by hand',
     'v50_mae_selection': 'Section 10 selects the mid on held-out MAE against the print; the selected mid is carried into the economic comparison as one policy, not as the quote of record',
     'v50_one_objective': 'the engines are compared on one common sample (prints with every mid, every fill curve, both edge models and a raw round-trip exit) and one declared objective: realised dollar P&L per month of the raw round trip (no hedge, no evaluation); the next-print mark is the secondary objective',
@@ -435,6 +455,19 @@ def cached(name: str, fn, deps=(), code=()):
         pd.to_pickle(obj, path_pk); p = path_pk
     print(f'[cache] {name}: computed in {dt:.0f}s, saved {p.name} ({p.stat().st_size / 1e6:.0f} MB)')
     CACHE_LOG.append({'stage': name, 'status': 'computed', 'seconds': dt, 'file': p.name, 'cell': _CELL_STATE['label']}); return obj
+
+
+def block_bootstrap_t(slopes: np.ndarray, block: int = 5, n_boot: int = 500, seed: int = 0) -> float:
+    """Moving-block bootstrap over the daily slopes: the FM t assumes independent dates, but the 125 trade dates share
+    27 Gammas and the daily slopes are autocorrelated within a month. Returns mean / bootstrap sd of the mean."""
+    n = len(slopes)
+    if n < 2 * block:
+        return np.nan
+    rng = np.random.default_rng(seed); nb = int(np.ceil(n / block)); means = np.empty(n_boot)
+    for i in range(n_boot):
+        starts = rng.integers(0, n - block + 1, nb); idx = (starts[:, None] + np.arange(block)[None, :]).ravel()[:n]; means[i] = slopes[idx].mean()
+    sd = means.std()
+    return float(slopes.mean() / sd) if sd > 0 else np.nan
 
 
 def frame_fingerprint(frame: pd.DataFrame, cols: list[str]) -> str:
@@ -2048,6 +2081,472 @@ record('factor_premia', premium_estimates=premia.round(5).to_dict(orient='record
        benchmark=bench.round(5).reset_index().to_dict(orient='records') if len(ls) else [], quintiles=qm.round(4).reset_index().to_dict(orient='records') if len(ls) and len(qt_all) else [], return_check=chk.round(4).astype({'t0': str}).to_dict(orient='records') if len(chk) else [], tangency=mve.round(5).reset_index().to_dict(orient='records') if len(mve) else [], tangency_weights=mve_w.round(4).reset_index().to_dict(orient='records') if mve_daily else [])
 
 # %% [markdown]
+# ### 8c. Portfolio research on the fixed window: the signal zoo, its EDA and the placebo
+#
+# The sample cannot be extended, so the question is what a fixed window of about 125 held-out days and fifty
+# thousand bonds can say about expected returns, and how to read it honestly. Three changes to 8b:
+#
+# **Every day is a formation date.** 8b rebalanced on the first date of each week or month, about twenty-five and
+# five times. Here every held-out date forms quintiles and holds them for $h \in \{1, 5, 10, 20\}$ business days,
+# so the holding periods overlap and inference uses Newey-West standard errors with $h-1$ lags (and the moving-block
+# bootstrap beside them). The effective number of independent periods is still the window divided by $h$: daily
+# formation uses all the data, it does not create more of it.
+#
+# **A zoo of point-in-time signals, each ranked raw and within duration quintile.** Besides the Kelly-Palhares-
+# Pruitt expected return (the factor premium, carry, both) the sorts cover the bond's own momentum and reversal
+# (trailing 20-day and 5-day yield change), the factor-implied move over the last 20 days, the residual value
+# signal (the trailing residual mean: a bond that cheapened against the model), the state-space forecast, low
+# volatility, illiquidity (print frequency), credit (rating), term (years to worst) and mark staleness (days since
+# the evaluation last moved, a data diagnostic rather than a signal). On a window where yields trended one way, a
+# raw sort is mostly a duration bet on that realisation; the duration-neutral rank is the reading of record and the
+# raw rank sits beside it to show the size of the bet. The target is the evaluated-price total return of 8b.
+#
+# The rank IC is the correlation of the signal's rank with the return's rank over the bonds the signal covers (both
+# within duration quintile for the neutral reading); signal correlations, persistence and the placebo run on a fixed
+# subsample of bonds.
+#
+# **A placebo.** Random signals (independent per bond-day, and fixed per bond so the sort holds the same bonds
+# every day) go through the identical pipeline. Their $t$ distribution is what noise looks like on this window and
+# with this return target, and sets the bar: a single pre-registered test (the state-space signal, duration-
+# neutral, $h = 5$) must clear the placebo's 97.5th percentile of $|t|$; the zoo as a whole is exploratory, so its
+# best $|t|$ is read against the expected maximum of $N$ noise tests, $\sqrt{2\ln N}$, and anything that clears it
+# is a hypothesis for the next window, not a result. The tangency portfolio of 8b gets the same treatment: its
+# factor means are replaced by a trailing 20- and 60-day trend and by their own sign flip, and the training-period
+# mean of each factor is checked against the realised mean of the next month (does the premium estimate predict
+# anything out of sample, or is it the window's drift).
+#
+# The figures are the EDA the zoo needs: signal correlations and persistence, coverage, the return target's zero
+# mass from unchanged evaluations, quintile monotonicity with bootstrap bands, rank IC through time and across
+# horizons, cumulative calendar-time long-shorts against the market with drawdowns, beta and alpha of each sort,
+# the factor exposure of each long-short, the placebo bands, and where the top sorts earn their return.
+
+# %%
+CELL_T('8c. Portfolio research on the fixed window: the signal zoo, its EDA [1]')
+PZ_H = tuple(int(h) for h in CFG.zoo_horizons); PZ_HOLD = int(CFG.zoo_hold_days)
+PZ_LAGS = (1, 5, 10, 20)
+
+
+def nw_t(x: np.ndarray, lag: int) -> float:
+    """Newey-West t of the mean with Bartlett weights to `lag` (overlapping holding periods)."""
+    x = np.asarray(x, float); x = x[np.isfinite(x)]; n = len(x)
+    if n < 8:
+        return np.nan
+    e = x - x.mean(); s = float(e @ e) / n
+    for l_ in range(1, min(lag, n - 1) + 1):
+        s += 2.0 * (1.0 - l_ / (lag + 1.0)) * float(e[l_:] @ e[:-l_]) / n
+    return float(x.mean() / np.sqrt(s / n)) if s > 0 else np.nan
+
+
+def row_rank(X: np.ndarray, method: str = 'average', group: np.ndarray | None = None) -> np.ndarray:
+    """Percentile rank (0, 1] of each row's finite values, by one argsort per call. method 'average' shares the rank
+    across ties, 'first' breaks them by column order. With `group` (integer labels per cell, NaN or < 0 = left out) the
+    rank is taken within each row x group: the sort key is the group label plus the within-row ordinal of the value."""
+    X = np.asarray(X, float); T, N = X.shape; fin = np.isfinite(X)
+    if group is not None:
+        g = np.asarray(group, float); fin = fin & np.isfinite(g) & (g >= 0)
+        o1 = np.argsort(np.where(fin, X, np.inf), axis=1, kind='stable'); p1 = np.empty((T, N)); np.put_along_axis(p1, o1, np.broadcast_to(np.arange(N, dtype=float), (T, N)), axis=1)
+        key = np.where(fin, g * (N + 1.0) + (p1 if method == 'first' else np.take_along_axis(_tie_min(np.take_along_axis(np.where(fin, X, np.inf), o1, axis=1)), np.argsort(o1, axis=1, kind='stable'), axis=1)), np.inf)
+    else:
+        key = np.where(fin, X, np.inf)
+    order = np.argsort(key, axis=1, kind='stable'); sv = np.take_along_axis(key, order, axis=1); ar = np.arange(N, dtype=float)[None, :]
+    if method == 'average':
+        new = np.ones((T, N), bool); new[:, 1:] = sv[:, 1:] != sv[:, :-1]
+        start = np.maximum.accumulate(np.where(new, ar, 0.0), axis=1)
+        last = np.ones((T, N), bool); last[:, :-1] = new[:, 1:]; last = np.minimum.accumulate(np.where(last, ar, N - 1.0)[:, ::-1], axis=1)[:, ::-1]
+        rs = (start + last) / 2.0 + 1.0
+    else:
+        rs = ar + 1.0
+    if group is not None:
+        gs = np.take_along_axis(np.where(fin, g, np.inf), order, axis=1); gnew = np.ones((T, N), bool); gnew[:, 1:] = gs[:, 1:] != gs[:, :-1]
+        gstart = np.maximum.accumulate(np.where(gnew, ar, 0.0), axis=1); glast = np.ones((T, N), bool); glast[:, :-1] = gnew[:, 1:]; glast = np.minimum.accumulate(np.where(glast, ar, N - 1.0)[:, ::-1], axis=1)[:, ::-1]
+        rs = (rs - gstart) / (glast - gstart + 1.0)
+    else:
+        rs = rs / np.maximum(fin.sum(1, keepdims=True), 1)
+    out = np.empty((T, N)); np.put_along_axis(out, order, rs, axis=1)
+    return np.where(fin, out, np.nan)
+
+
+def _tie_min(sv: np.ndarray) -> np.ndarray:
+    """For sorted rows, the position of the first element of each tie group (so equal values get an equal key)."""
+    T, N = sv.shape; ar = np.arange(N, dtype=float)[None, :]; new = np.ones((T, N), bool); new[:, 1:] = sv[:, 1:] != sv[:, :-1]
+    return np.maximum.accumulate(np.where(new, ar, 0.0), axis=1)
+
+
+def row_pearson(A: np.ndarray, B: np.ndarray, min_n: int = 30) -> np.ndarray:
+    """Pearson correlation per row over the columns where both are finite (on ranks: the Spearman IC)."""
+    ok = np.isfinite(A) & np.isfinite(B); n = ok.sum(1).astype(float); n[n < min_n] = np.nan
+    a = np.where(ok, A, 0.0); b = np.where(ok, B, 0.0); am = a.sum(1) / n; bm = b.sum(1) / n
+    ad = np.where(ok, a - am[:, None], 0.0); bd = np.where(ok, b - bm[:, None], 0.0)
+    den = np.sqrt((ad ** 2).sum(1) * (bd ** 2).sum(1)); den[den == 0] = np.nan
+    return (ad * bd).sum(1) / den
+
+
+def tie_share(X: np.ndarray, rows: int = 5) -> float:
+    """Share of a row's finite values that share their value with another (checked on the first rows)."""
+    out = []
+    for r_ in np.asarray(X, float)[:rows]:
+        v = r_[np.isfinite(r_)]
+        if len(v):
+            out.append(1.0 - len(np.unique(v)) / len(v))
+    return float(np.mean(out)) if out else 0.0
+
+
+def leg_mean(R: np.ndarray, M: np.ndarray, min_n: int = 50) -> np.ndarray:
+    """Mean of R over the columns in the boolean mask M, per row; NaN where fewer than min_n finite."""
+    ok = M & np.isfinite(R); n = ok.sum(1).astype(float); n[n < min_n] = np.nan
+    return np.where(ok, R, 0.0).sum(1) / n
+
+
+def _premia_zoo() -> dict:
+    rng = np.random.default_rng(CFG.seed)
+    # ---- (1) the wide grid: panel dates from twenty-five business days before the first held-out date, held-out bonds as columns
+    _oos_dates = pd.DatetimeIndex(sorted(resid['date'].unique())); _all_dates = pd.DatetimeIndex(sorted(to_ns(raw_panel['date']).unique()))
+    _i0 = max(int(np.searchsorted(_all_dates, _oos_dates[0])) - 25, 0); dates = _all_dates[_i0:]
+    bonds = pd.Index(sorted(resid['cusip'].astype('string').unique()))
+    _rp = raw_panel[['cusip', 'date', 'closing_price', 'closing_yield', 'cpn', 'modified_duration_lag1']].copy(); _rp['cusip'] = _rp['cusip'].astype('string'); _rp['date'] = to_ns(_rp['date'])
+    _rp = _rp[_rp['date'].isin(dates) & _rp['cusip'].isin(bonds)].drop_duplicates(['cusip', 'date'])
+
+    def wide(frame: pd.DataFrame, col: str, dates_: pd.DatetimeIndex = dates) -> np.ndarray:
+        return frame.pivot(index='date', columns='cusip', values=col).reindex(index=dates_, columns=bonds).to_numpy(float)
+
+    P = wide(_rp, 'closing_price'); Y = wide(_rp, 'closing_yield'); D = wide(_rp, 'modified_duration_lag1')
+    CPN = pd.to_numeric(_rp.groupby('cusip', observed=True)['cpn'].first(), errors='coerce').reindex(bonds).fillna(0.0).to_numpy(float)
+    P = np.where(P > 1.0, P, np.nan)
+    oos = np.flatnonzero(dates.isin(_oos_dates)); T = len(oos); N = len(bonds)
+    cal_days = np.array([(d_ - dates[0]).days for d_ in dates], float)
+
+    def fwd_ret(h: int) -> tuple[np.ndarray, np.ndarray]:
+        """Total return (bp of price, with accrued coupon) and yield change (bp) from each held-out date to h grid days later."""
+        R = np.full((T, N), np.nan); DY = np.full((T, N), np.nan)
+        for k_, i in enumerate(oos):
+            if i + h < len(dates):
+                days_ = cal_days[i + h] - cal_days[i]
+                R[k_] = 1e4 * (P[i + h] - P[i] + CPN * days_ / 365.0) / P[i]; DY[k_] = 100.0 * (Y[i + h] - Y[i])
+        R = np.where((np.abs(R) <= CFG.premia_max_abs_ret_bp) & (np.abs(DY) <= 500.0), R, np.nan); DY = np.where(np.isfinite(R), DY, np.nan)
+        return R, DY
+
+    R1 = fwd_ret(1)[0]; mkt_1 = np.nanmean(R1, axis=1)
+    # ---- (2) the signals on the held-out dates (nothing after the formation date enters any of them)
+    _rs = resid[['cusip', 'date', 'fold', 'fitted_bp', 'pit_residual'] + beta_cols + [c for c in ['resid_mean', 'target_abs_vol', 'ssm_signal'] if c in resid.columns]].copy(); _rs['cusip'] = _rs['cusip'].astype('string'); _rs['date'] = to_ns(_rs['date'])
+    _rs = _rs[_rs['cusip'].isin(bonds)].drop_duplicates(['cusip', 'date'])
+    _md = model[['cusip', 'date'] + [c for c in ['rating_score', 'years_to_worst', 'print_freq_lag', 'trade_size_lag', 'days_since_mark_move', 'is_callable'] if c in model.columns]].copy(); _md['cusip'] = _md['cusip'].astype('string'); _md['date'] = to_ns(_md['date'])
+    _md = _md[_md['date'].isin(_oos_dates) & _md['cusip'].isin(bonds)].drop_duplicates(['cusip', 'date'])
+    _od = dates[oos]
+    B = np.stack([wide(_rs, c, _od) for c in beta_cols], axis=-1)
+    fold_by_date = _rs.groupby('date')['fold'].first().reindex(_od).ffill().bfill().to_numpy()
+    lam_by_date = np.vstack([LAM.get(int(k_), np.full(CFG.selected_k, np.nan)) for k_ in fold_by_date])
+    bdot = np.einsum('tnj,tj->tn', B, lam_by_date); del B               # expected daily yield change (bp) under the premium in force
+    Doos = D[oos]; Yoos = Y[oos]
+    FIT = wide(_rs, 'fitted_bp', _od); _fit_cum = pd.DataFrame(FIT).rolling(20, min_periods=10).sum().to_numpy()
+
+    def lagged_dy(k: int) -> np.ndarray:
+        out = np.full((T, N), np.nan)
+        for j_, i in enumerate(oos):
+            if i - k >= 0:
+                out[j_] = 100.0 * (Y[i] - Y[i - k])
+        return out
+
+    SIGS: dict[str, np.ndarray] = {'factor premium (-D x beta.lambda)': -Doos * bdot, 'carry (yield)': Yoos.copy()}
+    SIGS['momentum: own 20d yield fall'] = -lagged_dy(20); SIGS['reversal: own 5d yield rise'] = lagged_dy(5)
+    SIGS['factor-implied momentum (20d fitted move, yields down)'] = -_fit_cum
+    if 'resid_mean' in _rs.columns:
+        SIGS['residual value (trailing residual mean; cheap = long)'] = wide(_rs, 'resid_mean', _od)
+    if 'ssm_signal' in _rs.columns:
+        SIGS['state-space signal (-forecast)'] = -wide(_rs, 'ssm_signal', _od)
+    if 'target_abs_vol' in _rs.columns:
+        SIGS['low volatility (-trailing sd)'] = -wide(_rs, 'target_abs_vol', _od)
+    if 'print_freq_lag' in _md.columns:
+        SIGS['illiquidity (-print frequency)'] = -wide(_md, 'print_freq_lag', _od)
+    if 'rating_score' in _md.columns:
+        SIGS['credit (-rating score; lower quality = long)'] = -wide(_md, 'rating_score', _od)
+    if 'years_to_worst' in _md.columns:
+        SIGS['term (years to worst)'] = wide(_md, 'years_to_worst', _od)
+    if 'days_since_mark_move' in _md.columns:
+        SIGS['stale mark (days since the evaluation moved)'] = wide(_md, 'days_since_mark_move', _od)
+    SIGS = {k_: v_.astype(np.float32) for k_, v_ in SIGS.items()}       # ranks are what the sorts use; single precision halves the footprint
+    PREM_CARRY = lambda h: (Yoos * 7.0 * h / 5.0 / 365.0 * 100.0) - Doos * bdot * h   # the 8b expected return at horizon h: carry over ~h business days minus the premium move
+    names = list(SIGS) + ['factor premium + carry']
+    # ---- (3) ranks: raw and within duration quintile; quintile legs; IC and long-short at every horizon
+    dq = np.ceil(row_rank(Doos, 'first') * 5.0)                        # duration quintile within the date (NaN without a duration)
+
+    def ranks(X: np.ndarray) -> dict:
+        """Quintile ranks (ties broken by column order, so the legs are balanced) and IC ranks (ties share a rank), raw and within duration quintile."""
+        X = np.asarray(X, float); q_raw = row_rank(X, 'first'); q_neu = row_rank(X, 'first', dq); tied = tie_share(X) > 0.01
+        return {'q_raw': q_raw, 'q_neu': q_neu, 'ic_raw': row_rank(X, 'average') if tied else q_raw, 'ic_neu': row_rank(X, 'average', dq) if tied else q_neu}
+
+    def sig_at(name: str, h: int) -> np.ndarray:
+        return PREM_CARRY(h) if name == 'factor premium + carry' else SIGS[name]
+
+    RET = {}; RR = {}
+    for h in PZ_H:
+        R, DY = fwd_ret(h); RET[h] = (R.astype(np.float32), DY.astype(np.float32)); RR[h] = {'raw': row_rank(R, 'average').astype(np.float32), 'duration-neutral': row_rank(R, 'average', dq).astype(np.float32)}
+    Rh = RET[PZ_HOLD][0].astype(float); sub = np.sort(rng.choice(N, min(N, CFG.zoo_placebo_bonds), replace=False))   # the bond subsample for the placebo, the signal correlations and the persistence
+    rows, ic_hold, ls_hold, qt_hold, q_hold, legs_hold, cov_rows, RK = [], {}, {}, {}, {}, {}, {}, {}
+    ann_h = {h: np.sqrt(252.0 / h) for h in PZ_H}
+    for name in names:
+        if name != 'factor premium + carry':
+            rk_ = ranks(SIGS[name]); RK[name] = rk_['ic_raw'][:, sub].astype(np.float32)
+        for h in PZ_H:
+            if name == 'factor premium + carry':
+                rk_ = ranks(sig_at(name, h))
+                if h == PZ_HOLD:
+                    RK[name] = rk_['ic_raw'][:, sub].astype(np.float32)
+            R, DY = RET[h]
+            for kind, rk, rk_ic in [('duration-neutral', rk_['q_neu'], rk_['ic_neu']), ('raw', rk_['q_raw'], rk_['ic_raw'])]:
+                q = np.ceil(rk * 5.0); long_ = q == 5; short_ = q == 1
+                ls = leg_mean(R, long_) - leg_mean(R, short_); ic = row_pearson(rk_ic, RR[h][kind])
+                ls_dy = leg_mean(DY, short_) - leg_mean(DY, long_)
+                v = ls[np.isfinite(ls)]
+                rows.append({'signal': name, 'ranking': kind, 'h': h, 'formation dates': int(np.isfinite(ls).sum()), 'bonds per leg': float(np.nanmean(long_.sum(1))),
+                             'IC mean': float(np.nanmean(ic)), 'IC NW t': nw_t(ic, h - 1), 'LS mean (bp per h days)': float(v.mean()) if len(v) else np.nan, 'LS NW t': nw_t(ls, h - 1),
+                             'LS block-boot t': block_bootstrap_t(v, max(CFG.block_days, h), CFG.n_boot, CFG.seed) if len(v) else np.nan, 'LS Sharpe (annualised)': float(ann_h[h] * v.mean() / v.std(ddof=1)) if len(v) > 2 and v.std(ddof=1) > 0 else np.nan,
+                             'hit rate': float((v > 0).mean()) if len(v) else np.nan, 'LS yield change, short minus long (bp)': float(np.nanmean(ls_dy))})
+                if h == PZ_HOLD:
+                    ic_hold[(name, kind)] = ic; ls_hold[(name, kind)] = ls
+                    qt_hold[(name, kind)] = np.array([np.nanmean(leg_mean(R, q == q_)) for q_ in range(1, 6)])
+                    if kind == 'duration-neutral':
+                        legs_hold[name] = (long_, short_); q_hold[name] = np.where(np.isfinite(q), q, 0).astype(np.int8); cov_rows[name] = np.isfinite(rk).sum(1) / np.maximum(np.isfinite(R).sum(1), 1)
+    table = pd.DataFrame(rows).set_index(['signal', 'ranking', 'h'])
+    # quintile bootstrap bands at the holding horizon (over formation dates, 5-day blocks)
+    qt_ci = {}
+    for key_, q in q_hold.items():
+        per_q = np.column_stack([leg_mean(Rh, q == q_) for q_ in range(1, 6)]); per_q = per_q[np.isfinite(per_q).all(1)]
+        if len(per_q) >= 10:
+            nb = int(np.ceil(len(per_q) / CFG.block_days)); draws = np.empty((200, 5))
+            for b_ in range(200):
+                st = rng.integers(0, len(per_q) - CFG.block_days + 1, nb); idx = (st[:, None] + np.arange(CFG.block_days)[None, :]).ravel()[:len(per_q)]; draws[b_] = per_q[idx].mean(0)
+            qt_ci[key_] = np.percentile(draws, [2.5, 97.5], axis=0)
+    # ---- (4) calendar-time daily long-short at the holding horizon: the average of the h overlapping cohorts' one-day returns
+    def calendar_ls(long_: np.ndarray, short_: np.ndarray, h: int) -> np.ndarray:
+        num = np.zeros(T); cnt = np.zeros(T)
+        for k_ in range(h):
+            Lk = np.zeros_like(long_); Sk = np.zeros_like(short_)
+            if k_ < T:
+                Lk[k_:] = long_[:T - k_]; Sk[k_:] = short_[:T - k_]
+            r_ = leg_mean(R1, Lk) - leg_mean(R1, Sk); ok_ = np.isfinite(r_); num[ok_] += r_[ok_]; cnt[ok_] += 1
+        return np.where(cnt > 0, num / np.maximum(cnt, 1), np.nan)
+
+    daily = pd.DataFrame({name: calendar_ls(l_, s_, PZ_HOLD) for name, (l_, s_) in legs_hold.items()}, index=_od); daily['MARKET: equal-weighted universe'] = mkt_1
+    FD = resid.groupby('date')[_fc].first().reindex(_od).shift(-1)      # the factor move on t+1 prices the one-day return from t
+    cal_rows = []
+    for name in legs_hold:
+        v = daily[name].to_numpy(float); m = mkt_1; ok = np.isfinite(v) & np.isfinite(m)
+        b = float(np.cov(v[ok], m[ok], ddof=1)[0, 1] / np.var(m[ok], ddof=1)) if ok.sum() > 5 and np.var(m[ok]) > 0 else np.nan; a = float(v[ok].mean() - b * m[ok].mean()) if np.isfinite(b) else np.nan
+        e_ = v[ok] - (a + b * m[ok]) if np.isfinite(b) else np.array([np.nan])
+        cum = np.nancumsum(v); dd = float((cum - np.maximum.accumulate(cum)).min()) if ok.any() else np.nan
+        mm = pd.Series(v, index=_od).groupby(_od.to_period('M')).sum()
+        Xf = np.column_stack([np.ones(ok.sum()), m[ok], -FD.to_numpy(float)[ok]]); okf = np.isfinite(Xf).all(1)
+        bf = np.linalg.lstsq(Xf[okf], v[ok][okf], rcond=None)[0] if okf.sum() > 10 else np.full(2 + CFG.selected_k, np.nan)
+        r2 = 1 - np.var(v[ok][okf] - Xf[okf] @ bf) / np.var(v[ok][okf]) if okf.sum() > 10 and np.var(v[ok][okf]) > 0 else np.nan
+        cal_rows.append({'signal': name, 'days': int(ok.sum()), 'mean (bp/day)': float(v[ok].mean()), 'Sharpe (annualised)': float(np.sqrt(252.0) * v[ok].mean() / v[ok].std(ddof=1)) if ok.sum() > 2 and v[ok].std(ddof=1) > 0 else np.nan,
+                         'block-boot t': block_bootstrap_t(v[ok], CFG.block_days, CFG.n_boot, CFG.seed), 'beta to market': b, 'alpha (bp/day)': a, 'alpha t': float(np.sqrt(ok.sum()) * a / e_.std(ddof=1)) if np.isfinite(b) and e_.std(ddof=1) > 0 else np.nan,
+                         'max drawdown (bp)': dd, 'months positive': float((mm > 0).mean()), 'months': int(len(mm)), **{f'loading on -f{j+1}': float(bf[2 + j]) for j in range(CFG.selected_k)}, 'R2 on market + factors': float(r2) if np.isfinite(r2) else np.nan})
+    calendar = pd.DataFrame(cal_rows).set_index('signal')
+    # ---- (5) signal EDA: correlation between signals (mean cross-sectional Spearman), persistence (rank autocorrelation by lag), coverage
+    corr = pd.DataFrame(index=names, columns=names, dtype=float)
+    for a_ in names:
+        for b_ in names:
+            corr.loc[a_, b_] = 1.0 if a_ == b_ else float(np.nanmean(row_pearson(RK[a_], RK[b_])))
+    pers = pd.DataFrame({f'lag {l_}': {name: float(np.nanmean(row_pearson(RK[name][:-l_], RK[name][l_:]))) if T > l_ + 5 else np.nan for name in names} for l_ in PZ_LAGS})
+    coverage = pd.DataFrame(cov_rows, index=_od)
+    zero_share = pd.Series((R1 == 0).sum(1) / np.maximum(np.isfinite(R1).sum(1), 1), index=_od)
+    ret_sample = Rh[np.isfinite(Rh)]; ret_sample = rng.choice(ret_sample, min(len(ret_sample), 200_000), replace=False)
+    # ---- (6) the placebo: random signals through the same pipeline at the holding horizon (raw ranks), on a bond subsample
+    Rs = Rh[:, sub].astype(float); RRs = RR[PZ_HOLD]['raw'][:, sub]; pl_rows = []
+    for kind in ['independent per bond-day', 'fixed per bond']:
+        for d_ in range(CFG.zoo_placebo_draws):
+            Xp = rng.standard_normal((T, len(sub))) if kind.startswith('independent') else np.tile(rng.standard_normal(len(sub)), (T, 1))
+            Xp = np.where(np.isfinite(Rs), Xp, np.nan); rk = row_rank(Xp, 'first'); q = np.ceil(rk * 5.0); long_ = q == 5; short_ = q == 1
+            ls = leg_mean(Rs, long_, 20) - leg_mean(Rs, short_, 20); ic = row_pearson(rk, RRs); v = ls[np.isfinite(ls)]
+            pl_rows.append({'placebo': kind, 'draw': d_, 'IC NW t': nw_t(ic, PZ_HOLD - 1), 'LS NW t': nw_t(ls, PZ_HOLD - 1), 'LS naive t': float(np.sqrt(len(v)) * v.mean() / v.std(ddof=1)) if len(v) > 2 and v.std(ddof=1) > 0 else np.nan, 'LS mean (bp)': float(v.mean()) if len(v) else np.nan})
+    placebo = pd.DataFrame(pl_rows)
+    # ---- (7) where the top sorts earn it: the duration-neutral long-short at the holding horizon inside characteristic buckets
+    top = calendar['block-boot t'].abs().sort_values(ascending=False).index[:3].tolist() if len(calendar) else []
+    buckets = {}
+    if 'rating_score' in _md.columns:
+        rs_ = wide(_md, 'rating_score', _od); buckets['rating'] = {'AAA/AA': rs_ >= 18, 'A': (rs_ >= 15) & (rs_ < 18), 'BBB': (rs_ >= 12) & (rs_ < 15), 'HY or NR': (rs_ < 12) | ~np.isfinite(rs_)}
+    buckets['duration'] = {'< 3y': Doos < 3, '3-7y': (Doos >= 3) & (Doos < 7), '7-12y': (Doos >= 7) & (Doos < 12), '>= 12y': Doos >= 12}
+    if 'is_callable' in _md.columns:
+        ic_ = wide(_md, 'is_callable', _od); buckets['structure'] = {'bullet': ic_ == 0, 'callable': ic_ == 1}
+    if 'target_abs_vol' in _rs.columns:
+        tv_ = wide(_rs, 'target_abs_vol', _od); tq = np.ceil(row_rank(tv_, 'first') * 3.0); buckets['trailing vol tercile'] = {'low': tq == 1, 'mid': tq == 2, 'high': tq == 3}
+    where = {}
+    for dim, bk in buckets.items():
+        w_rows = []
+        for name in top:
+            long_, short_ = legs_hold[name]
+            for lab, m_ in bk.items():
+                ls = leg_mean(Rh, long_ & m_, 30) - leg_mean(Rh, short_ & m_, 30); v = ls[np.isfinite(ls)]
+                w_rows.append({'signal': name, dim: lab, 'LS mean (bp per h days)': float(v.mean()) if len(v) else np.nan, 'NW t': nw_t(ls, PZ_HOLD - 1), 'formation dates': int(len(v)), 'bonds per leg': float(np.nanmean((long_ & m_).sum(1)))})
+        where[dim] = pd.DataFrame(w_rows)
+    # ---- (8) the tangency portfolio against trend and sign-flip placebos, and the premium estimate against the next month's realisation
+    _fdf = resid.groupby('date')[_fc + ['fold']].first().sort_index(); G = -_fdf[_fc].to_numpy(float); tg = {}
+    w_fold = np.full_like(G, np.nan); w_flip = np.full_like(G, np.nan)
+    for i_, (d_, k_) in enumerate(zip(_fdf.index, _fdf['fold'])):
+        if int(k_) in LAM:
+            w = np.linalg.solve(SIG[int(k_)] + 1e-9 * np.eye(CFG.selected_k), -LAM[int(k_)]); w_fold[i_] = w / np.abs(w).sum(); w_flip[i_] = -w_fold[i_]
+    tg['tangency: fold premium (8b)'] = np.einsum('ij,ij->i', G, w_fold); tg['tangency: sign-flipped premium'] = np.einsum('ij,ij->i', G, w_flip)
+    for win in CFG.zoo_trend_windows:
+        w_tr = np.full_like(G, np.nan)
+        for i_ in range(len(G)):
+            if i_ >= win:
+                mu = G[i_ - win:i_].mean(0); Sg = np.cov(G[i_ - win:i_].T) + 1e-9 * np.eye(CFG.selected_k); w = np.linalg.solve(Sg, mu); w_tr[i_] = w / np.abs(w).sum()
+        tg[f'trend: trailing {win}-day factor mean (time-series momentum)'] = np.einsum('ij,ij->i', G, w_tr)
+    tg['equal weight of factors'] = G.mean(1); tg['MARKET: equal-weighted universe (yield space)'] = (-resid.groupby('date')['target_bp'].mean()).reindex(_fdf.index).to_numpy()
+    tang_d = pd.DataFrame(tg, index=_fdf.index); mk_ = tang_d['MARKET: equal-weighted universe (yield space)'].to_numpy(float); t_rows = []
+    for c_ in tang_d.columns:
+        v = tang_d[c_].to_numpy(float); ok = np.isfinite(v) & np.isfinite(mk_)
+        b = float(np.cov(v[ok], mk_[ok], ddof=1)[0, 1] / np.var(mk_[ok], ddof=1)) if ok.sum() > 5 and np.var(mk_[ok]) > 0 else np.nan; a = float(v[ok].mean() - b * mk_[ok].mean()) if np.isfinite(b) else np.nan; e_ = v[ok] - (a + b * mk_[ok]) if np.isfinite(b) else np.array([np.nan])
+        t_rows.append({'portfolio': c_, 'days': int(ok.sum()), 'mean (bp/day)': float(v[ok].mean()) if ok.any() else np.nan, 'Sharpe (annualised)': float(np.sqrt(252.0) * v[ok].mean() / v[ok].std(ddof=1)) if ok.sum() > 2 and v[ok].std(ddof=1) > 0 else np.nan, 'block-boot t': block_bootstrap_t(v[ok], CFG.block_days, CFG.n_boot, CFG.seed) if ok.sum() > 10 else np.nan,
+                       'beta to market': b, 'alpha (bp/day)': a, 'alpha t': float(np.sqrt(ok.sum()) * a / e_.std(ddof=1)) if np.isfinite(b) and e_.std(ddof=1) > 0 else np.nan})
+    tangency = pd.DataFrame(t_rows).set_index('portfolio')
+    lam_rows = []
+    for k_, lam in LAM.items():
+        te_ = _fdf[_fdf['fold'] == k_]
+        if len(te_) >= 5:
+            real = te_[_fc].to_numpy(float).mean(0)
+            for j in range(CFG.selected_k):
+                lam_rows.append({'fold': k_, 'factor': f'factor{j+1}', 'premium estimate (training mean, bp/day)': float(lam[j]), 'realised next-month mean (bp/day)': float(real[j]), 'same sign': bool(np.sign(lam[j]) == np.sign(real[j])), 'test days': len(te_)})
+    lam_check = pd.DataFrame(lam_rows)
+    return {'table': table, 'calendar': calendar, 'daily': daily, 'ic_hold': pd.DataFrame({f'{k[0]} | {k[1]}': v for k, v in ic_hold.items()}, index=_od), 'ls_hold': pd.DataFrame({f'{k[0]} | {k[1]}': v for k, v in ls_hold.items()}, index=_od),
+            'quintiles': pd.DataFrame({f'{k[0]} | {k[1]}': v for k, v in qt_hold.items()}, index=[f'Q{q_}' for q_ in range(1, 6)]).T, 'quintile_ci': qt_ci, 'corr': corr, 'persistence': pers, 'coverage': coverage, 'zero_share': zero_share, 'ret_sample': ret_sample,
+            'placebo': placebo, 'where': where, 'top': top, 'tangency': tangency, 'tangency_daily': tang_d, 'lam_check': lam_check, 'names': names, 'bonds': int(N), 'dates': int(T), 'market_hold': float(np.nanmean(np.nanmean(Rh, axis=1)))}
+
+
+ZOO = cached('premia_zoo', _premia_zoo, deps=[RESID_FP, PANEL_FP, STAGE_KEYS.get('ssm_pooled'), repr({k_: np.round(v, 6).tolist() for k_, v in sorted(LAM.items())}), repr(PZ_H), PZ_HOLD], code=[nw_t, row_rank, _tie_min, row_pearson, tie_share, leg_mean, block_bootstrap_t])
+zoo_tab, zoo_cal, zoo_pl = ZOO['table'], ZOO['calendar'], ZOO['placebo']
+_n_tests = int(zoo_tab.index.get_level_values(0).nunique() * len(PZ_H) * 2); _fam_bar = float(np.sqrt(2.0 * np.log(max(_n_tests, 2))))
+_pl_q = zoo_pl.groupby('placebo')[['IC NW t', 'LS NW t', 'LS naive t']].agg(lambda s: float(np.nanpercentile(np.abs(s), 97.5)))
+_pl_sd = zoo_pl.groupby('placebo')[['IC NW t', 'LS NW t', 'LS naive t']].std()
+print(f'Signal zoo on {ZOO["dates"]} held-out formation dates and {ZOO["bonds"]:,} bonds; quintile long-short (top minus bottom, equal-weighted) from every date, held h business days; Newey-West t with h - 1 lags; the market (equal-weighted universe) returned {ZOO["market_hold"]:+.1f} bp per {PZ_HOLD} days on average.')
+print(f'Placebo (random signals through the same pipeline, h = {PZ_HOLD}, {CFG.zoo_placebo_draws} draws each): 97.5th percentile of |t| and the sd of t. The bar for the one pre-registered test is the 97.5th percentile; for the zoo of {_n_tests} tests the expected maximum of |t| under noise is about {_fam_bar:.1f}:'); display(pd.concat({'|t| 97.5th pct': _pl_q, 'sd of t': _pl_sd}, axis=1).round(2))
+_hold = zoo_tab.xs(PZ_HOLD, level='h')
+_dn = _hold.xs('duration-neutral', level='ranking').sort_values('LS NW t', ascending=False); _rw = _hold.xs('raw', level='ranking').reindex(_dn.index)
+_bar_single = float(_pl_q.loc['fixed per bond', 'LS NW t']) if 'fixed per bond' in _pl_q.index else 2.0
+view = pd.DataFrame({'IC mean': _dn['IC mean'], 'IC NW t': _dn['IC NW t'], 'LS mean (bp per h days)': _dn['LS mean (bp per h days)'], 'LS NW t': _dn['LS NW t'], 'LS block-boot t': _dn['LS block-boot t'], 'hit rate': _dn['hit rate'], 'bonds per leg': _dn['bonds per leg'],
+                     'raw: LS mean (bp)': _rw['LS mean (bp per h days)'], 'raw: LS NW t': _rw['LS NW t'], 'clears placebo 97.5%': _dn['LS NW t'].abs() > _bar_single, 'clears family bar': _dn['LS NW t'].abs() > _fam_bar})
+print(f'The zoo at h = {PZ_HOLD}, duration-neutral ranking (the reading of record), with the raw ranking beside it (the size of the duration bet on this window); sorted by the long-short Newey-West t:'); display(view.round(3))
+_hz = zoo_tab.xs('duration-neutral', level='ranking')[['IC mean', 'IC NW t', 'LS mean (bp per h days)', 'LS NW t']].unstack('h')
+print('Across horizons (duration-neutral): rank IC and long-short by holding period. A premium that is information rather than a one-period artefact keeps its sign as h grows; a mark-timing artefact fades after the evaluation catches up:'); display(_hz.round(3))
+print(f'Calendar-time daily long-short at h = {PZ_HOLD} (the average of the {PZ_HOLD} overlapping cohorts\' one-day returns): against the equal-weighted market, with the loadings of the daily long-short on the market and the factor realisations (minus f: yields down = gain) and the share of its variance they explain:'); display(zoo_cal.round(3))
+print('Signal persistence: rank autocorrelation of each signal with itself l days later (1 = the same sort every day; turnover at the holding horizon is roughly one minus the value at lag h):'); display(ZOO['persistence'].round(3))
+print('The tangency portfolio of 8b against its placebos (yield space, bp/day): the fold premium, the same weights sign-flipped, a trailing-window trend in the factor realisations (time-series momentum, no model), equal weight, and the market:'); display(ZOO['tangency'].round(3))
+_lc = ZOO['lam_check']
+if len(_lc):
+    print(f'Does the premium estimate predict the next month? Training-period mean of each factor against the realised mean of its test month: same sign in {int(_lc["same sign"].sum())} of {len(_lc)} fold x factor cases (coin flip: {len(_lc) / 2:.0f}); correlation across cases {_lc["premium estimate (training mean, bp/day)"].corr(_lc["realised next-month mean (bp/day)"]):+.2f}:'); display(_lc.round(3))
+for dim, wdf in ZOO['where'].items():
+    if len(wdf):
+        print(f'Where the top sorts earn it, by {dim} (duration-neutral long-short at h = {PZ_HOLD} inside the bucket; bp per h days, NW t):'); display(wdf.pivot(index='signal', columns=dim, values='LS mean (bp per h days)').round(1).astype(str) + ' (t ' + wdf.pivot(index='signal', columns=dim, values='NW t').round(1).astype(str) + ')')
+_top1 = view.index[0]; _ss = [n_ for n_ in view.index if n_.startswith('state-space')]
+print(f'Reading. Pre-registered single test (state-space signal, duration-neutral, h = {PZ_HOLD}): ' + (f'LS NW t {view.loc[_ss[0], "LS NW t"]:+.2f} against the placebo bar {_bar_single:.2f}, IC NW t {view.loc[_ss[0], "IC NW t"]:+.2f}; ' if _ss else 'not available; ') + f'best of the zoo on LS t: {_top1} at {view.loc[_top1, "LS NW t"]:+.2f} against the family bar {_fam_bar:.2f} ({"clears it: a hypothesis for the next window" if abs(view.loc[_top1, "LS NW t"]) > _fam_bar else "does not clear it: consistent with noise over the zoo"}).')
+record('premia_zoo', table=zoo_tab.round(5).reset_index().to_dict(orient='records'), calendar=zoo_cal.round(5).reset_index().to_dict(orient='records'), placebo_quantiles=_pl_q.round(4).reset_index().to_dict(orient='records'), family_bar=_fam_bar, n_tests=_n_tests, single_bar=_bar_single,
+       persistence=ZOO['persistence'].round(4).reset_index().to_dict(orient='records'), tangency=ZOO['tangency'].round(5).reset_index().to_dict(orient='records'), lam_check=_lc.round(5).to_dict(orient='records') if len(_lc) else [], where={k_: v_.round(4).to_dict(orient='records') for k_, v_ in ZOO['where'].items()},
+       quintiles=ZOO['quintiles'].round(4).reset_index().to_dict(orient='records'), hold_days=PZ_HOLD, horizons=list(PZ_H), formation_dates=ZOO['dates'], bonds=ZOO['bonds'], best_signal=_top1, best_ls_nw_t=float(view.loc[_top1, 'LS NW t']), single_test=({'signal': _ss[0], 'ls_nw_t': float(view.loc[_ss[0], 'LS NW t']), 'ic_nw_t': float(view.loc[_ss[0], 'IC NW t'])} if _ss else {}))
+
+# %%
+CELL_T('8c. Portfolio research on the fixed window: the signal zoo, its EDA [2]')
+_names = ZOO['names']; _od = ZOO['daily'].index; _short = lambda s_: s_.split(' (')[0][:34]
+_pal = plt.cm.tab20(np.linspace(0, 1, max(len(_names), 2)))
+# ---- figure 1: the signals themselves (correlation, persistence, coverage) and the return target (zero mass, distribution)
+fig, ax = plt.subplots(2, 3, figsize=(20, 11))
+_c = ZOO['corr'].astype(float); im = ax[0, 0].imshow(_c.to_numpy(), cmap='RdBu_r', vmin=-1, vmax=1); ax[0, 0].set_xticks(range(len(_c))); ax[0, 0].set_xticklabels([_short(n_) for n_ in _c.columns], rotation=90, fontsize=7); ax[0, 0].set_yticks(range(len(_c))); ax[0, 0].set_yticklabels([_short(n_) for n_ in _c.index], fontsize=7); ax[0, 0].grid(False); plt.colorbar(im, ax=ax[0, 0], fraction=0.046); ax[0, 0].set_title('Signal correlation (mean cross-sectional Spearman of the raw ranks)', fontsize=10)
+for i_ in range(len(_c)):
+    for j_ in range(len(_c)):
+        ax[0, 0].text(j_, i_, f'{_c.iloc[i_, j_]:+.1f}', ha='center', va='center', fontsize=6, color='white' if abs(_c.iloc[i_, j_]) > 0.6 else 'black')
+ZOO['persistence'].T.plot(ax=ax[0, 1], marker='o', color=_pal, legend=False); _h, _l = ax[0, 1].get_legend_handles_labels(); ax[0, 1].legend(_h, [_short(l_) for l_ in _l], fontsize=6, ncol=2, loc='lower left'); ax[0, 1].set_ylim(-0.1, 1.05); ax[0, 1].set_title('Signal persistence: rank autocorrelation at lag l days', fontsize=10); ax[0, 1].set_xlabel('')
+ZOO['coverage'].plot(ax=ax[0, 2], color=_pal[:ZOO['coverage'].shape[1]], lw=1, legend=False); ax[0, 2].set_ylim(0, 1.05); ax[0, 2].set_title('Coverage: share of bonds with a forward return that carry the signal', fontsize=10); ax[0, 2].set_xlabel(''); ax[0, 2].tick_params(axis='x', rotation=30, labelsize=8)
+ax[0, 2].legend([_short(n_) for n_ in ZOO['coverage'].columns], fontsize=6, loc='lower left', ncol=2)
+ZOO['zero_share'].plot(ax=ax[1, 0], color='#C44E52', lw=1); ax[1, 0].set_ylim(0, 1); ax[1, 0].set_title('Share of bonds whose evaluated price did not move over one day (the zero mass of the daily return)', fontsize=10); ax[1, 0].set_xlabel(''); ax[1, 0].tick_params(axis='x', rotation=30, labelsize=8)
+_rs_ = ZOO['ret_sample']; ax[1, 1].hist(np.clip(_rs_, -300, 300), bins=150, color='#4C72B0', alpha=0.8, density=True); ax[1, 1].set_yscale('log'); ax[1, 1].set_title(f'Distribution of the {PZ_HOLD}-day total return (bp of price; zero share {float((_rs_ == 0).mean()):.1%}, sd {_rs_.std():.0f})', fontsize=10); ax[1, 1].set_xlabel('bp')
+_rv = ZOO['table'].xs(PZ_HOLD, level='h').reset_index().pivot(index='signal', columns='ranking', values='LS mean (bp per h days)').reindex(_names)
+_rv.plot.barh(ax=ax[1, 2], color={'duration-neutral': '#4C72B0', 'raw': '#C44E52'}); ax[1, 2].axvline(0, color='k', lw=0.6); ax[1, 2].set_yticklabels([_short(n_) for n_ in _rv.index], fontsize=7); ax[1, 2].set_title(f'Long-short at h = {PZ_HOLD}: duration-neutral vs raw ranking (bp; the gap is the duration bet on this window)', fontsize=10); ax[1, 2].set_ylabel(''); ax[1, 2].legend(fontsize=8)
+fig.suptitle('8c. The signals and the return target on the fixed window', fontsize=12); plt.tight_layout(); savefig('08c_signals_eda')
+# ---- figure 2: quintile monotonicity with bootstrap bands, duration-neutral at the holding horizon
+_qt = ZOO['quintiles']; _keys = [f'{n_} | duration-neutral' for n_ in _names if f'{n_} | duration-neutral' in _qt.index]
+nc = 4; nr = int(np.ceil(len(_keys) / nc)); fig, ax = plt.subplots(nr, nc, figsize=(19, 3.6 * nr), squeeze=False)
+for a_, k_ in zip(ax.ravel(), _keys):
+    name = k_.split(' | ')[0]; y_ = _qt.loc[k_].to_numpy(float); a_.plot(range(1, 6), y_, marker='o', color='#4C72B0')
+    ci = ZOO['quintile_ci'].get(name)
+    if ci is not None:
+        a_.fill_between(range(1, 6), ci[0], ci[1], color='#4C72B0', alpha=0.15)
+    a_.axhline(ZOO['market_hold'], color='k', ls='--', lw=0.8); a_.set_title(_short(name) + f'  (LS t {ZOO["table"].loc[(name, "duration-neutral", PZ_HOLD), "LS NW t"]:+.1f})', fontsize=9); a_.set_xticks(range(1, 6)); a_.set_xlabel('quintile (1 = low signal)', fontsize=8)
+for a_ in ax.ravel()[len(_keys):]:
+    a_.set_visible(False)
+fig.suptitle(f'Mean {PZ_HOLD}-day total return by signal quintile, duration-neutral (bp; band = 95% block bootstrap over formation dates; dashed = market)', fontsize=11); plt.tight_layout(); savefig('08c_quintiles')
+# ---- figure 3: IC across horizons and through time
+fig, ax = plt.subplots(2, 2, figsize=(18, 10))
+_hz = ZOO['table'].xs('duration-neutral', level='ranking')
+for n_, c_ in zip(_names, _pal):
+    g_ = _hz.loc[n_]; ax[0, 0].plot(g_.index, g_['IC mean'], marker='o', color=c_, label=_short(n_)); ax[0, 1].plot(g_.index, g_['LS NW t'], marker='o', color=c_)
+ax[0, 0].axhline(0, color='k', lw=0.6); ax[0, 0].set_xticks(list(PZ_H)); ax[0, 0].set_title('Mean rank IC by holding horizon (duration-neutral)', fontsize=10); ax[0, 0].set_xlabel('h (business days)'); ax[0, 0].legend(fontsize=6, ncol=2)
+ax[0, 1].axhline(0, color='k', lw=0.6); ax[0, 1].axhline(ZOO['placebo'].groupby('placebo')['LS NW t'].agg(lambda s: np.nanpercentile(np.abs(s), 97.5)).max(), color='grey', ls=':', lw=1); ax[0, 1].axhline(-ZOO['placebo'].groupby('placebo')['LS NW t'].agg(lambda s: np.nanpercentile(np.abs(s), 97.5)).max(), color='grey', ls=':', lw=1)
+ax[0, 1].set_xticks(list(PZ_H)); ax[0, 1].set_title('Long-short Newey-West t by holding horizon (dotted: placebo 97.5% band)', fontsize=10); ax[0, 1].set_xlabel('h (business days)')
+_ic = ZOO['ic_hold']; _icn = _ic[[c_ for c_ in _ic.columns if c_.endswith('| duration-neutral')]]
+_icn.rolling(20, min_periods=10).mean().plot(ax=ax[1, 0], color=_pal[:_icn.shape[1]], lw=1.2, legend=False); _h, _l = ax[1, 0].get_legend_handles_labels(); ax[1, 0].legend(_h, [_short(l_.split(' | ')[0]) for l_ in _l], fontsize=6, ncol=2); ax[1, 0].axhline(0, color='k', lw=0.6); ax[1, 0].set_title(f'Rank IC at h = {PZ_HOLD}, rolling 20-day mean (duration-neutral)', fontsize=10); ax[1, 0].set_xlabel(''); ax[1, 0].tick_params(axis='x', rotation=30, labelsize=8)
+_icm = _icn.groupby(_icn.index.to_period('M')).mean(); _icm.columns = [_short(c_.split(' | ')[0]) for c_ in _icm.columns]
+im = ax[1, 1].imshow(_icm.T.to_numpy(float), cmap='RdBu_r', vmin=-0.1, vmax=0.1, aspect='auto'); ax[1, 1].set_xticks(range(len(_icm))); ax[1, 1].set_xticklabels([str(p_) for p_ in _icm.index], fontsize=8); ax[1, 1].set_yticks(range(_icm.shape[1])); ax[1, 1].set_yticklabels(_icm.columns, fontsize=7); ax[1, 1].grid(False); plt.colorbar(im, ax=ax[1, 1], fraction=0.03); ax[1, 1].set_title('Mean rank IC by month (sign consistency)', fontsize=10)
+for i_ in range(_icm.shape[1]):
+    for j_ in range(len(_icm)):
+        if np.isfinite(_icm.iloc[j_, i_]):
+            ax[1, 1].text(j_, i_, f'{_icm.iloc[j_, i_]:+.2f}', ha='center', va='center', fontsize=6)
+fig.suptitle('8c. Information coefficients across horizons and through time', fontsize=12); plt.tight_layout(); savefig('08c_ic_horizons')
+# ---- figure 4: calendar-time portfolios against the market
+_dl = ZOO['daily']; fig, ax = plt.subplots(2, 2, figsize=(18, 10))
+_cum = _dl.cumsum()
+for n_, c_ in zip(_names, _pal):
+    if n_ in _cum.columns:
+        ax[0, 0].plot(_cum.index, _cum[n_], color=c_, lw=1.2, label=_short(n_))
+ax[0, 0].plot(_cum.index, _cum['MARKET: equal-weighted universe'], color='k', ls='--', lw=1.8, label='MARKET (long all bonds)'); ax[0, 0].axhline(0, color='k', lw=0.6); ax[0, 0].set_title(f'Cumulative calendar-time long-short, h = {PZ_HOLD}, duration-neutral (bp of price); market dashed', fontsize=10); ax[0, 0].legend(fontsize=6, ncol=2); ax[0, 0].tick_params(axis='x', rotation=30, labelsize=8)
+for n_, c_ in zip(_names, _pal):
+    if n_ in _cum.columns:
+        cs_ = _cum[n_].to_numpy(float); ax[0, 1].plot(_cum.index, cs_ - np.maximum.accumulate(np.nan_to_num(cs_)), color=c_, lw=1)
+ax[0, 1].set_title('Drawdown from the running peak (bp)', fontsize=10); ax[0, 1].tick_params(axis='x', rotation=30, labelsize=8)
+_cl = ZOO['calendar']
+for n_, c_ in zip(_names, _pal):
+    if n_ in _cl.index:
+        ax[1, 0].scatter(_cl.loc[n_, 'beta to market'], _cl.loc[n_, 'alpha t'], color=c_, s=60); ax[1, 0].annotate(_short(n_), (_cl.loc[n_, 'beta to market'], _cl.loc[n_, 'alpha t']), fontsize=6, xytext=(3, 3), textcoords='offset points')
+ax[1, 0].axhline(0, color='k', lw=0.6); ax[1, 0].axvline(0, color='k', lw=0.6); ax[1, 0].axhspan(-2, 2, color='grey', alpha=0.1); ax[1, 0].set_xlabel('beta to the market (daily)'); ax[1, 0].set_ylabel('alpha t'); ax[1, 0].set_title('Market exposure and alpha of each long-short (grey band: |t| < 2)', fontsize=10)
+_ld = _cl[[c_ for c_ in _cl.columns if c_.startswith('loading on')] + ['beta to market']].reindex(_names); _ld.index = [_short(n_) for n_ in _ld.index]
+_ld.plot.barh(ax=ax[1, 1]); ax[1, 1].axvline(0, color='k', lw=0.6); ax[1, 1].set_title('Loadings of the daily long-short on the factor realisations (-f) and the market; R2 in the table', fontsize=10); ax[1, 1].tick_params(axis='y', labelsize=7); ax[1, 1].legend(fontsize=7)
+fig.suptitle('8c. Calendar-time long-short portfolios against the market', fontsize=12); plt.tight_layout(); savefig('08c_portfolios')
+# ---- figure 5: the placebo and the tangency variants
+fig, ax = plt.subplots(1, 3, figsize=(20, 5))
+_pl = ZOO['placebo']
+for kind, c_ in [('independent per bond-day', '#8C8C8C'), ('fixed per bond', '#C44E52')]:
+    g_ = _pl[_pl['placebo'] == kind]
+    if len(g_):
+        ax[0].hist(g_['LS NW t'].dropna(), bins=30, alpha=0.5, color=c_, density=True, label=f'{kind} (NW t)'); ax[0].hist(g_['LS naive t'].dropna(), bins=30, histtype='step', color=c_, density=True, ls='--', label=f'{kind} (naive t)')
+_xs = np.linspace(-5, 5, 200); ax[0].plot(_xs, np.exp(-_xs ** 2 / 2) / np.sqrt(2 * np.pi), 'k-', lw=1, label='N(0,1)')
+for n_, c_ in zip(_names, _pal):
+    v_ = ZOO['table'].loc[(n_, 'duration-neutral', PZ_HOLD), 'LS NW t']
+    if np.isfinite(v_):
+        ax[0].axvline(v_, color=c_, lw=1.2)
+ax[0].set_title(f'Placebo t distribution at h = {PZ_HOLD} (random signals); vertical lines: the zoo\'s duration-neutral LS t', fontsize=10); ax[0].legend(fontsize=7)
+_td = ZOO['tangency_daily'].cumsum()
+for c_, col_ in zip(_td.columns, ['k', '#C44E52', '#4C72B0', '#55A868', '#8172B2', '#8C8C8C', '#DD8452']):
+    ax[1].plot(_td.index, _td[c_], color=col_, lw=1.8 if c_.startswith('tangency: fold') else 1.1, ls='--' if c_.startswith('MARKET') else '-', label=c_)
+ax[1].axhline(0, color='k', lw=0.6); ax[1].set_title('Tangency portfolio vs its placebos (yield space, cumulative bp)', fontsize=10); ax[1].legend(fontsize=6); ax[1].tick_params(axis='x', rotation=30, labelsize=8)
+_lc = ZOO['lam_check']
+if len(_lc):
+    for f_, c_ in zip(sorted(_lc['factor'].unique()), ['#4C72B0', '#55A868', '#C44E52']):
+        g_ = _lc[_lc['factor'] == f_]; ax[2].scatter(g_['premium estimate (training mean, bp/day)'], g_['realised next-month mean (bp/day)'], color=c_, s=50, label=f_)
+    _lim = max(float(np.abs(_lc[['premium estimate (training mean, bp/day)', 'realised next-month mean (bp/day)']].to_numpy()).max()) * 1.1, 0.1); ax[2].plot([-_lim, _lim], [-_lim, _lim], 'k:', lw=0.8); ax[2].axhline(0, color='k', lw=0.6); ax[2].axvline(0, color='k', lw=0.6)
+    ax[2].set_xlabel('premium estimate: training-period mean (bp/day)'); ax[2].set_ylabel('realised mean in the next month (bp/day)'); ax[2].set_title(f'Does the premium estimate predict the next month? same sign {int(_lc["same sign"].sum())} of {len(_lc)}', fontsize=10); ax[2].legend(fontsize=8)
+fig.suptitle('8c. What noise looks like on this window, and the tangency portfolio against trend and sign-flip', fontsize=12); plt.tight_layout(); savefig('08c_placebo_tangency')
+# ---- figure 6: where the top sorts earn it
+_wh = ZOO['where']
+if _wh and ZOO['top']:
+    fig, ax = plt.subplots(1, len(_wh), figsize=(5.5 * len(_wh), 4.5), squeeze=False)
+    for a_, (dim, wdf) in zip(ax.ravel(), _wh.items()):
+        pv = wdf.pivot(index='signal', columns=dim, values='LS mean (bp per h days)').reindex(ZOO['top']); pt = wdf.pivot(index='signal', columns=dim, values='NW t').reindex(ZOO['top'])
+        pv.T.plot.bar(ax=a_, color=_pal[:len(pv)]); _h, _l = a_.get_legend_handles_labels(); a_.legend(_h, [_short(l_) for l_ in _l], fontsize=6); a_.axhline(0, color='k', lw=0.6); a_.set_title(f'by {dim}', fontsize=10); a_.set_xlabel(''); a_.tick_params(axis='x', rotation=20, labelsize=8)
+        for i_, (sig_, row_) in enumerate(pt.iterrows()):
+            for j_, (lab_, t_) in enumerate(row_.items()):
+                if np.isfinite(t_):
+                    a_.text(j_ + (i_ - (len(pt) - 1) / 2) * 0.8 / len(pt), pv.loc[sig_, lab_], f'{t_:+.1f}', ha='center', va='bottom' if pv.loc[sig_, lab_] >= 0 else 'top', fontsize=6)
+    fig.suptitle(f'8c. Where the top three sorts earn it: duration-neutral long-short at h = {PZ_HOLD} inside each bucket (bp; labels = NW t)', fontsize=11); plt.tight_layout(); savefig('08c_where')
+
+# %% [markdown]
 # ## 9. Transaction validation (PIT-safe)
 #
 # Each matched trade is joined to the latest residual dated **strictly before** the trade date. Targets:
@@ -2166,19 +2665,6 @@ def join_trades_to_residual(t: pd.DataFrame, res: pd.DataFrame, min_age: int) ->
     j = j.merge(close_td, on=['cusip', 'trade_date'], how='left')
     j['mark_revision_bp'] = 100.0 * (j['y_close_trade_date'] - j['y_prior_mark'])
     return j.reset_index(drop=True)
-
-
-def block_bootstrap_t(slopes: np.ndarray, block: int = 5, n_boot: int = 500, seed: int = 0) -> float:
-    """Moving-block bootstrap over the daily slopes: the FM t assumes independent dates, but the 125 trade dates share
-    27 Gammas and the daily slopes are autocorrelated within a month. Returns mean / bootstrap sd of the mean."""
-    n = len(slopes)
-    if n < 2 * block:
-        return np.nan
-    rng = np.random.default_rng(seed); nb = int(np.ceil(n / block)); means = np.empty(n_boot)
-    for i in range(n_boot):
-        starts = rng.integers(0, n - block + 1, nb); idx = (starts[:, None] + np.arange(block)[None, :]).ravel()[:n]; means[i] = slopes[idx].mean()
-    sd = means.std()
-    return float(slopes.mean() / sd) if sd > 0 else np.nan
 
 
 def fm_slope(frame: pd.DataFrame, y: str, x: str, controls: list[str], date_col: str = 'trade_date', min_n: int = 30) -> dict:
@@ -5141,6 +5627,14 @@ if 'factor_premia' in REGISTRY and REGISTRY['factor_premia']['long_short']:
             _k = (fq_, 'factor premium + carry', 'long leg, equal-weight (bp)'); _km = (fq_, 'MARKET: equal-weighted universe, long all bonds', 'total return (bp)')
             if _k in _bm.index and _km in _bm.index:
                 summary_rows.append((f'Long leg of premium + carry vs the market, {fq_}: mean | market | excess (bp per period); beta; periods above market; down capture', f"{_bm.loc[_k, 'mean (bp)']:+.1f} | {_bm.loc[_km, 'mean (bp)']:+.1f} | {_bm.loc[_k, 'excess over market (bp)']:+.1f}; {_bm.loc[_k, 'beta to market']:+.2f}; {_bm.loc[_k, 'periods above market']:.0%}; {_bm.loc[_k, 'down capture']:.2f}"))
+if 'premia_zoo' in REGISTRY:
+    _z = REGISTRY['premia_zoo']
+    summary_rows.append((f"Signal zoo (8c), duration-neutral, h = {_z['hold_days']}: best long-short by NW t | family bar | single-test placebo bar", f"{_z['best_signal']}: t {_z['best_ls_nw_t']:+.2f} | {_z['family_bar']:.2f} | {_z['single_bar']:.2f}"))
+    if _z.get('single_test'):
+        summary_rows.append(('Pre-registered single test (8c: state-space signal, duration-neutral): LS NW t | IC NW t', f"{_z['single_test']['ls_nw_t']:+.2f} | {_z['single_test']['ic_nw_t']:+.2f}"))
+    _zt = pd.DataFrame(_z['tangency']).set_index('portfolio') if _z.get('tangency') else pd.DataFrame()
+    if len(_zt) and 'tangency: fold premium (8b)' in _zt.index:
+        summary_rows.append(('Tangency vs placebos (8c), annualised Sharpe: fold premium | sign-flipped | trend 20d | trend 60d | market', ' | '.join(f"{_zt.loc[k_, 'Sharpe (annualised)']:+.2f}" for k_ in _zt.index if not k_.startswith('equal'))))
 summary = pd.DataFrame(summary_rows, columns=['item', 'result']).set_index('item')
 display(summary)
 print('Artifacts written to', ARTIFACTS)
