@@ -1,6 +1,18 @@
 # %% [markdown]
 # # Muni IPCA v4 — From Fair Mid to Markout: the Factor Model as Risk Layer, the Quote Judged in Dollars
 #
+# **v4.4.** Two additions and one removal. (i) The production objective is rebuilt inside the notebook: the desk
+# chooses the concession $x$ on a quote to maximise $p_{\text{fill}}(x)\,(x + \text{charge})$, with the fill curve the
+# trailing empirical CDF of the basis on the quote's own side and the charge the liquidity, risk and manual charges
+# booked on the trade. Section 12c replicates it on the matched prints, then swaps each of its three parts for what
+# this programme built (the same-side memory for the algo mid, the conditioned fill model for the pooled curve, the
+# expected round-trip P&L for the booked spread) and judges every variant on realised dollars against the production
+# rule. (ii) Section 8b asks the Kelly-Palhares-Pruitt question of the factor model: do the exposures, times the
+# factor means estimated at each refit, rank bonds by subsequent total return? Expected-return quintile long-shorts
+# at monthly and weekly rebalancing, and the model-implied tangency portfolio of the factors, on a total-return
+# target from evaluated prices rather than on daily residuals. (iii) Section 14 (the roll-forward of stale marks)
+# is folded into Section 8 as one table: it is a marking property of the risk layer, not a section.
+#
 # **v4.3.** The desk's fill-probability curve, a trailing 100-day empirical CDF of the basis between the quote and the
 # print by side, is built inside the notebook and tested for what conditioning adds (size, beta-space cluster, then a
 # gradient-boosted model with and without IPCA and state-space features). The level model's target moves from fair
@@ -64,16 +76,17 @@
 # 5. Walk-forward residuals: refit cadence, residuals of record
 # 6. Factor-mimicking weights, leverage, beta-space map and clusters
 # 7. Residual dynamics and the state-space filter (the mark-noise score)
-# 8. Risk model snapshot: betas, factor covariance, idiosyncratic and mark-noise variance per bond
+# 8. Risk model snapshot: betas, factor covariance, idiosyncratic and mark-noise variance per bond; the factor roll-forward of stale marks; 8b factor premia as expected returns (the Kelly-Palhares-Pruitt test, monthly and weekly)
 # 9. Transaction join (PIT-safe) and mark quality; 9b trade size and side; 9c where prints sit relative to our quote and to the evaluation
 # 10. Quote rules: the same-side memory, the interaction ladder, the re-opened legacy trials, the side x size intercepts, the level model; the direction-aware view
 # 11. Markout: would-have-filled P&L, edge and adverse selection, fill and P&L curves, the re-ranking in dollars, the cell-optimal concession, the realised round trip; 11b fill probability (the desk's curve, conditioned, modelled), the edge model, the quote engine in reduced form
-# 12. Quantile grid: the conditional distribution of the oriented error for the optimizer, with its calibration; 12b the residual side: forecast as concession modifier, mark noise as width scalar
+# 12. Quantile grid: the conditional distribution of the oriented error for the optimizer, with its calibration; 12b the residual side: forecast as concession modifier, mark noise as width scalar; 12c the production objective pfill(x) x (x + charge), rebuilt and tested piece by piece against expected P&L
 # 13. Where the P&L lives: markout by characteristic, factor beta, cluster, side and size; the side heatmaps; the cells that carry the dollars
-# 14. Systematic path: factor roll-forward of stale marks
-# 15. Results registry and summary
-# 16. Robustness
+# 14. Results registry and summary
+# 15. Robustness
 #
+# **Dropped in v4.4**: the stand-alone roll-forward section (its table now closes Section 8; the by-segment version
+# added nothing the cluster risk table does not say).
 # **Dropped in v4.1**: the MAE breakdowns by characteristic and the factor-beta loading of the pricing error (the
 # factor model is the risk and marking layer, not a mid corrector, so the breakdown that matters is of P&L).
 # **Dropped in v4.0** (fair-mid exhibits that no longer feed the quote): the hedged paper portfolio, the conformal
@@ -195,14 +208,20 @@ class RunConfig:
     pfill_trees: int = 150                               # gradient-boosted fill and edge models per fold
     pfill_max_train: int = 200_000                       # training rows per fold are subsampled to this many for speed
     pfill_min_train: int = 5_000                         # a fold needs this many training prints for the fill and edge models
+    # v4.4 factor premia (Section 8b) and the production objective (Section 12c)
+    premia_freqs: tuple[str, ...] = ('monthly', 'weekly')   # rebalancing frequencies of the expected-return long-short
+    premia_max_abs_ret_bp: float = 3000.0                # a holding-period return beyond this (30% of price) is a data error and is dropped
+    charge_units: str = 'auto'                           # units of the charge columns: 'bp' (of yield), 'pct' (percent of yield, x100), 'price' (price points, converted with duration), 'auto' (detected, printed)
+    charge_max_age_days: float = 1.0                     # a per-trade charge joins a print as of the print's time within this many days, else the bond's last charge, else the side median
+    objective_grid_bp: tuple[float, float, float] = (-3.0, 11.0, 1.0)   # concessions the production objective chooses from (start, stop, step); fill models are interpolated onto it
     cell_min_trades: int = 500                           # a side x size cell intercept / concession needs this many training trades, else the side value
     grid_taus: tuple[float, ...] = (0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95)
     grid_shrink_k: float = 500.0                         # a cell's quantiles shrink toward the side x size marginal with weight n / (n + k)
     seed: int = 20260921
 
 
-# Pre-registered choices, fixed on 2026-10-07 after the v5 review and before this notebook was run. Section 14
-# prints them so a reader can tell a choice from a fit.
+# Pre-registered choices, fixed on 2026-10-07 after the v5 review and before this notebook was run. The robustness
+# section prints them so a reader can tell a choice from a fit.
 PRE_REGISTERED = {
     'fixed_on': '2026-10-07 (v3.1, after the v31 review)',
     'selected_k': 3, 'record_cadence': 'monthly', 'level_signal_window': 20, 'activity_window': 20,
@@ -229,6 +248,12 @@ PRE_REGISTERED = {
     'v43_pfill': 'fill probability P(o >= delta | x) for the S quote at delta in {-3, 0, 3, 6, 10} bp; four estimators scored by Brier and log-loss on the next month: the desk curve (side, trailing 100-day empirical CDF), a side x size x cluster cell table on prior months (shrunk), a gradient-boosted classifier on trade features, and the same with IPCA and state-space features',
     'v43_edge_model': 'expected round-trip edge of a fill at delta 0, gradient-boosted on the same two feature sets, walk-forward; scored by out-of-sample R2 and realised edge by predicted decile',
     'v43_engine_bar': 'the reduced-form engine (concession per print = argmax over the delta grid of pfill(delta | x) x (expected edge + delta)) replaces S at 0 only if its round-trip P&L per print is higher by 0.10 bp with bootstrap t > 3 and positive in 4 of 5 months',
+    'v44_production_objective': 'concession per print x* = argmax over the grid of pfill_side(x) x (x + total charge), with pfill the trailing 100-day empirical CDF of the basis on the same side and the charge the liquidity + risk + manual charges of the trade (sign and units detected and printed); fill iff the print crossed the quote shifted by x*',
+    'v44_objective_variants': 'the three parts of the objective swapped one at a time and together: the mid (algo quote -> same-side memory S), the fill curve (desk curve -> quantile grid -> gradient-boosted model with IPCA and state-space features), the value of a fill (x + charge -> expected round-trip P&L from the edge model with the selection adjustment)',
+    'v44_objective_bar': 'a variant replaces the production rule only if its realised round-trip P&L per print is higher by 0.10 bp, bootstrap t of the daily difference > 3, positive in >= 4 of the held-out months',
+    'v44_premia_signal': 'expected total return over the holding period = carry - modified duration x (beta . lambda) x business days, with lambda the mean daily factor realisation under the Gamma in force (in-sample on its training dates, nothing after the formation date); sorts: factor premium alone, carry alone, both, premium within duration quintile, the premium in yield space, the state-space residual signal as the reference',
+    'v44_premia_portfolios': 'quintile long-short (top minus bottom), equal-weighted and DV01-balanced, rebalanced on the first residual date of each month and of each week, total return from evaluated prices with accrued coupon; the tangency portfolio of the factors with mean and covariance from the same training dates, applied to the out-of-sample factor realisations',
+    'v44_premia_reading': 'with five to six monthly and about twenty-five weekly rebalances the test can only reject a large premium: the reading is weekly long-short t > 2 with a monotone quintile pattern and the same sign at monthly frequency; a Sharpe is reported, never relied on',
     'v42_round_trip': 'realised round trip: a would-be fill exits at the next opposite-side print in the same bond within 10 days, at that print\'s yield, factor-hedged over the holding period; the evaluation-independent check of the side split',
     'v42_signal_test': 'the state-space forecast, oriented by side and ranked within date x beta cluster, is tested as a predictor of the hedged markout and as a concession modifier (shift = -kappa x forecast, kappa on prior months); bar = +0.10 bp per print over S with its side concession, bootstrap t > 3, 4 of 5 months',
     'v42_width_scalar': 'quantile grid split by mark-noise tercile replaces the pooled grid if the mean absolute tail calibration error (tau 0.05, 0.10, 0.90, 0.95) falls by >= 0.01 on both sides',
@@ -1178,7 +1203,7 @@ if HAS_TRADES and 'msrb_side' in trades_raw.columns:
     smt = smt.merge(_mix, on='cusip', how='left')
 panels = [(c, t, k, cm) for c, t, k, cm in [('trade_size_lag', 'by trade size (decayed mean log par of the bond\'s prints)', 'num', 'viridis'),
                                              ('p_share', 'by side mix of the bond\'s prints (share that are dealer buys; 0.5 = balanced)', 'num', 'coolwarm'),
-                                             ('print_freq_lag', 'by print frequency (decayed count of prints)', 'num', 'viridis'),
+                                             ('print_freq_lag', 'by print frequency (decayed count of prints, log10 colour scale)', 'log', 'viridis'),
                                              ('industry_bucket', 'by issuer industry', 'cat', None)] if c in smt.columns and smt[c].notna().any()]
 if panels:
     fig, ax = plt.subplots(2, 2, figsize=(14, 11))
@@ -1191,7 +1216,8 @@ if panels:
             a.legend(markerscale=3, fontsize=8, loc='best')
         else:
             kw = {'vmin': 0.0, 'vmax': 1.0} if col == 'p_share' else {}
-            sc = a.scatter(g0['x'], g0['y'], s=6, c=g0[col], cmap=cmap, alpha=0.85, **kw); plt.colorbar(sc, ax=a, fraction=0.046)
+            cvals = np.log10(g0[col].clip(lower=0.05)) if kind == 'log' else g0[col]   # v4.4: a few very active bonds flattened the linear scale
+            sc = a.scatter(g0['x'], g0['y'], s=6, c=cvals, cmap=cmap, alpha=0.85, **kw); plt.colorbar(sc, ax=a, fraction=0.046)
         a.set_title(f'Beta space ({emb_name}), {last_date.date()}: {title}', fontsize=10); a.set_xticks([]); a.set_yticks([]); a.grid(False)
     for a in ax.ravel()[len(panels):]:
         a.set_visible(False)
@@ -1578,6 +1604,10 @@ record('residual_diagnostics', two_regime=two_regime.reset_index().astype({'res_
 # in-sample estimate), the idiosyncratic variance (trailing variance of the residual of record) and the mark-noise
 # scale from the state-space filter. The systematic share of a bond's daily variance is $\beta' \Sigma_f \beta$ over
 # the total; the table shows it by beta-space cluster. The snapshot is written to `artifacts_v3/` for the optimizer.
+#
+# The block closes with the one marking property of the risk layer that the print-to-print panel confirmed: a stale
+# mark rolled forward by its factor-implied move (beta . f, cumulated) is closer to the next mark than the stale mark
+# itself, by horizon. It is an in-panel upper bound (the factor realisations are the fitted ones).
 
 # %%
 last_date = resid['date'].max()
@@ -1603,7 +1633,221 @@ risk_tab[['systematic_sd_bp', 'idio_sd_bp']].plot.barh(ax=ax[0], color=['#4C72B0
 ax[1].hist(risk_snap['systematic_share'].clip(0, 1).dropna(), bins=40, color='#55A868'); ax[1].set_title('Share of a bond\'s daily variance that is systematic', fontsize=10); ax[1].set_xlabel('systematic share'); ax[1].set_ylabel('bonds')
 savefig('08_risk_model_snapshot')
 risk_snap.to_parquet(ARTIFACTS / f'risk_model_snapshot_{last_date.date()}.parquet', index=False)
-record('risk_model', date=str(last_date.date()), factor_covariance=fcov.round(5).to_dict(), by_cluster=risk_tab.round(4).reset_index().to_dict(orient='records'), bonds=int(len(risk_snap)))
+# the factor roll-forward of stale marks (v4.4: folded in from the former Section 14)
+_rsf = resid.sort_values(['cusip', 'date'], kind='stable'); _gsf = _rsf.groupby('cusip', observed=True); rf_rows = []
+for h in [1, 2, 3, 5, 10]:
+    cum_target = _gsf['target_bp'].transform(lambda s_: s_.rolling(h).sum().shift(-h + 1)); cum_resid = _gsf['pit_residual'].transform(lambda s_: s_.rolling(h).sum().shift(-h + 1))
+    ok = cum_target.notna() & cum_resid.notna()
+    rf_rows.append({'horizon': h, 'n': int(ok.sum()), 'stale_mae_bp': cum_target[ok].abs().mean(), 'rolled_mae_bp': cum_resid[ok].abs().mean(), 'stale_rmse_bp': np.sqrt((cum_target[ok] ** 2).mean()), 'rolled_rmse_bp': np.sqrt((cum_resid[ok] ** 2).mean())})
+rollf = pd.DataFrame(rf_rows).set_index('horizon'); rollf['rmse_reduction'] = 1 - rollf['rolled_rmse_bp'] / rollf['stale_rmse_bp']
+print('Factor roll-forward of a stale mark versus leaving it unchanged, by horizon in observations (in-panel upper bound):'); display(rollf.round(3))
+fig, ax = plt.subplots(figsize=(7, 4))
+ax.plot(rollf.index, rollf['stale_mae_bp'], marker='o', label='leave mark stale'); ax.plot(rollf.index, rollf['rolled_mae_bp'], marker='o', label='roll forward by beta . f'); ax.set_xlabel('horizon (observations)'); ax.set_ylabel('MAE (bp)'); ax.legend(); ax.set_title('Factor roll-forward of marks (in-panel upper bound)')
+savefig('08_roll_forward')
+record('risk_model', date=str(last_date.date()), factor_covariance=fcov.round(5).to_dict(), by_cluster=risk_tab.round(4).reset_index().to_dict(orient='records'), bonds=int(len(risk_snap)), roll_forward=rollf.round(4).reset_index().to_dict(orient='records'))
+
+# %% [markdown]
+# ### 8b. Factor premia as expected returns: the Kelly-Palhares-Pruitt test on a bond return target
+#
+# Kelly, Palhares and Pruitt ("Modeling Corporate Bond Returns") fit IPCA to bond returns and read the model two
+# ways a market maker can use: the exposures times the factor means are **expected returns**, so a sort on them is a
+# tradable ranking, and the factors' historical means and covariance give the **model-implied tangency portfolio**.
+# This block asks both questions of our yield-space model, on a return target rather than on daily residuals.
+#
+# **The signal.** The model's exposures are $\beta_{i,t} = Z_{i,t}\Gamma$ in bp of yield per unit factor. Under the
+# Gamma in force at date $t$, the mean daily factor realisation on its training dates is $\bar\lambda_t$ (nothing
+# after $t$ enters), so the expected yield change over a holding period of $h$ business days is
+# $\beta_{i,t}'\bar\lambda_t\,h$ and the expected total return, in bp of price, is
+#
+# $$\hat\mu_{i,t} = \underbrace{y_{i,t}\,\tfrac{\text{days}}{365}}_{\text{carry}} \;-\; D_{i,t}\,\beta_{i,t}'\bar\lambda_t\,h .$$
+#
+# **The target.** The realised total return from evaluated prices, $(P_{t+h} - P_t + \text{accrued})/P_t$ in bp,
+# with the duration approximation $\text{carry} - D\,\Delta y$ beside it as the data check. Bonds are sorted into
+# quintiles on the signal at the first residual date of every month and of every week; the long-short is top minus
+# bottom, equal-weighted and DV01-balanced (weights inversely proportional to duration inside each leg, so the two
+# legs carry the same rate exposure). Six sorts: the factor premium alone, carry alone, both, the premium within
+# duration quintile (which removes the duration tilt a yield-space premium carries into price space), the premium in
+# yield space (judged on the realised yield change), and the state-space residual signal as the reference the
+# programme has used so far (the yield-space sort's predicted spread is in bp of yield, the others in bp of
+# price). **The tangency portfolio** takes the factor means and covariance from the same training
+# dates, $w \propto \Sigma^{-1}\mu$, and applies them to the out-of-sample daily factor realisations of record.
+#
+# **What this can and cannot show.** There are five to six monthly and about twenty-five weekly rebalances. The
+# premium estimate itself is shown with its $t$ at every refit: if the factor means are not distinguishable from
+# zero on sixty to two hundred training days, a sort on them is a bet on noise and the honest reading is "no
+# measurable premium at this sample length", not "no premium". The pre-registered reading is a weekly long-short
+# $t$ above 2 with a monotone quintile pattern and the same sign at monthly frequency.
+
+# %%
+_fc = [f'f{j+1}' for j in range(CFG.selected_k)]
+# ---- (1) the premium available at each refit: in-sample factor realisations under the fold's Gamma, on its training dates only
+prem_rows, LAM, SIG = [], {}, {}
+for fo in folds:
+    gv = pd.Timestamp(fo['train_end']); G = GAMMA_ALIGNED.get(gv)
+    if G is None:
+        continue
+    F = []
+    for d in fo['train_dates']:
+        g = MODEL_BY_DATE.get(pd.Timestamp(d))
+        if g is None:
+            continue
+        B = g[CHARS].to_numpy(float) @ G; r = g[TARGET].to_numpy(float)
+        F.append(np.linalg.solve(B.T @ B + CFG.ridge * np.eye(CFG.selected_k), B.T @ r))
+    F = np.asarray(F)
+    if len(F) < 20:
+        continue
+    LAM[fo['fold']] = F.mean(axis=0); SIG[fo['fold']] = np.cov(F.T) if len(F) > CFG.selected_k + 1 else np.eye(CFG.selected_k)
+    for j in range(CFG.selected_k):
+        prem_rows.append({'fold': fo['fold'], 'Gamma as of': str(gv.date()), 'training days': len(F), 'factor': f'factor{j+1}', 'mean daily realisation (bp)': float(F[:, j].mean()), 'sd (bp)': float(F[:, j].std()), 't': float(np.sqrt(len(F)) * F[:, j].mean() / F[:, j].std()) if F[:, j].std() > 0 else np.nan})
+premia = pd.DataFrame(prem_rows)
+if len(premia):
+    _pt = premia.pivot(index='Gamma as of', columns='factor', values='mean daily realisation (bp)'); _tt = premia.pivot(index='Gamma as of', columns='factor', values='t')
+    print('The factor premium as estimated at each refit: mean daily factor realisation on the training dates (bp of yield per day; t in brackets). A yield-space premium is a drift in yields; negative = yields drifting down = positive expected price return on positive-beta bonds:')
+    display(pd.DataFrame({c_: [f'{v:+.3f} (t {t_:+.1f})' for v, t_ in zip(_pt[c_], _tt[c_])] for c_ in _pt.columns}, index=_pt.index))
+    _nsig = int((premia['t'].abs() >= 2).sum()); print(f'{_nsig} of {len(premia)} refit x factor premium estimates have |t| >= 2.')
+
+# ---- (2) formation dates and holding periods: the first residual date of each month / week, held to the next one
+_rd = pd.DatetimeIndex(sorted(resid['date'].unique()))
+FORM = {}
+for fq in CFG.premia_freqs:
+    firsts = pd.Series(_rd).groupby(_rd.to_period('M' if fq == 'monthly' else 'W')).first().to_numpy()
+    FORM[fq] = [(pd.Timestamp(a), pd.Timestamp(b)) for a, b in zip(firsts[:-1], firsts[1:])]
+px = raw_panel[['cusip', 'date', 'closing_price', 'closing_yield', 'cpn', 'modified_duration_lag1']].copy(); px['cusip'] = px['cusip'].astype('string'); px['date'] = to_ns(px['date'])
+px = px.dropna(subset=['closing_price', 'closing_yield']).drop_duplicates(['cusip', 'date']).set_index(['date', 'cusip']).sort_index()
+_rsig = resid[['cusip', 'date', 'fold'] + beta_cols + (['ssm_signal'] if 'ssm_signal' in resid.columns else [])].copy(); _rsig['cusip'] = _rsig['cusip'].astype('string'); _rsig['date'] = to_ns(_rsig['date'])
+SIGNALS = ['factor premium  (-D x beta.lambda x h)', 'carry only', 'factor premium + carry', 'factor premium within duration quintile', 'factor premium in yield space  (-beta.lambda)'] + (['state-space residual signal (reference)'] if 'ssm_signal' in _rsig.columns else [])
+
+
+def _leg_ret(frame: pd.DataFrame, col: str, q: int, w: str) -> float:
+    g = frame[frame['q'] == q]
+    if g.empty:
+        return np.nan
+    wt = (1.0 / g['D'].clip(lower=0.25)) if w == 'dv01' else pd.Series(1.0, index=g.index)
+    return float((g[col] * wt).sum() / wt.sum())
+
+
+def _sort_once(t0: pd.Timestamp, t1: pd.Timestamp) -> tuple[list[dict], pd.DataFrame]:
+    u = _rsig[_rsig['date'] == t0]
+    if u.empty or t0 not in px.index.get_level_values(0) or t1 not in px.index.get_level_values(0):
+        return [], pd.DataFrame()
+    p0 = px.xs(t0, level='date'); p1 = px.xs(t1, level='date')[['closing_price', 'closing_yield']].rename(columns={'closing_price': 'P1', 'closing_yield': 'y1'})
+    f = u.merge(p0, left_on='cusip', right_index=True, how='inner').merge(p1, left_on='cusip', right_index=True, how='inner')
+    days = (t1 - t0).days; bd = int(((_rd >= t0) & (_rd < t1)).sum())
+    f['D'] = pd.to_numeric(f['modified_duration_lag1'], errors='coerce').fillna(f['modified_duration_lag1'].median())
+    f['ret_bp'] = 1e4 * (f['P1'] - f['closing_price'] + pd.to_numeric(f['cpn'], errors='coerce').fillna(0.0) * days / 365.0) / f['closing_price']
+    f['dy_bp'] = 100.0 * (f['y1'] - f['closing_yield']); f['carry_bp'] = f['closing_yield'] * days / 365.0 * 100.0
+    f['dur_ret_bp'] = f['carry_bp'] - f['D'] * f['dy_bp']
+    n0 = len(f); f = f[(f['closing_price'] > 1) & (f['ret_bp'].abs() <= CFG.premia_max_abs_ret_bp) & (f['dy_bp'].abs() <= 500)]
+    lam = np.vstack([LAM.get(int(k_), np.full(CFG.selected_k, np.nan)) for k_ in f['fold']]) if len(f) else np.empty((0, CFG.selected_k))
+    f['exp_dy_bp'] = np.einsum('ij,ij->i', f[beta_cols].to_numpy(float), lam) * bd
+    f = f[np.isfinite(f['exp_dy_bp'])]
+    if len(f) < 100:
+        return [], pd.DataFrame()
+    sig = {'factor premium  (-D x beta.lambda x h)': -f['D'] * f['exp_dy_bp'], 'carry only': f['carry_bp'], 'factor premium + carry': f['carry_bp'] - f['D'] * f['exp_dy_bp'], 'factor premium in yield space  (-beta.lambda)': -f['exp_dy_bp']}
+    _dq = pd.qcut(f['D'].rank(method='first'), 5, labels=False); _fp = sig['factor premium  (-D x beta.lambda x h)']
+    sig['factor premium within duration quintile'] = _fp.groupby(_dq).rank(pct=True)
+    if 'ssm_signal' in f.columns and f['ssm_signal'].notna().mean() >= 0.5:
+        sig['state-space residual signal (reference)'] = -f['ssm_signal']          # bonds without a signal are left out of this sort
+    rows, qt = [], []
+    for name in SIGNALS:
+        x = sig.get(name)
+        if x is None or x.std() == 0 or x.notna().sum() < 100:
+            continue
+        f['q'] = np.nan; f.loc[x.notna(), 'q'] = pd.qcut(x[x.notna()].rank(method='first'), 5, labels=False) + 1
+        r = {'signal': name, 't0': t0, 't1': t1, 'bonds': int(f['q'].notna().sum()), 'days': days, 'bdays': bd, 'dropped share': 1 - len(f) / n0}
+        r['LS equal-weight (bp)'] = _leg_ret(f, 'ret_bp', 5, 'ew') - _leg_ret(f, 'ret_bp', 1, 'ew'); r['LS DV01-balanced (bp)'] = _leg_ret(f, 'ret_bp', 5, 'dv01') - _leg_ret(f, 'ret_bp', 1, 'dv01')
+        r['LS yield change, short minus long (bp)'] = _leg_ret(f, 'dy_bp', 1, 'ew') - _leg_ret(f, 'dy_bp', 5, 'ew')
+        r['long leg (bp)'] = _leg_ret(f, 'ret_bp', 5, 'ew'); r['short leg (bp)'] = _leg_ret(f, 'ret_bp', 1, 'ew'); r['universe mean (bp)'] = float(f['ret_bp'].mean())
+        r['predicted spread (bp)'] = float(x[f['q'] == 5].mean() - x[f['q'] == 1].mean()) if 'within' not in name and 'reference' not in name else np.nan
+        rows.append(r)
+        qt.append(f.dropna(subset=['q']).groupby('q')['ret_bp'].mean().rename(name).to_frame().T.assign(t0=t0))
+    chk = pd.DataFrame({'t0': [t0], 'corr(price return, duration approx)': [float(f['ret_bp'].corr(f['dur_ret_bp']))], 'median |gap| (bp)': [float((f['ret_bp'] - f['dur_ret_bp']).abs().median())], 'bonds': [len(f)], 'dropped share': [1 - len(f) / n0]})
+    return rows, (pd.concat(qt) if qt else pd.DataFrame(), chk)
+
+
+LS, QT, CHK = [], [], []
+for fq, pairs in FORM.items():
+    for t0, t1 in pairs:
+        rows, extra = _sort_once(t0, t1)
+        for r in rows:
+            r['freq'] = fq; LS.append(r)
+        if rows:
+            QT.append(extra[0].assign(freq=fq)); CHK.append(extra[1].assign(freq=fq))
+ls = pd.DataFrame(LS); chk = pd.concat(CHK, ignore_index=True) if CHK else pd.DataFrame()
+if len(ls):
+    if len(chk):
+        print('Return target check per formation date: correlation of the evaluated-price total return with the duration approximation (carry - D x dy), and the median absolute gap:'); display(chk.groupby('freq')[['corr(price return, duration approx)', 'median |gap| (bp)', 'bonds', 'dropped share']].mean().round(3))
+    ann = {'monthly': np.sqrt(12.0), 'weekly': np.sqrt(52.0)}
+    sum_rows = []
+    for (fq, name), g in ls.groupby(['freq', 'signal'], sort=False):
+        for col in ['LS equal-weight (bp)', 'LS DV01-balanced (bp)', 'LS yield change, short minus long (bp)']:
+            v = g[col].dropna().to_numpy(float)
+            if len(v) < 2:
+                continue
+            sum_rows.append({'freq': fq, 'signal': name, 'portfolio': col, 'rebalances': len(v), 'mean (bp)': v.mean(), 'sd (bp)': v.std(ddof=1), 't': np.sqrt(len(v)) * v.mean() / v.std(ddof=1) if v.std(ddof=1) > 0 else np.nan,
+                             'Sharpe (annualised)': ann[fq] * v.mean() / v.std(ddof=1) if v.std(ddof=1) > 0 else np.nan, 'hit rate': float((v > 0).mean()), 'predicted spread (bp)': float(g['predicted spread (bp)'].mean()) if g['predicted spread (bp)'].notna().any() else np.nan})
+    prem_tab = pd.DataFrame(sum_rows).set_index(['freq', 'signal', 'portfolio'])
+    for fq in CFG.premia_freqs:
+        if fq in prem_tab.index.get_level_values(0):
+            print(f'Expected-return quintile long-short, {fq} rebalancing (top quintile minus bottom; bp of price per holding period, yield-change row in bp of yield):'); display(prem_tab.loc[fq].round(3))
+    qt_all = pd.concat(QT, ignore_index=False) if QT else pd.DataFrame()
+    if len(qt_all):
+        qm = qt_all[qt_all['freq'] == CFG.premia_freqs[0]].drop(columns=['t0', 'freq']).groupby(level=0).mean().reindex([n_ for n_ in SIGNALS if n_ in qt_all.index])
+        print(f'Mean realised total return by predicted quintile, {CFG.premia_freqs[0]} (bp; a premium reads as a rising row from Q1 to Q5):'); display(qm.round(2))
+    for fq in CFG.premia_freqs:
+        _ew = ls[(ls['signal'] == 'factor premium + carry') & (ls['freq'] == fq)].set_index('t0')['LS equal-weight (bp)']
+        if len(_ew):
+            _ew.index = [str(d_.date()) for d_ in _ew.index]; print(f'Long-short of the full expected return (premium + carry) by {fq} rebalance date, equal-weighted (bp of price):'); display(_ew.round(1).to_frame().T)
+
+# ---- (3) the model-implied tangency portfolio of the factors, in yield space (a factor "return" is minus its realisation: yields down = gain)
+mve_rows, mve_daily = [], []
+_fd = resid.groupby('date')[_fc + ['fold']].first().sort_index()
+for k_, lam in LAM.items():
+    te = _fd[_fd['fold'] == k_]
+    if te.empty:
+        continue
+    mu = -lam; Sg = SIG[k_]; w_t = np.linalg.solve(Sg + 1e-9 * np.eye(len(mu)), mu); w_t = w_t / np.abs(w_t).sum()
+    G_oos = -te[_fc].to_numpy(float)
+    ports = {'tangency (model-implied MVE)': G_oos @ w_t, 'equal weight of factors': G_oos.mean(axis=1), **{f'factor{j+1} alone (long the factor)': G_oos[:, j] for j in range(CFG.selected_k)}}
+    mve_daily.append(pd.DataFrame(ports, index=te.index).assign(fold=k_))
+    mve_rows.append({'fold': k_, **{f'w{j+1}': w_t[j] for j in range(CFG.selected_k)}, 'test days': len(te)})
+if mve_daily:
+    mve_d = pd.concat(mve_daily); mve_w = pd.DataFrame(mve_rows).set_index('fold')
+    print('Tangency weights on the factors at each refit (normalised to unit gross; from the training-date mean and covariance):'); display(mve_w.round(3))
+    _cols = [c_ for c_ in mve_d.columns if c_ != 'fold']
+    mve = pd.DataFrame({'mean (bp/day)': mve_d[_cols].mean(), 'sd (bp/day)': mve_d[_cols].std(), 'Sharpe (annualised, daily)': np.sqrt(252.0) * mve_d[_cols].mean() / mve_d[_cols].std(), 'OOS days': len(mve_d)})
+    _mm = mve_d[_cols].groupby(mve_d.index.to_period('M')).sum()
+    mve['monthly hit rate'] = (_mm > 0).mean(); mve['months'] = len(_mm)
+    print('Out-of-sample factor portfolios in yield space (bp of yield per day; the tangency portfolio is the paper\'s model-implied mean-variance portfolio):'); display(mve.round(3))
+else:
+    mve = pd.DataFrame(); mve_d = pd.DataFrame()
+
+# ---- figures
+fig, ax = plt.subplots(2, 2, figsize=(16, 10))
+if len(premia):
+    _pt.plot.bar(ax=ax[0, 0], color=['#4C72B0', '#55A868', '#C44E52'][:CFG.selected_k]); ax[0, 0].axhline(0, color='k', lw=0.6); ax[0, 0].set_title('The premium estimate at each refit: mean daily factor realisation on the training dates (bp)', fontsize=10); ax[0, 0].set_xlabel(''); ax[0, 0].tick_params(axis='x', rotation=30, labelsize=8)
+    for i_, (idx, row) in enumerate(_tt.iterrows()):
+        for j_, c_ in enumerate(_tt.columns):
+            ax[0, 0].text(i_ + (j_ - 1) * 0.27, _pt.loc[idx, c_], f't {row[c_]:+.1f}', ha='center', va='bottom' if _pt.loc[idx, c_] >= 0 else 'top', fontsize=7)
+if len(ls):
+    for name, c_ in zip(SIGNALS, ['#4C72B0', '#DD8452', '#2E8B57', '#8172B2', '#937860', '#8C8C8C']):
+        g = ls[(ls['freq'] == CFG.premia_freqs[-1]) & (ls['signal'] == name)].sort_values('t0')
+        if len(g):
+            ax[0, 1].plot(g['t0'], g['LS equal-weight (bp)'].cumsum(), marker='.', color=c_, label=name)
+    ax[0, 1].axhline(0, color='k', lw=0.6); ax[0, 1].set_title(f'Cumulative long-short total return, {CFG.premia_freqs[-1]} rebalancing, equal-weighted (bp of price)', fontsize=10); ax[0, 1].legend(fontsize=7)
+    if len(qt_all):
+        for name, c_ in zip(['factor premium  (-D x beta.lambda x h)', 'factor premium + carry', 'carry only'], ['#4C72B0', '#2E8B57', '#DD8452']):
+            if name in qm.index:
+                ax[1, 0].plot(qm.columns, qm.loc[name], marker='o', color=c_, label=name)
+        ax[1, 0].set_xlabel('predicted-return quintile (1 = lowest)'); ax[1, 0].set_ylabel('mean realised total return (bp)'); ax[1, 0].set_title(f'Realised return by predicted quintile, {CFG.premia_freqs[0]} (a premium rises left to right)', fontsize=10); ax[1, 0].legend(fontsize=8)
+if len(mve_d):
+    _cum = mve_d[[c_ for c_ in mve_d.columns if c_ != 'fold']].cumsum()
+    for c_, col_ in zip(_cum.columns, ['k', '#8C8C8C', '#4C72B0', '#55A868', '#C44E52']):
+        ax[1, 1].plot(_cum.index, _cum[c_], color=col_, lw=1.6 if c_.startswith('tangency') else 1.0, label=c_)
+    ax[1, 1].axhline(0, color='k', lw=0.6); ax[1, 1].set_title('Cumulative out-of-sample factor portfolio P&L in yield space (bp; tangency in black)', fontsize=10); ax[1, 1].legend(fontsize=7)
+fig.suptitle('Factor premia as expected returns: the Kelly-Palhares-Pruitt test on evaluated-price total returns', fontsize=12); plt.tight_layout(); savefig('08b_factor_premia')
+record('factor_premia', premium_estimates=premia.round(5).to_dict(orient='records'), long_short=prem_tab.round(5).reset_index().to_dict(orient='records') if len(ls) else [], by_rebalance=ls.drop(columns=[]).round(4).astype({'t0': str, 't1': str}).to_dict(orient='records') if len(ls) else [],
+       quintiles=qm.round(4).reset_index().to_dict(orient='records') if len(ls) and len(qt_all) else [], return_check=chk.round(4).astype({'t0': str}).to_dict(orient='records') if len(chk) else [], tangency=mve.round(5).reset_index().to_dict(orient='records') if len(mve) else [], tangency_weights=mve_w.round(4).reset_index().to_dict(orient='records') if mve_daily else [])
 
 # %% [markdown]
 # ## 9. Transaction validation (PIT-safe)
@@ -2749,6 +2993,8 @@ else:
 # the prints that were further through the quote, and their base edge is lower on average. Three versions, differing only in the fill
 # model (desk, cell, GBM with the factor model), are judged on realised P&L per print on both markout metrics against
 # S at zero and the side concession of Section 11, with the usual bar. All model fits are cached on the trade key.
+# v4.4 adds the same fill and edge models for the **algo quote** (factor-model feature set), which Section 12c needs to
+# replace the desk curve inside the production objective without changing the mid.
 
 # %%
 if HAS_TRADES and 'mo' in globals() and not mo.empty:
@@ -2845,6 +3091,20 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty:
                     out[f'edge_{fs_name}_{tgt_name}'] = yhat
                     if imp_e is not None and tgt_name == 'rt':
                         imps.append(imp_e.astype(float).rename(f'edge {fs_name}|{m}'))
+            # v4.4: fill and edge models for the ALGO quote (factor-model feature set only), consumed by the production objective of Section 12c
+            feats_u = usable_features(mo.iloc[tr_idx], PF_IPCA); med = mo.iloc[tr_idx][feats_u].median()
+            Xtr = mo.iloc[tr_idx][feats_u].astype(float).fillna(med); Xte = mo.iloc[te_idx][feats_u].astype(float).fillna(med)
+            for dlt in PF_DELTAS:
+                ytr = (O_A[tr_idx] >= dlt).astype(int)
+                if ytr.min() == ytr.max():
+                    out[f'pf_ipcaA_{dlt:g}'] = float(ytr.mean()); continue
+                if HAS_LGB:
+                    mdl = lgb.LGBMClassifier(n_estimators=CFG.pfill_trees, learning_rate=0.05, num_leaves=31, min_child_samples=200, subsample=0.8, subsample_freq=1, colsample_bytree=0.8, random_state=CFG.seed, verbose=-1).fit(Xtr, ytr)
+                else:
+                    mdl = HistGradientBoostingClassifier(max_iter=max(100, CFG.pfill_trees), learning_rate=0.08, max_leaf_nodes=31, min_samples_leaf=200, random_state=CFG.seed).fit(Xtr, ytr)
+                out[f'pf_ipcaA_{dlt:g}'] = mdl.predict_proba(Xte)[:, 1]
+            fill_trA = tr_idx[O_A[tr_idx] >= 0]; y_eA = (BASE_RT - O_A)[fill_trA]; okA = np.isfinite(y_eA)
+            out['edge_ipcaA_rt'] = fit_gbm(mo.iloc[fill_trA[okA]].assign(_y=y_eA[okA]), mo.iloc[te_idx], PF_IPCA, '_y', CFG.pfill_trees)[0] if okA.sum() >= max(500, CFG.pfill_min_train // 2) else np.nan
             parts.append(out); print(f'  fill and edge models {m}: train {len(tr_idx):,} | test {len(te_idx):,} | {time.perf_counter() - t0:.0f}s')
         pred = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=['_id'])
         imp_df = pd.concat(imps, axis=1).reset_index().rename(columns={'index': 'feature'}) if imps else pd.DataFrame(columns=['feature'])
@@ -3217,6 +3477,240 @@ else:
     print('Section 12b skipped: needs the state-space signal on the trade frame.')
 
 # %% [markdown]
+# ### 12c. The production objective: pfill(x) x (x + charge), rebuilt, then replaced one piece at a time
+#
+# **What the desk runs.** For a quote on one side, production chooses the concession $x$ (bp of yield away from the
+# algo mid) that maximises
+#
+# $$\max_x\; \hat p_{\text{fill}}(x)\,\big(x + \text{charge}\big),$$
+#
+# with $\hat p_{\text{fill}}$ the trailing empirical CDF of the basis between the algo yield and the print on the
+# quote's own side (the bid uses dealer-buy prints only) and the charge the sum of the liquidity, risk and manual
+# charges booked on the trade. It is a one-dimensional optimizer with three parts: a **mid** (the algo quote), a
+# **fill curve** (pooled by side) and a **value of a fill** ($x$ plus the charge, which assumes the charge is earned
+# in full and the market does nothing afterwards). Everything this programme has built is a candidate replacement
+# for one of those parts: the same-side memory S for the mid, the quantile grid or the conditioned fill model for the
+# pooled curve, and the expected round-trip P&L (the edge model with its selection adjustment) for the booked spread.
+#
+# **The test.** The production rule is replicated on the matched prints (charges joined as of the print, units and
+# sign detected and printed), then each part is swapped alone and all together. Every variant chooses $x^*$ per
+# print on its own objective (the expected-P&L objective may decline to quote where no concession on the grid has a
+# positive expectation, which the production objective cannot, since $x + \text{charge}$ is positive wherever it
+# looks) and is judged on the **same realised outcome**: a fill if the print crossed the quote at $x^*$, P&L from the realised round trip (and the evaluation markout beside it), in bp per print and dollars per
+# month, against the production rule with the usual bar. The gap between what the production objective expects per
+# print and what the round trip pays is the cost of assuming the charge is earned in full.
+#
+# **Reading it.** If swapping the fill curve moves the dollars and swapping the mid does not, the desk's lever is
+# the fill model; if the expected-P&L value moves them, the lever is where the quote earns its edge, not how often it
+# fills. A variant that wins on its own objective but loses on realised dollars is a model that flatters itself.
+
+# %%
+if HAS_TRADES and 'mo' in globals() and not mo.empty and 'METHODS' in globals() and common.sum() >= 200:
+    XGa = np.arange(*CFG.objective_grid_bp).astype(float); XG = [float(x_) for x_ in XGa]
+    # ---- (1) charges per print: the per-trade track store as of the print, else charge columns on the matched trades, else the static track, else zero
+    def _charge_cols(frame) -> list:
+        return [c for c in frame.columns if 'charge' in str(c).lower()] if frame is not None else []
+    _cdir = PIPE.path(PIPE.data_dir, 'track_charges')
+    trk_ch = PIPE.store('track_charges').read(categorical=False) if _cdir.exists() and any(_cdir.glob('*.parquet')) else None
+    CH = pd.DataFrame(index=mo['_id'].to_numpy()); charge_src = 'none'; ccols = []
+    if trk_ch is not None and _charge_cols(trk_ch) and 'cusip' in trk_ch.columns:
+        ccols = _charge_cols(trk_ch)
+        tcol = next((c for c in ['timestamp', 'ts', 'time', 'tradetime', 'trade_time', 'signal_ts', 'signal_time', 'quote_time', 'date'] if c in trk_ch.columns), None)
+        scol = next((c for c in ['side', 'msrb_side', 'signal_side', 'quote_side'] if c in trk_ch.columns), None)
+        t_ = trk_ch[['cusip'] + ([tcol] if tcol else []) + ([scol] if scol else []) + ccols].copy(); t_['cusip'] = t_['cusip'].astype('string')
+        for c in ccols:
+            t_[c] = pd.to_numeric(t_[c], errors='coerce')
+        q_ = mo[['_id', 'cusip', 'trade_ts', 'side']].copy(); q_['cusip'] = q_['cusip'].astype('string'); q_['trade_ts'] = to_ns(q_['trade_ts']); q_['side'] = q_['side'].astype(str)
+        if tcol:
+            t_['_t'] = to_ns(t_[tcol]); t_ = t_.dropna(subset=['_t', 'cusip']).sort_values('_t'); q_ = q_.sort_values('trade_ts'); by = ['cusip']
+            if scol:
+                t_['side'] = t_[scol].astype('string').str.upper().str[0].astype(str); by = ['cusip', 'side']
+            j_ = pd.merge_asof(q_, t_[by + ['_t'] + ccols], left_on='trade_ts', right_on='_t', by=by, direction='backward', tolerance=pd.Timedelta(days=CFG.charge_max_age_days)).set_index('_id')
+            j2 = pd.merge_asof(q_[['_id', 'cusip', 'trade_ts']], t_[['cusip', '_t'] + ccols], left_on='trade_ts', right_on='_t', by='cusip', direction='backward').set_index('_id')
+            _exact = float(np.isfinite(j_[ccols[0]].reindex(CH.index).to_numpy(float)).mean())
+            for c in ccols:
+                v1 = j_[c].reindex(CH.index).to_numpy(float); v2 = j2[c].reindex(CH.index).to_numpy(float); CH[c] = np.where(np.isfinite(v1), v1, v2)
+            charge_src = f'track_charges store, as of the print time by {" x ".join(by)} within {CFG.charge_max_age_days:g} days ({_exact:.0%} of prints; the rest take the bond\'s last earlier charge)'
+        else:
+            last = t_.groupby('cusip', observed=True)[ccols].last()
+            for c in ccols:
+                CH[c] = last[c].reindex(mo['cusip'].astype('string')).to_numpy(float)
+            charge_src = 'track_charges store, last charge per bond (the track carries no time column)'
+    elif _charge_cols(mo):
+        ccols = _charge_cols(mo)
+        for c in ccols:
+            CH[c] = pd.to_numeric(mo[c], errors='coerce').to_numpy(float)
+        charge_src = 'charge columns on the matched trades (algosignal_msrb store)'
+    elif 'track_static' in globals() and track_static is not None and _charge_cols(track_static):
+        ccols = _charge_cols(track_static); last = track_static.assign(cusip=track_static['cusip'].astype('string')).drop_duplicates('cusip', keep='last').set_index('cusip')
+        for c in ccols:
+            CH[c] = pd.to_numeric(last[c], errors='coerce').reindex(mo['cusip'].astype('string')).to_numpy(float)
+        charge_src = 'track_static store, one static value per bond'
+    _pxa = pd.to_numeric(mo['msrb_price'], errors='coerce').clip(1, 300).fillna(100.0).to_numpy(float)
+    if ccols:
+        units = CFG.charge_units
+        tot = CH[ccols].sum(axis=1, min_count=1).to_numpy(float)
+        if units == 'auto':
+            units = 'bp' if any('bp' in c.lower() for c in ccols) else ('pct' if np.nanmedian(np.abs(tot)) < 0.5 else 'bp')
+        if units == 'pct':
+            CH[ccols] = CH[ccols] * 100.0
+        elif units == 'price':
+            _conv = 1e4 / (mo['modified_duration_lag1'].clip(lower=0.25).fillna(5.0).to_numpy(float) * _pxa)
+            CH[ccols] = CH[ccols].to_numpy(float) * _conv[:, None]
+        tot = CH[ccols].sum(axis=1, min_count=1).to_numpy(float); flipped = False
+        if np.nanmedian(tot) < 0:
+            CH[ccols] = -CH[ccols]; tot = -tot; flipped = True
+        print(f'Charges: {len(ccols)} column(s) {ccols} from {charge_src}; units read as {units!r}{" (sign flipped: the store books charges as negatives)" if flipped else ""}; '
+              f'{float(np.isfinite(tot).mean()):.0%} of customer prints carry a charge; median total {np.nanmedian(tot):.2f} bp (P {np.nanmedian(tot[IS_P]):.2f}, S {np.nanmedian(tot[IS_S]):.2f}).')
+        _ct = pd.DataFrame({'side': SIDE_ARR, 'qty_group': QTY_ARR, **{c: CH[c].to_numpy(float) for c in ccols}, 'total': tot})
+        charge_tab = _ct.groupby(['qty_group', 'side'], observed=True)[ccols + ['total']].mean().unstack('side').reindex(QTY_LABELS)
+        print('Mean charge by quantity bin and side (bp of yield):'); display(charge_tab.round(2))
+    else:
+        tot = np.full(len(mo), np.nan); units = 'none'; charge_tab = pd.DataFrame()
+        print('Charges: no column containing "charge" in the track_charges, algosignal_msrb or track_static stores. The objective runs with a zero charge (max pfill(x) x x). '
+              'Regenerate the pipeline with the track_charges source (see the final note of the run) to populate it.')
+    CHG = tot.copy()
+    for sd_, msk in [('P', IS_P), ('S', IS_S)]:
+        _m = float(np.nanmedian(CHG[msk])) if np.isfinite(CHG[msk]).any() else 0.0; CHG[msk & ~np.isfinite(CHG)] = _m
+
+    # ---- (2) fill curves on the objective grid: desk curves (A from the full history, S from the held-out months), the quantile grid (S), the GBM fill models (A and S)
+    def interp_rows(P: np.ndarray, knots: np.ndarray, grid: np.ndarray) -> np.ndarray:
+        """Row-wise linear interpolation of a fill curve known at the knots onto the grid, flat beyond the ends, forced non-increasing."""
+        P = np.minimum.accumulate(P, axis=1); out = np.full((P.shape[0], len(grid)), np.nan)
+        for g_i, x in enumerate(grid):
+            if x <= knots[0]:
+                out[:, g_i] = P[:, 0]
+            elif x >= knots[-1]:
+                out[:, g_i] = P[:, -1]
+            else:
+                j = int(np.searchsorted(knots, x, 'right')) - 1; w = (x - knots[j]) / (knots[j + 1] - knots[j]); out[:, g_i] = (1 - w) * P[:, j] + w * P[:, j + 1]
+        return out
+
+    _h = trades_all[['side', 'trade_date', 'e_algo_bp']].dropna(); _h = _h[_h['side'].isin(['P', 'S'])]
+    desk_A_x = rolling_ecdf_pfill(to_ns(_h['trade_date']).to_numpy(), np.where(_h['side'].to_numpy() == 'P', 1.0, -1.0) * _h['e_algo_bp'].to_numpy(float), _h['side'].astype(str).to_numpy(), TD, SIDE_ARR, XG, CFG.pfill_window_days)
+    desk_S_x = rolling_ecdf_pfill(TD, O_S, SIDE_ARR, TD, SIDE_ARR, XG, CFG.pfill_window_days)
+    gbm_S_x = interp_rows(_mat('pf_ipca'), PFD, XGa); gbm_A_x = interp_rows(_mat('pf_ipcaA'), PFD, XGa)
+    grid_S_x = np.full((len(mo), len(XG)), np.nan); TAUa = np.asarray(TAUS, float); _nt = len(TAUa)
+    for m in MONTHS_MO[1:]:
+        trm = MONTH_ARR < m; tem = MONTH_ARR == m
+        if trm.sum() < CFG.pfill_min_train or not tem.any():
+            continue
+        g_, marg_ = build_grid(mo[trm], 'o_S'); q = np.maximum.accumulate(lookup(g_, marg_, mo[tem]), axis=1); rows_ = np.arange(len(q))
+        for g_i, x in enumerate(XGa):
+            k = (q <= x).sum(axis=1); kl = np.clip(k - 1, 0, _nt - 1); kh = np.clip(k, 0, _nt - 1)
+            lo = q[rows_, kl]; hi = q[rows_, kh]; frac = np.where(hi > lo, (x - lo) / np.where(hi > lo, hi - lo, 1.0), 0.0)
+            F = np.where(k == 0, TAUa[0] * 0.5, np.where(k == _nt, 1.0 - (1.0 - TAUa[-1]) * 0.5, TAUa[kl] + (TAUa[kh] - TAUa[kl]) * frac))
+            grid_S_x[tem, g_i] = 1.0 - F
+    e_S = pred['edge_ipca_rt'].to_numpy(float) if 'edge_ipca_rt' in pred.columns else np.full(len(mo), np.nan)
+    e_A = pred['edge_ipcaA_rt'].to_numpy(float) if 'edge_ipcaA_rt' in pred.columns else np.full(len(mo), np.nan)
+
+    def adj_curve(o_mid: np.ndarray, base: np.ndarray) -> np.ndarray:
+        """Selection adjustment on the objective grid, by side on prior months: mean base edge of the fills kept at x minus at 0."""
+        ADJx = np.zeros((len(mo), len(XGa))); be = base - o_mid
+        for m in MONTHS_MO[1:]:
+            trm = MONTH_ARR < m; tem = MONTH_ARR == m
+            for sd_, msk in [('P', IS_P), ('S', IS_S)]:
+                sel0 = trm & msk & np.isfinite(be)
+                if (sel0 & (o_mid >= 0)).sum() < max(200, CFG.pfill_min_train // 10):
+                    continue
+                m0 = float(be[sel0 & (o_mid >= 0)].mean())
+                for g_i, x in enumerate(XGa):
+                    selj = sel0 & (o_mid >= x); ADJx[tem & msk, g_i] = (float(be[selj].mean()) - m0) if selj.sum() >= max(100, CFG.pfill_min_train // 20) else 0.0
+        return ADJx
+
+    ADJ_S = adj_curve(O_S, BASE_RT); ADJ_A = adj_curve(O_A, BASE_RT)
+    V_charge = XGa[None, :] + CHG[:, None]; V_exp_S = e_S[:, None] + XGa[None, :] + ADJ_S; V_exp_A = e_A[:, None] + XGa[None, :] + ADJ_A
+
+    def pnl_policy(err: np.ndarray, xs: np.ndarray | float, mask: np.ndarray, base_arr: np.ndarray) -> dict:
+        """pnl_with for a policy that may decline to quote (x* = +inf: no fill, zero P&L on that print)."""
+        o = S_ARR * err; fill = o >= xs; xe = np.where(np.isfinite(xs), xs, 0.0); pnl = base_arr - o + xe; ok = mask & np.isfinite(pnl) & np.isfinite(o); f_ok = fill & ok
+        d_ = pd.Series(np.where(f_ok, pnl, 0.0)[ok]).groupby(mo['trade_date'].to_numpy()[ok]).mean()
+        return {'fill share': f_ok.sum() / max(ok.sum(), 1), 'P&L per print (bp)': float(d_.mean()) if len(d_) else np.nan, '$ per month ($k)': float((pnl[f_ok] * DPB[f_ok]).sum() / 1e3 / max(int(pd.Series(MONTH_ARR[ok]).nunique()), 1)), '_daily': d_}
+
+    def choose(pf: np.ndarray, value: np.ndarray, may_decline: bool = False) -> tuple[np.ndarray, np.ndarray]:
+        """x* per print and the objective at x*. An expected-P&L objective that is negative at every x declines to quote (x* = +inf: no fill, zero P&L);
+        the production objective has no such option (x + charge is positive wherever it looks)."""
+        val = np.where(np.isfinite(pf) & np.isfinite(value), pf * value, -np.inf); j = np.argmax(val, axis=1); has = np.isfinite(val).any(axis=1)
+        best = np.where(has, val[np.arange(len(val)), j], np.nan); xs = np.where(has, XGa[j], np.nan)
+        if may_decline:
+            dec = has & (best < 0); xs = np.where(dec, np.inf, xs); best = np.where(dec, 0.0, best)
+        return xs, best
+
+    POL = {'production: A, desk curve, x + charge': (errA, O_A, desk_A_x, V_charge, False),
+           'A, desk curve, expected P&L (edge model on A)': (errA, O_A, desk_A_x, V_exp_A, True),
+           'A, GBM + IPCA fill model, x + charge': (errA, O_A, gbm_A_x, V_charge, False),
+           'A, GBM + IPCA fill model, expected P&L': (errA, O_A, gbm_A_x, V_exp_A, True),
+           'S, desk curve, x + charge': (errS, O_S, desk_S_x, V_charge, False),
+           'S, quantile grid, x + charge': (errS, O_S, grid_S_x, V_charge, False),
+           'S, GBM + IPCA fill model, x + charge': (errS, O_S, gbm_S_x, V_charge, False),
+           'S, GBM + IPCA fill model, expected P&L (the Section 11b engine)': (errS, O_S, gbm_S_x, V_exp_S, True)}
+    okm = tested & common & np.isfinite(e_S) & np.isfinite(e_A) & np.isfinite(CHG) & np.isfinite(BASE_RT)
+    for _, _, pf_, _, _ in POL.values():
+        okm &= np.isfinite(pf_).all(axis=1)
+    if okm.sum() < 200:
+        print(f'Section 12c: only {int(okm.sum())} prints carry every input (charges, the fill curves, the edge models, a round trip); the objective test is skipped on this run.')
+        record('production_objective', charge_source=charge_src, charge_units=units, prints=int(okm.sum()), policies=[])
+    else:
+        obj_rows, obj_daily, XSTAR = [], {}, {}
+        for name, (err_, o_, pf_, v_, dec_) in POL.items():
+            xs, val = choose(pf_, v_, dec_); XSTAR[name] = xs
+            r_rt = pnl_policy(err_, xs, okm, BASE_RT); r_ev = pnl_policy(err_, xs, okm, BASE_EVAL); obj_daily[name] = (r_rt.pop('_daily'), r_ev.pop('_daily'))
+            fill_ = okm & (o_ >= xs); _fin = okm & np.isfinite(xs)
+            obj_rows.append({'policy': name, 'mean x* (bp)': float(np.mean(xs[_fin])) if _fin.any() else np.nan, 'share declined': float(np.isinf(xs[okm]).mean()), 'fill share': r_rt['fill share'], 'objective value per print (expected)': float(np.nanmean(val[okm])),
+                             'booked spread | fill (x + charge, bp)': float(np.mean((xs + CHG)[fill_])) if fill_.any() else np.nan, 'round trip: P&L per print (bp)': r_rt['P&L per print (bp)'], 'round trip: $ per month ($k)': r_rt['$ per month ($k)'],
+                             'evaluation: P&L per print (bp)': r_ev['P&L per print (bp)'], 'evaluation: $ per month ($k)': r_ev['$ per month ($k)']})
+        for name, err_ in [('A at 0 (no concession)', errA), ('S at 0 (no concession)', errS)]:
+            r_rt = pnl_policy(err_, 0.0, okm, BASE_RT); r_ev = pnl_policy(err_, 0.0, okm, BASE_EVAL); obj_daily[name] = (r_rt.pop('_daily'), r_ev.pop('_daily')); XSTAR[name] = np.zeros(len(mo))
+            obj_rows.append({'policy': name, 'mean x* (bp)': 0.0, 'share declined': 0.0, 'fill share': r_rt['fill share'], 'objective value per print (expected)': np.nan, 'booked spread | fill (x + charge, bp)': np.nan, 'round trip: P&L per print (bp)': r_rt['P&L per print (bp)'], 'round trip: $ per month ($k)': r_rt['$ per month ($k)'],
+                             'evaluation: P&L per print (bp)': r_ev['P&L per print (bp)'], 'evaluation: $ per month ($k)': r_ev['$ per month ($k)']})
+        objective = pd.DataFrame(obj_rows).set_index('policy'); PRODN = 'production: A, desk curve, x + charge'; _p_rt, _p_ev = obj_daily[PRODN]
+        for name in objective.index:
+            d_rt = (obj_daily[name][0] - _p_rt).dropna(); d_ev = (obj_daily[name][1] - _p_ev).dropna(); dm = d_rt.groupby(pd.DatetimeIndex(d_rt.index).to_period('M')).mean()
+            objective.loc[name, 'round trip: boot t vs production'] = block_bootstrap_t(d_rt.to_numpy(), CFG.block_days, CFG.n_boot, CFG.seed) if name != PRODN else np.nan
+            objective.loc[name, 'evaluation: boot t vs production'] = block_bootstrap_t(d_ev.to_numpy(), CFG.block_days, CFG.n_boot, CFG.seed) if name != PRODN else np.nan
+            objective.loc[name, 'months above production (round trip)'] = int((dm > 0).sum()) if name != PRODN else np.nan
+        _nm = int(pd.Series(MONTH_ARR[okm]).nunique())
+        objective['beats production (bar, round trip)'] = ((objective['round trip: P&L per print (bp)'] - objective.loc[PRODN, 'round trip: P&L per print (bp)']) >= CFG.interaction_bar_bp) & (objective['round trip: boot t vs production'] > 3) & (objective['months above production (round trip)'] >= min(4, _nm))
+        print(f'The production objective and its variants on {int(okm.sum()):,} held-out customer prints with every input ({_nm} months). Each policy picks x* per print on its own objective over x in [{XGa[0]:g}, {XGa[-1]:g}] bp (the expected-P&L objective may decline to quote); all are judged on the realised round trip. Bar vs production: +{CFG.interaction_bar_bp:.2f} bp per print, bootstrap t > 3, positive in >= 4 months:'); display(objective.round(3))
+        _gap = objective.loc[PRODN, 'objective value per print (expected)'] - objective.loc[PRODN, 'round trip: P&L per print (bp)']
+        print(f'Reality gap of the production objective: it expects {objective.loc[PRODN, "objective value per print (expected)"]:+.2f} bp per print (charge earned in full, no move after the fill); the round trip pays {objective.loc[PRODN, "round trip: P&L per print (bp)"]:+.2f} bp per print, a gap of {_gap:+.2f} bp.')
+        comp = pd.DataFrame([{'swap': 'mid: algo quote -> same-side memory S (desk curve, x + charge)', 'delta RT P&L per print (bp)': objective.loc['S, desk curve, x + charge', 'round trip: P&L per print (bp)'] - objective.loc[PRODN, 'round trip: P&L per print (bp)'], 'boot t': objective.loc['S, desk curve, x + charge', 'round trip: boot t vs production']},
+                             {'swap': 'fill curve: desk -> GBM + IPCA (algo quote, x + charge)', 'delta RT P&L per print (bp)': objective.loc['A, GBM + IPCA fill model, x + charge', 'round trip: P&L per print (bp)'] - objective.loc[PRODN, 'round trip: P&L per print (bp)'], 'boot t': objective.loc['A, GBM + IPCA fill model, x + charge', 'round trip: boot t vs production']},
+                             {'swap': 'value of a fill: x + charge -> expected round-trip P&L (algo quote, desk curve)', 'delta RT P&L per print (bp)': objective.loc['A, desk curve, expected P&L (edge model on A)', 'round trip: P&L per print (bp)'] - objective.loc[PRODN, 'round trip: P&L per print (bp)'], 'boot t': objective.loc['A, desk curve, expected P&L (edge model on A)', 'round trip: boot t vs production']},
+                             {'swap': 'all three: S, GBM + IPCA, expected P&L', 'delta RT P&L per print (bp)': objective.loc['S, GBM + IPCA fill model, expected P&L (the Section 11b engine)', 'round trip: P&L per print (bp)'] - objective.loc[PRODN, 'round trip: P&L per print (bp)'], 'boot t': objective.loc['S, GBM + IPCA fill model, expected P&L (the Section 11b engine)', 'round trip: boot t vs production']}]).set_index('swap')
+        print('What each replacement is worth on its own (round-trip P&L per print vs the production rule):'); display(comp.round(3))
+        xmix = pd.DataFrame({name: pd.Series(XSTAR[name][okm]).value_counts(normalize=True).sort_index() for name in POL}).fillna(0.0); xmix.index = ['no quote' if np.isinf(i_) else f'x = {float(i_):g}' for i_ in xmix.index]
+        print('Concession chosen, share of prints by policy:'); display(xmix.round(3))
+
+        # ---- figures
+        fig, ax = plt.subplots(2, 2, figsize=(18, 11))
+        if len(charge_tab):
+            _ctp = charge_tab['total'] if 'total' in charge_tab.columns.get_level_values(0) else charge_tab
+            x_ = np.arange(len(_ctp)); w = 0.38
+            for i_, (sd_, c_) in enumerate([('P', '#4C72B0'), ('S', '#DD8452')]):
+                if sd_ in _ctp.columns:
+                    ax[0, 0].bar(x_ + (i_ - 0.5) * w, _ctp[sd_], w, color=c_, label={'P': 'P bid', 'S': 'S offer'}[sd_])
+            ax[0, 0].set_xticks(x_); ax[0, 0].set_xticklabels(_ctp.index, rotation=30, fontsize=8); ax[0, 0].set_title(f'Total charge by quantity bin and side (bp; {", ".join(ccols)})', fontsize=10); ax[0, 0].legend(fontsize=8); ax[0, 0].set_ylabel('bp of yield')
+        else:
+            ax[0, 0].text(0.5, 0.5, 'no charge columns in the stores', ha='center', va='center', transform=ax[0, 0].transAxes); ax[0, 0].set_axis_off()
+        for sd_, msk, c_ in [('P bid', IS_P & okm, '#4C72B0'), ('S offer', IS_S & okm, '#DD8452')]:
+            if msk.any():
+                pcurve = np.nanmean(desk_A_x[msk], axis=0); chm = float(np.nanmedian(CHG[msk])); val = pcurve * (XGa + chm); j = int(np.nanargmax(val))
+                ax[0, 1].plot(XGa, val, marker='.', color=c_, label=f'{sd_}: desk curve x (x + median charge {chm:.1f} bp)'); ax[0, 1].plot(XGa[j], val[j], 'o', ms=9, mfc='none', mec=c_, mew=1.5)
+                pg = np.nanmean(gbm_A_x[msk], axis=0); ax[0, 1].plot(XGa, pg * (XGa + chm), ls='--', color=c_, alpha=0.7, label=f'{sd_}: GBM fill model, same value')
+        ax[0, 1].axvline(0, color='k', lw=0.6); ax[0, 1].set_xlabel('concession x on the algo quote (bp)'); ax[0, 1].set_ylabel('expected objective per print (bp)'); ax[0, 1].set_title('The production objective as the desk sees it: pfill(x) x (x + charge), side means (circle = its argmax)', fontsize=10); ax[0, 1].legend(fontsize=7)
+        _ob = objective.sort_values('round trip: P&L per print (bp)'); y_ = np.arange(len(_ob))
+        ax[1, 0].barh(y_, _ob['round trip: P&L per print (bp)'], color=['#2E8B57' if b_ else ('#4C72B0' if i_ == PRODN else '#8C8C8C') for i_, b_ in zip(_ob.index, _ob['beats production (bar, round trip)'])])
+        ax[1, 0].set_yticks(y_); ax[1, 0].set_yticklabels([f'{i_}  (t {t_:+.1f})' if np.isfinite(t_) else i_ for i_, t_ in zip(_ob.index, _ob['round trip: boot t vs production'])], fontsize=7)
+        ax[1, 0].axvline(objective.loc[PRODN, 'round trip: P&L per print (bp)'], color='#4C72B0', ls='--', lw=0.9); ax[1, 0].set_xlabel('realised round-trip P&L per print (bp)'); ax[1, 0].set_title('Every variant on the same realised outcome (blue = production; green = clears the bar)', fontsize=10)
+        xmix.T.plot.bar(ax=ax[1, 1], stacked=True, colormap='viridis', width=0.8); ax[1, 1].set_title('Concession chosen by each policy (share of prints)', fontsize=10); ax[1, 1].set_xlabel(''); ax[1, 1].tick_params(axis='x', rotation=20, labelsize=6); ax[1, 1].legend(fontsize=6, ncol=2)
+        plt.tight_layout(); savefig('12c_production_objective')
+        record('production_objective', charge_source=charge_src, charge_units=units, charge_columns=ccols, prints=int(okm.sum()), months=_nm, grid=XG, charge_by_cell=flat_records(charge_tab.reset_index()) if len(charge_tab) else [],
+               policies=objective.round(4).reset_index().to_dict(orient='records'), swaps=comp.round(4).reset_index().to_dict(orient='records'), concession_mix=flat_records(xmix.reset_index()), reality_gap_bp=float(_gap))
+else:
+    print('Section 12c skipped: needs Sections 11b and 12.')
+
+# %% [markdown]
 # ## 13. Where the P&L lives: markout by characteristic, factor coordinate, side and size
 #
 # The same segmentation the fair-mid work used, now scored in the currency the desk uses. Every customer print
@@ -3346,49 +3840,7 @@ else:
     print('Section 13 skipped: needs Section 11.')
 
 # %% [markdown]
-# ## 14. Systematic path: factor roll-forward of stale marks, by segment
-#
-# The one systematic use of the factor model that the v5 print-to-print panel confirmed out of panel: the next
-# print follows the factor-implied move (coefficient 0.83) and ignores the residual move in the marks. Here the
-# in-panel version: moving a mark by the cumulative factor-implied change versus leaving it unchanged, by horizon.
-
-# %%
-r_sorted = resid.sort_values(['cusip', 'date'], kind='stable')
-g = r_sorted.groupby('cusip', observed=True)
-rf_rows = []
-for h in [1, 2, 3, 5, 10]:
-    cum_target = g['target_bp'].transform(lambda s: s.rolling(h).sum().shift(-h + 1))
-    cum_resid = g['pit_residual'].transform(lambda s: s.rolling(h).sum().shift(-h + 1))
-    ok = cum_target.notna() & cum_resid.notna()
-    rf_rows.append({'horizon': h, 'n': int(ok.sum()), 'stale_mae_bp': cum_target[ok].abs().mean(), 'rolled_mae_bp': cum_resid[ok].abs().mean(), 'stale_rmse_bp': np.sqrt((cum_target[ok] ** 2).mean()), 'rolled_rmse_bp': np.sqrt((cum_resid[ok] ** 2).mean())})
-rollf = pd.DataFrame(rf_rows).set_index('horizon'); rollf['rmse_reduction'] = 1 - rollf['rolled_rmse_bp'] / rollf['stale_rmse_bp']
-display(rollf.round(3))
-fig, ax = plt.subplots(figsize=(7, 4))
-ax.plot(rollf.index, rollf['stale_mae_bp'], marker='o', label='leave mark stale'); ax.plot(rollf.index, rollf['rolled_mae_bp'], marker='o', label='roll forward by beta . f'); ax.set_xlabel('horizon (observations)'); ax.set_ylabel('MAE (bp)'); ax.legend(); ax.set_title('Factor roll-forward of marks (in-panel upper bound)')
-savefig('14_roll_forward')
-record('systematic_path', roll_forward=rollf.round(4).reset_index().to_dict(orient='records'))
-
-# %%
-# roll-forward by segment: where does the factor model move stale marks most usefully?
-h = 5
-_rs = resid.sort_values(['cusip', 'date'], kind='stable'); _g = _rs.groupby('cusip', observed=True)
-_rs = _rs.assign(cum_target=_g['target_bp'].transform(lambda s: s.rolling(h).sum().shift(-h + 1)), cum_resid=_g['pit_residual'].transform(lambda s: s.rolling(h).sum().shift(-h + 1))).dropna(subset=['cum_target', 'cum_resid'])
-_rs = _rs.merge(model[['cusip', 'date', 'modified_duration_lag1', 'call_structure']], on=['cusip', 'date'], how='left')
-_rs['dur_bucket'] = pd.cut(_rs['modified_duration_lag1'], bins=[-1, 1, 2.5, 4, 6, 8, 11, 100], labels=['<1', '1-2.5', '2.5-4', '4-6', '6-8', '8-11', '>11']).astype(str)
-_rs['cluster'] = _rs['beta_cluster'].map(CLUSTER_LABEL)
-rf_seg = {}
-for name, col in [('duration bucket', 'dur_bucket'), ('call structure', 'call_structure'), ('beta-space cluster', 'cluster')]:
-    g = _rs.groupby(col, observed=True)
-    t = pd.DataFrame({'bond_days': g.size(), 'stale_rmse_bp': g['cum_target'].apply(lambda s: np.sqrt((s ** 2).mean())), 'rolled_rmse_bp': g['cum_resid'].apply(lambda s: np.sqrt((s ** 2).mean()))}); t['rmse_reduction'] = 1 - t['rolled_rmse_bp'] / t['stale_rmse_bp']
-    rf_seg[name] = t; print(f'Roll-forward at h={h} by {name}:'); display(t.round(3))
-fig, ax = plt.subplots(1, 3, figsize=(18, 4.2))
-for a, (name, t) in zip(ax, rf_seg.items()):
-    t['rmse_reduction'].plot.bar(ax=a, color='#8172B2'); a.set_title(f'Roll-forward RMSE reduction (h={h}) by {name}', fontsize=10); a.set_xlabel(''); a.tick_params(axis='x', rotation=30, labelsize=8)
-savefig('14_roll_forward_by_segment')
-record('systematic_path', roll_forward_by_segment={k: v.round(4).reset_index().to_dict(orient='records') for k, v in rf_seg.items()})
-
-# %% [markdown]
-# ## 15. Results registry and summary
+# ## 14. Results registry and summary
 
 # %%
 score = resid[['cusip', 'date', 'gamma_version', 'fold', 'target_bp', 'fitted_bp', 'pit_residual', 'activity_bucket'] + beta_cols + [c for c in ['ssm_signal', 'ssm_drift', 'ssm_mark_noise'] if c in resid.columns]].copy()
@@ -3478,6 +3930,13 @@ if 'pfill' in REGISTRY and REGISTRY['pfill']['engine']:
             summary_rows.append(('Edge model (round-trip edge of S fills, + IPCA): OOS R2 | daily rank IC (t)', f"{_em.loc[_k, 'OOS R2']:.3f} | {_em.loc[_k, 'daily rank IC']:+.3f} (t {_em.loc[_k, 'IC t']:+.1f})"))
     _en = pd.DataFrame(REGISTRY['pfill']['engine']).set_index('policy')
     summary_rows.append(('Engine in reduced form vs S at 0, round-trip P&L per print (bp; boot t; bar): desk | cell | GBM + IPCA', ' | '.join(f"{_en.loc[p_, 'round trip: P&L per print (bp)']:+.2f} (t {_en.loc[p_, 'round trip: boot t vs S at 0']:+.1f}) {'PASS' if bool(_en.loc[p_, 'beats S (bar, round trip)']) else 'no'}" for p_ in ['engine: desk pfill x edge model', 'engine: cell pfill x edge model', 'engine: GBM + IPCA pfill x edge model'] if p_ in _en.index) + f"; S at 0 {_en.loc['S at 0', 'round trip: P&L per print (bp)']:+.2f}"))
+if 'production_objective' in REGISTRY and REGISTRY['production_objective']['policies']:
+    _po = pd.DataFrame(REGISTRY['production_objective']['policies']).set_index('policy'); _pp = 'production: A, desk curve, x + charge'
+    summary_rows.append((f"Production objective (charges: {REGISTRY['production_objective']['charge_source'].split(',')[0]}, {REGISTRY['production_objective']['charge_units']}): expected | realised round trip per print (bp); mean x*; fill share", f"{_po.loc[_pp, 'objective value per print (expected)']:+.2f} | {_po.loc[_pp, 'round trip: P&L per print (bp)']:+.2f}; {_po.loc[_pp, 'mean x* (bp)']:.1f} bp; {_po.loc[_pp, 'fill share']:.0%}"))
+    _sw = pd.DataFrame(REGISTRY['production_objective']['swaps']).set_index('swap')
+    summary_rows.append(('Replacing one part of the production objective (delta round-trip P&L per print vs production, boot t): mid | fill curve | value of a fill | all three', ' | '.join(f"{r_['delta RT P&L per print (bp)']:+.2f} (t {r_['boot t']:+.1f})" for _, r_ in _sw.iterrows())))
+    _win = _po[_po['beats production (bar, round trip)'].astype(bool)]
+    summary_rows.append(('Variants that clear the bar against production (round trip)', '; '.join(f"{i_}: {r_['round trip: P&L per print (bp)']:+.2f} bp" for i_, r_ in _win.iterrows()) if len(_win) else 'none'))
 if 'residual_side' in REGISTRY:
     _sp = pd.DataFrame(REGISTRY['residual_side']['policy']).set_index('input'); _sl = pd.DataFrame(REGISTRY['residual_side']['slopes'])
     summary_rows.append(('Residual signal as concession modifier (delta bp per print over S + side concession, boot t, bar)', '; '.join(f"{i_}: {r_['delta (bp)']:+.2f} (t {r_['boot t of delta']:+.1f}) {'PASS' if r_['passes bar'] else 'no'}" for i_, r_ in _sp.iterrows())))
@@ -3496,6 +3955,18 @@ if 'dollars' in REGISTRY:
     _d = REGISTRY['dollars']['overall'][0]
     summary_rows.append(('Dollar error removed per month on held-out prints ($k): C | S | K | D', ' | '.join(f"{_d[f'$ removed per month ($k) [{k}]']:,.0f}" for k in ['C side-pooled EWMA', 'S same-side memory', 'K per-side state-space memory', 'D level model']) + f" of {_d['algo |error| ($k)'] / max(len(REGISTRY['dollars']['by_month']), 1):,.0f} algo error per month"))
 summary_rows.append(('Roll-forward RMSE reduction, h=1 / h=10', f"{rollf.loc[1, 'rmse_reduction']:.0%} / {rollf.loc[10, 'rmse_reduction']:.0%}"))
+if 'factor_premia' in REGISTRY and REGISTRY['factor_premia']['long_short']:
+    _fp = pd.DataFrame(REGISTRY['factor_premia']['long_short']).set_index(['freq', 'signal', 'portfolio'])
+    for fq_ in CFG.premia_freqs:
+        _k = (fq_, 'factor premium + carry', 'LS equal-weight (bp)'); _k2 = (fq_, 'factor premium  (-D x beta.lambda x h)', 'LS equal-weight (bp)')
+        if _k in _fp.index:
+            summary_rows.append((f'Factor premia long-short, {fq_}: premium + carry | premium alone (mean bp per period, t, hit rate; rebalances)', f"{_fp.loc[_k, 'mean (bp)']:+.1f} (t {_fp.loc[_k, 't']:+.1f}, hit {_fp.loc[_k, 'hit rate']:.0%})" + (f" | {_fp.loc[_k2, 'mean (bp)']:+.1f} (t {_fp.loc[_k2, 't']:+.1f}, hit {_fp.loc[_k2, 'hit rate']:.0%})" if _k2 in _fp.index else '') + f"; {int(_fp.loc[_k, 'rebalances'])} rebalances"))
+    _pe = pd.DataFrame(REGISTRY['factor_premia']['premium_estimates'])
+    if len(_pe):
+        summary_rows.append(('Factor premium estimates with |t| >= 2 at the refits (of refit x factor)', f"{int((_pe['t'].abs() >= 2).sum())} of {len(_pe)}"))
+    if REGISTRY['factor_premia']['tangency']:
+        _tg = pd.DataFrame(REGISTRY['factor_premia']['tangency']).set_index('index')
+        summary_rows.append(('Tangency portfolio of the factors, OOS (yield space): annualised Sharpe | equal weight | factor 1 alone', ' | '.join(f"{_tg.loc[k_, 'Sharpe (annualised, daily)']:+.2f}" for k_ in ['tangency (model-implied MVE)', 'equal weight of factors', 'factor1 alone (long the factor)'] if k_ in _tg.index)))
 summary = pd.DataFrame(summary_rows, columns=['item', 'result']).set_index('item')
 display(summary)
 print('Artifacts written to', ARTIFACTS)
@@ -3509,7 +3980,7 @@ if len(_cl):
     record('stage_cache', log=_cl.round(2).to_dict(orient='records'), keys=STAGE_KEYS)
 
 # %% [markdown]
-# ## 16. Robustness: dispersion-day exclusions, bootstrap inference, pre-registered choices
+# ## 15. Robustness: dispersion-day exclusions, bootstrap inference, pre-registered choices
 
 # %%
 rob_rows = [{'check': 'Residual ACF lag 1 (Pearson)', 'all days': acf.loc[1, 'pearson'], 'ex dispersion days': acf.loc[1, 'pearson_ex_dispersion']},

@@ -82,7 +82,7 @@ class Config:
     dh_env: str = 'FICC'
     dh_heap_gb: int = 16
     pit_ratings: bool = True             # rating as of partition end instead of latest
-    sources: tuple[str, ...] = ('panel', 'closing_marks', 'msrb', 'algosignal_msrb', 'track_static')
+    sources: tuple[str, ...] = ('panel', 'closing_marks', 'msrb', 'algosignal_msrb', 'track_static', 'track_charges')
 
     # OneTick
     ot_context: str = 'MUNI_PROD'
@@ -306,6 +306,13 @@ ALGOSIGNAL_WANT = ['date', 'msrb_trade_id', 'cusip', 'msrb_quantity', 'size_bin'
 TRACK_STATIC_WANT = ['cusip', 'issuer_industry', 'industry', 'sector', 'issuer', 'state', 'tax_status', 'coupon_type',
                      'issue_size', 'amount_outstanding', 'outstanding_amount', 'final_comp_rating', 'comp_rating']
 STATIC_SOURCES = {'track_static'}          # pulled once (first partition key), not per month
+# Per-trade charges from muni_algo_trade_track (v4.4): every column whose name contains 'charge' (liquidity, risk,
+# manual, total ...) plus the keys needed to join a charge to a matched print as of its time. Pulled per partition on
+# the track's date column when it has one, otherwise once. Column names on the track are not fixed, so the keep list
+# is resolved on the server from what exists; TRACK_CHARGE_KEYS lists every key/time column we would like if present.
+TRACK_CHARGE_KEYS = ['cusip', 'date', 'timestamp', 'ts', 'time', 'tradetime', 'trade_time', 'signal_ts', 'signal_time', 'quote_time',
+                     'side', 'msrb_side', 'signal_side', 'quote_side', 'quantity', 'size', 'msrb_quantity', 'price', 'yield', 'algo_yield',
+                     'msrb_trade_id', 'trade_id', 'order_id', 'inquiry_id']
 
 DH_PRELUDE = r"""
 # ---- muni_data_pipeline prelude: built once per session, reused by every partition ----
@@ -371,11 +378,24 @@ _mdp_tkeep = [c for c in {want} if c in _mdp_tcols] or ['cusip']
 mdp_track_static_part = _mdp_track.last_by(['cusip']).view(_mdp_tkeep)
 """
 
+DH_TRACK_CHARGES_PARTITION = r"""
+# ---- track_charges partition {key}: [{a}, {b}) -- per-trade charge columns of muni_algo_trade_track ----
+_mdp_tcols = _mdp_cols(_mdp_track)
+_mdp_charge = [c for c in _mdp_tcols if 'charge' in c.lower()]
+_mdp_ckeep = [c for c in {keys} if c in _mdp_tcols] + [c for c in _mdp_charge if c not in {keys}]
+_mdp_ckeep = _mdp_ckeep or ['cusip']
+if mdp_track_has_date:
+    mdp_track_charges_part = _mdp_track.where(['date >= `{a}`', 'date < `{b}`']).view(_mdp_ckeep)
+else:
+    mdp_track_charges_part = _mdp_track.view(_mdp_ckeep)
+"""
+
 DH_ALGOSIGNAL_PARTITION = r"""
 # ---- algosignal partition {key}: [{a}, {b}) ----
 _mdp_s = db.historical_table('muni_offline', 'algosignal_msrb_match').where(['date >= `{a}`', 'date < `{b}`'])
 _mdp_scols = _mdp_cols(_mdp_s)
 _mdp_keep = [c for c in {want} if c in _mdp_scols] or _mdp_scols
+_mdp_keep = _mdp_keep + [c for c in _mdp_scols if 'charge' in c.lower() and c not in _mdp_keep]   # v4.4: any charge column on the match table rides along
 mdp_algosignal_part = _mdp_s.view(_mdp_keep)
 """
 
@@ -427,6 +447,8 @@ class DeephavenClient:
             script, name = DH_ALGOSIGNAL_PARTITION.format(key=part.key, a=part.start_str, b=part.end_str, want=ALGOSIGNAL_WANT), 'mdp_algosignal_part'
         elif source == 'track_static':
             script, name = DH_TRACK_STATIC_PARTITION.format(want=TRACK_STATIC_WANT), 'mdp_track_static_part'
+        elif source == 'track_charges':
+            script, name = DH_TRACK_CHARGES_PARTITION.format(key=part.key, a=part.start_str, b=part.end_str, keys=TRACK_CHARGE_KEYS), 'mdp_track_charges_part'
         else:
             raise KeyError(source)
         self.run(script)
@@ -489,7 +511,20 @@ def normalize_track_static(table: pa.Table) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-NORMALIZERS = {'panel': normalize_panel, 'msrb': normalize_msrb, 'algosignal_msrb': normalize_algosignal, 'track_static': normalize_track_static}
+def normalize_track_charges(table: pa.Table) -> pd.DataFrame:
+    df = table.to_pandas(self_destruct=True)
+    df.columns = [str(c) for c in df.columns]
+    for col in df.columns:
+        if col in ('date', 'timestamp', 'ts', 'time', 'tradetime', 'trade_time', 'signal_ts', 'signal_time', 'quote_time'):
+            df[col] = _to_naive_datetime(df[col])
+        elif 'charge' in col.lower():
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    if 'cusip' in df.columns:
+        df['cusip'] = df['cusip'].astype('string')
+    return df.drop_duplicates().reset_index(drop=True)
+
+
+NORMALIZERS = {'panel': normalize_panel, 'msrb': normalize_msrb, 'algosignal_msrb': normalize_algosignal, 'track_static': normalize_track_static, 'track_charges': normalize_track_charges}
 
 
 def pull_deephaven(cfg: Config, sources: Sequence[str], force: bool = False, dry_run: bool = False) -> dict[str, Any]:
