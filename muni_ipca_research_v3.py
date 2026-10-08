@@ -1,6 +1,13 @@
 # %% [markdown]
 # # Muni IPCA v4 — From Fair Mid to Markout: the Factor Model as Risk Layer, the Quote Judged in Dollars
 #
+# **v4.5.** The objective test of Section 12c is read the way the desk reads it: **win rate by side** (the share of
+# bid and of offer prints the quote at $x^*$ would have won), **distance to the print** (how far the quote sat from
+# the MSRB level, the cover: on wins the bp given up through the print, on misses the bp short of it), and P&L, for
+# the production rule on the original algo yield and for every variant, then the same by trade size, duration,
+# rating, call structure, beta-space cluster and industry, side by side. Every code cell now records its runtime;
+# the last cell tabulates the cells against the previous run and names the stages worth caching next.
+#
 # **v4.4.** Two additions and one removal. (i) The production objective is rebuilt inside the notebook: the desk
 # chooses the concession $x$ on a quote to maximise $p_{\text{fill}}(x)\,(x + \text{charge})$, with the fill curve the
 # trailing empirical CDF of the basis on the quote's own side and the charge the liquidity, risk and manual charges
@@ -80,7 +87,7 @@
 # 9. Transaction join (PIT-safe) and mark quality; 9b trade size and side; 9c where prints sit relative to our quote and to the evaluation
 # 10. Quote rules: the same-side memory, the interaction ladder, the re-opened legacy trials, the side x size intercepts, the level model; the direction-aware view
 # 11. Markout: would-have-filled P&L, edge and adverse selection, fill and P&L curves, the re-ranking in dollars, the cell-optimal concession, the realised round trip; 11b fill probability (the desk's curve, conditioned, modelled), the edge model, the quote engine in reduced form
-# 12. Quantile grid: the conditional distribution of the oriented error for the optimizer, with its calibration; 12b the residual side: forecast as concession modifier, mark noise as width scalar; 12c the production objective pfill(x) x (x + charge), rebuilt and tested piece by piece against expected P&L
+# 12. Quantile grid: the conditional distribution of the oriented error for the optimizer, with its calibration; 12b the residual side: forecast as concession modifier, mark noise as width scalar; 12c the production objective pfill(x) x (x + charge), rebuilt and tested piece by piece against expected P&L; win rate, cover distance and P&L by side and by characteristic
 # 13. Where the P&L lives: markout by characteristic, factor beta, cluster, side and size; the side heatmaps; the cells that carry the dollars
 # 14. Results registry and summary
 # 15. Robustness
@@ -115,6 +122,15 @@ warnings.filterwarnings('ignore')
 pd.set_option('display.max_columns', None)
 pd.set_option('display.width', 200)
 pd.options.display.float_format = '{:.4f}'.format
+
+# ---- per-cell runtime log (v4.5). Every code cell starts with CELL_T('label'); the last cell tabulates the runtimes, compares
+# them with the previous run (artifacts_v3/cell_runtimes.csv) and lists the cached stages each cell hit or recomputed.
+_RUN_T0 = time.perf_counter(); CELL_LOG: list[dict] = []; _CELL_STATE = {'t0': _RUN_T0, 'label': '1. Setup and configuration [1]'}
+
+
+def CELL_T(label: str) -> None:
+    now = time.perf_counter(); CELL_LOG.append({'cell': _CELL_STATE['label'], 'seconds': now - _CELL_STATE['t0']}); _CELL_STATE['t0'] = now; _CELL_STATE['label'] = label
+
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -248,6 +264,7 @@ PRE_REGISTERED = {
     'v43_pfill': 'fill probability P(o >= delta | x) for the S quote at delta in {-3, 0, 3, 6, 10} bp; four estimators scored by Brier and log-loss on the next month: the desk curve (side, trailing 100-day empirical CDF), a side x size x cluster cell table on prior months (shrunk), a gradient-boosted classifier on trade features, and the same with IPCA and state-space features',
     'v43_edge_model': 'expected round-trip edge of a fill at delta 0, gradient-boosted on the same two feature sets, walk-forward; scored by out-of-sample R2 and realised edge by predicted decile',
     'v43_engine_bar': 'the reduced-form engine (concession per print = argmax over the delta grid of pfill(delta | x) x (expected edge + delta)) replaces S at 0 only if its round-trip P&L per print is higher by 0.10 bp with bootstrap t > 3 and positive in 4 of 5 months',
+    'v45_win_rate_cover': 'win rate = share of customer prints on a side that crossed the quote at x*; cover distance = |print - quote at x*| in bp of yield, split into bp given up through the print on wins and bp short of the print on misses; both on the same prints for every variant, with the daily difference from production bootstrapped',
     'v44_production_objective': 'concession per print x* = argmax over the grid of pfill_side(x) x (x + total charge), with pfill the trailing 100-day empirical CDF of the basis on the same side and the charge the liquidity + risk + manual charges of the trade (sign and units detected and printed); fill iff the print crossed the quote shifted by x*',
     'v44_objective_variants': 'the three parts of the objective swapped one at a time and together: the mid (algo quote -> same-side memory S), the fill curve (desk curve -> quantile grid -> gradient-boosted model with IPCA and state-space features), the value of a fill (x + charge -> expected round-trip P&L from the edge model with the selection adjustment)',
     'v44_objective_bar': 'a variant replaces the production rule only if its realised round-trip P&L per print is higher by 0.10 bp, bootstrap t of the daily difference > 3, positive in >= 4 of the held-out months',
@@ -331,7 +348,7 @@ def cached(name: str, fn, deps=(), code=()):
         obj = pd.read_parquet(path_df) if path_df.exists() else pd.read_pickle(path_pk)
         p = path_df if path_df.exists() else path_pk
         print(f'[cache] {name}: reused {p.name} ({p.stat().st_size / 1e6:.0f} MB, loaded in {time.perf_counter() - t0:.1f}s)')
-        CACHE_LOG.append({'stage': name, 'status': 'reused', 'seconds': time.perf_counter() - t0, 'file': p.name}); return obj
+        CACHE_LOG.append({'stage': name, 'status': 'reused', 'seconds': time.perf_counter() - t0, 'file': p.name, 'cell': _CELL_STATE['label']}); return obj
     obj = fn(); dt = time.perf_counter() - t0
     for old in CACHE_DIR.glob(f'{name}_*'):
         old.unlink()
@@ -343,7 +360,7 @@ def cached(name: str, fn, deps=(), code=()):
     else:
         pd.to_pickle(obj, path_pk); p = path_pk
     print(f'[cache] {name}: computed in {dt:.0f}s, saved {p.name} ({p.stat().st_size / 1e6:.0f} MB)')
-    CACHE_LOG.append({'stage': name, 'status': 'computed', 'seconds': dt, 'file': p.name}); return obj
+    CACHE_LOG.append({'stage': name, 'status': 'computed', 'seconds': dt, 'file': p.name, 'cell': _CELL_STATE['label']}); return obj
 
 
 def frame_fingerprint(frame: pd.DataFrame, cols: list[str]) -> str:
@@ -433,6 +450,7 @@ print('Spec', CFG.spec_version, '| window', CFG.start_date, '->', CFG.end_date, 
 #   the target is additionally clipped at ±`target_clip_bp`.
 
 # %%
+CELL_T('2. Data load and QA [1]')
 t0 = time.perf_counter()
 step3_path = PIPE.path('research_panel_step3_yield.parquet')
 if not step3_path.exists():
@@ -474,6 +492,7 @@ savefig('02_market_context')
 record('data', panel_rows=len(raw_panel), panel_cusips=raw_panel['cusip'].nunique(), date_min=str(raw_panel['date'].min().date()), date_max=str(raw_panel['date'].max().date()))
 
 # %%
+CELL_T('2. Data load and QA [2]')
 # --- v3.9 new characteristics: trade size from MSRB prints, issuer industry from the trade track ---
 # Trade size is a bond characteristic here, not a trade feature: the time-decayed mean of log quantity over the
 # bond's MSRB prints strictly before the date (half-life trade_size_halflife_days), with the decayed print count as
@@ -526,6 +545,7 @@ else:
 record('data', has_msrb_store=bool(HAS_MSRB), has_industry=bool(HAS_INDUSTRY), trade_size_coverage=float(raw_panel['trade_size_lag'].notna().mean()) if 'trade_size_lag' in raw_panel.columns else None)
 
 # %%
+CELL_T('2. Data load and QA [3]')
 # --- rating fallback audit ---
 RATING_SCALE = {'AAA': 21, 'AA+': 20, 'AA': 19, 'AA-': 18, 'A+': 17, 'A': 16, 'A-': 15, 'BBB+': 14, 'BBB': 13, 'BBB-': 12,
                 'BB+': 11, 'BB': 10, 'BB-': 9, 'B+': 8, 'B': 7, 'B-': 6, 'CCC+': 5, 'CCC': 4, 'CCC-': 3, 'CC': 2, 'C': 1, 'D': 0}
@@ -561,6 +581,7 @@ if len(unmapped):
 record('data', **{k.replace(' ', '_'): float(v) for k, v in rating_audit['value'].items()})
 
 # %%
+CELL_T('2. Data load and QA [4]')
 # --- extreme-yield handling ---
 def flag_extreme_by_date(frame: pd.DataFrame, col: str, k: float) -> pd.Series:
     g = frame.groupby('date', observed=True)[col]
@@ -609,6 +630,7 @@ record('data', extreme_yield_rows=int(raw_panel['extreme_yield'].sum()), extreme
 # change in bp, clipped.
 
 # %%
+CELL_T('3. Model panel: instruments [1]')
 STATE_DUMMIES = ['CA', 'NY', 'TX', 'FL']
 TARGET = 'closing_yield_change_bp'
 
@@ -730,6 +752,7 @@ display(model[CHARS].describe().T[['mean', 'std', 'min', 'max']])
 record('model_panel', rows=len(model), cusips=model['cusip'].nunique(), dates=model['date'].nunique(), instruments=CHARS, mark_unchanged_share=float(model['mark_unchanged'].mean()), geo_buckets=geo.round(4).to_dict())
 
 # %%
+CELL_T('3. Model panel: instruments [2]')
 # Instrument EDA: correlation structure and the duration vs term relationship
 zc = [c for c in CHARS if c.startswith('z_')]
 sample = model.sample(min(len(model), 200_000), random_state=CFG.seed)
@@ -746,6 +769,7 @@ savefig('03_instrument_eda')
 print('max |corr| off-diagonal:', round(float((corr.values - np.eye(len(corr))).max()), 3), '| duration instrument:', CFG.duration_instrument)
 
 # %%
+CELL_T('3. Model panel: instruments [3]')
 # The two data rules.
 # (1) Dispersion days. An evaluator-wide reprice is a day where many bonds move a lot relative to the day's MEDIAN
 #     move; a day where the whole curve moves 15 bp is a common move the intercept factor absorbs and must stay in
@@ -793,6 +817,7 @@ record('data_rules', partial_days=[str(d.date()) for d in sorted(PARTIAL_DAYS)],
 # walk-forward Gamma.
 
 # %%
+CELL_T('4. IPCA: K sweep, Gamma anatomy, factor paths [1]')
 def date_weights(dates: pd.DatetimeIndex, rr: np.ndarray, nobs: np.ndarray, cfg: RunConfig, repricing: set) -> np.ndarray:
     """Per-date weights for the ALS moments. 'inverse_var' divides each date by its cross-sectional mean square of the
     target (capped), so one 20 bp day does not carry 50 normal days; dispersion days get weight zero when excluded."""
@@ -902,6 +927,7 @@ savefig('04_k_sweep')
 record('ipca_full_sample', **{f'var_explained_K{k}': float(v) for k, v in k_table['in_sample_var_explained (date-weighted)'].items()})
 
 # %%
+CELL_T('4. IPCA: K sweep, Gamma anatomy, factor paths [2]')
 ipca = fits[CFG.selected_k]
 gamma = pd.DataFrame(ipca.Gamma, index=CHARS, columns=[f'factor{i+1}' for i in range(CFG.selected_k)])
 fvar = ipca.Factors.var(axis=0); fshare = fvar / fvar.sum()
@@ -933,6 +959,7 @@ record('ipca_full_sample', factor_variance_share=[float(x) for x in fshare], gam
 # (the code still supports 'weekly' and 'regime'). The residuals of record come from the pre-registered cadence.
 
 # %%
+CELL_T('5. Walk-forward residuals: refit cadence, regime-conditional [1]')
 def make_folds(dates: pd.DatetimeIndex, train_start: str, first_oos: str, test_days: int | None) -> list[dict]:
     """Expanding-window folds. test_days=None gives a single fold (Gamma frozen at first_oos)."""
     dates = pd.DatetimeIndex(dates).sort_values()
@@ -1056,6 +1083,7 @@ record('walk_forward', folds=len(folds), residual_rows=len(resid), cusips=resid[
 del runs
 
 # %%
+CELL_T('5. Walk-forward residuals: refit cadence, regime-conditional [2]')
 # Fit quality over time and Gamma stability across versions
 rm = resid.assign(month=resid['date'].dt.to_period('M').astype(str)).groupby('month').apply(
     lambda g: pd.Series({'oos_var_explained': 1 - g['pit_residual'].var() / g['target_bp'].var(), 'residual_sd_bp': g['pit_residual'].std(), 'target_sd_bp': g['target_bp'].std(), 'rows': len(g)}), include_groups=False)
@@ -1087,6 +1115,7 @@ savefig('05_residual_dispersion')
 record('walk_forward', gamma_loading_sd_across_versions=drift, gamma_loading_sd_raw=drift_raw, monthly=rm.round(4).to_dict())
 
 # %%
+CELL_T('5. Walk-forward residuals: refit cadence, regime-conditional [3]')
 # Lookups used by the leverage diagnostic: the instrument matrix per date and the Gamma per version
 MODEL_BY_DATE = {d: g for d, g in model.groupby('date', sort=True, observed=True)}
 GAMMA_ALIGNED = {gv: g.drop(columns=['gamma_version', 'fold', 'regime']).to_numpy(float) for gv, g in gamma_versions.groupby('gamma_version', sort=True)}
@@ -1101,6 +1130,7 @@ _gv_index = pd.DatetimeIndex(sorted(GAMMA_ALIGNED))
 # beta span; we check $B_t'\varepsilon_t = 0$ and the gross leverage / breadth of each factor portfolio.
 
 # %%
+CELL_T('6. Factor-mimicking weights and the residual-maker [1]')
 beta_cols = [f'beta{j+1}' for j in range(CFG.selected_k)]
 w_rows, orth = [], []
 lev_rows = []
@@ -1146,6 +1176,7 @@ record('mimicking_weights', max_beta_orthogonality=float(max(orth)), **{f'{k}_{m
 # comparables view an RFQ desk uses.
 
 # %%
+CELL_T('6b. Factor space: beta-space map, clusters and within-cluste [1]')
 from sklearn.cluster import KMeans  # noqa: E402
 from sklearn.decomposition import PCA  # noqa: E402
 from sklearn.manifold import TSNE  # noqa: E402
@@ -1193,6 +1224,7 @@ for a, (col, title, kind) in zip(ax.ravel(), [('rating_bucket', 'by rating', 'ca
 savefig('06b_beta_space_map')
 
 # %%
+CELL_T('6b. Factor space: beta-space map, clusters and within-cluste [2]')
 # v4.3: the same map coloured by how the bond trades: decayed trade size, side mix of its prints, print frequency, industry
 _tc = model[model['date'] == last_date][['cusip'] + [c for c in ['trade_size_lag', 'print_freq_lag', 'industry_bucket'] if c in model.columns]].copy(); _tc['cusip'] = _tc['cusip'].astype('string')
 smt = sm.assign(cusip=sm['cusip'].astype('string')).merge(_tc, on='cusip', how='left')
@@ -1224,6 +1256,7 @@ if panels:
     fig.suptitle('How the bonds in beta space trade (grey = no print history)', fontsize=12); plt.tight_layout(); savefig('06b_beta_space_map_trading')
 
 # %%
+CELL_T('6b. Factor space: beta-space map, clusters and within-cluste [3]')
 # Clusters in beta space: profile and named examples, then rich/cheap ranking inside one cluster
 km = KMeans(n_clusters=N_CLUSTERS, n_init=10, random_state=CFG.seed).fit(Bs)
 snap['cluster'] = km.labels_
@@ -1252,6 +1285,7 @@ snap.drop(columns=['label']).to_parquet(ARTIFACTS / f'beta_space_snapshot_{last_
 record('factor_space', date=str(last_date.date()), embedding=emb_name, clusters=N_CLUSTERS, cluster_profile=profile.round(4).reset_index().to_dict(orient='records'))
 
 # %%
+CELL_T('6b. Factor space: beta-space map, clusters and within-cluste [4]')
 # Point-in-time beta-space clusters for the breakdowns in Section 12: k-means fitted on the standardised betas of the
 # FIRST OOS month and applied to every later bond-day with the same centroids and scaling, so membership never looks ahead.
 _first_m = resid['date'].dt.to_period('M').min()
@@ -1276,6 +1310,7 @@ record('factor_space', pit_clusters=cluster_profile.round(4).reset_index().to_di
 # pooled one, were closed in v41 and v31 and are no longer run.)
 
 # %%
+CELL_T('7. Residual dynamics: autocorrelation, activity buckets, the [1]')
 resid = resid.sort_values(['cusip', 'date'], kind='stable').reset_index(drop=True)
 grp = resid.groupby('cusip', observed=True)
 resid['dispersion_day'] = resid['date'].isin(DISPERSION_DAYS)
@@ -1299,6 +1334,7 @@ savefig('07_residual_acf')
 record('residual_diagnostics', acf_pearson=acf['pearson'].round(4).to_dict(), acf_spearman=acf['spearman'].round(4).to_dict(), acf_pearson_ex_dispersion=acf['pearson_ex_dispersion'].round(4).to_dict())
 
 # %%
+CELL_T('7. Residual dynamics: autocorrelation, activity buckets, the [2]')
 # Point-in-time activity buckets: trailing-window volatility of the target per bond, lagged one observation,
 # ranked into quintiles within each date. Every bond-day gets a bucket (no UNKNOWN), and nothing looks ahead.
 _m = model.sort_values(['cusip', 'date'], kind='stable')
@@ -1344,6 +1380,7 @@ savefig('07_buckets_and_distribution')
 record('residual_diagnostics', bucket_ic=bucket_ic.round(4).to_dict(), residual_kurtosis=float(stats.kurtosis(e)))
 
 # %%
+CELL_T('7. Residual dynamics: autocorrelation, activity buckets, the [3]')
 # Reference forecaster on expanding monthly folds: the trailing mean (level signal)
 L = CFG.longconv_lags   # kept as the number of lags shown in the ACF and the implied-tap exhibit
 # Level signal: trailing mean of the residual (the bond's accumulated deviation from factor-implied fair value).
@@ -1426,6 +1463,7 @@ for name, cols, winsor, fitter in FC_SPECS:
 # the residual signal of record (`record_signal`). The fit is cached on the walk-forward residuals' key.
 
 # %%
+CELL_T('7b. The signal of record: state-space filter, AR drift plus  [1]')
 LOG2PI = np.log(2.0 * np.pi)
 
 
@@ -1579,6 +1617,7 @@ savefig('07_forecasters')
 record('residual_forecast', table=fc_table.drop(columns=[c for c in ['params'] if c in fc_table.columns]).round(4).to_dict(), ssm_params=ssm_params.round(5).to_dict(orient='records'), ssm_params_by_bucket=ssmb_params.round(5).to_dict(orient='records'))
 
 # %%
+CELL_T('7b. The signal of record: state-space filter, AR drift plus  [2]')
 # Two-regime check: does the body persist while the tails revert? Conditional next-residual by current-residual bin.
 bins = pairs['pit_residual'].quantile([0, 0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99, 1.0]).to_numpy()
 pairs['res_bin'] = pd.cut(pairs['pit_residual'], bins=np.unique(bins), include_lowest=True)
@@ -1610,6 +1649,7 @@ record('residual_diagnostics', two_regime=two_regime.reset_index().astype({'res_
 # itself, by horizon. It is an in-panel upper bound (the factor realisations are the fitted ones).
 
 # %%
+CELL_T('8. Risk model snapshot: what the inventory charge needs [1]')
 last_date = resid['date'].max()
 _rs = resid.sort_values(['cusip', 'date'], kind='stable')
 _rs = _rs.reset_index(drop=True)
@@ -1679,6 +1719,7 @@ record('risk_model', date=str(last_date.date()), factor_covariance=fcov.round(5)
 # $t$ above 2 with a monotone quintile pattern and the same sign at monthly frequency.
 
 # %%
+CELL_T('8b. Factor premia as expected returns: the Kelly-Palhares-Pr [1]')
 _fc = [f'f{j+1}' for j in range(CFG.selected_k)]
 # ---- (1) the premium available at each refit: in-sample factor realisations under the fold's Gamma, on its training dates only
 prem_rows, LAM, SIG = [], {}, {}
@@ -1864,6 +1905,7 @@ record('factor_premia', premium_estimates=premia.round(5).to_dict(orient='record
 # inter-dealer. The dealer round trip is therefore `P yield − S yield` and is positive.
 
 # %%
+CELL_T('9. Transaction validation (PIT-safe) [1]')
 def standardize_trades(tr: pd.DataFrame) -> pd.DataFrame:
     t = tr.copy()
     t.columns = [str(c) for c in t.columns]
@@ -2031,6 +2073,7 @@ def neutralised_fm(frame: pd.DataFrame, y: str, x: str, cells: list[str], date_c
     return {'n': len(f), 'fm_beta': slopes.mean() if len(slopes) else np.nan, 'fm_t': np.sqrt(len(slopes)) * slopes.mean() / slopes.std() if len(slopes) > 2 and slopes.std() > 0 else np.nan, 'fm_dates': len(slopes)}
 
 # %%
+CELL_T('9. Transaction validation (PIT-safe) [2]')
 CONTROLS = ['log_size', 'MinuteFromSignal', 'dMmdSprdSide']
 if HAS_TRADES:
     trades_all = cached('trades_std', lambda: standardize_trades(trades_raw), deps=[TRADES_FP], code=[standardize_trades, group_ewm_by_order])   # full matched print history
@@ -2086,6 +2129,7 @@ else:
 # was above the print and the bid was aggressive; on S the sign reverses.
 
 # %%
+CELL_T('9b. Trade size and side: how large and small prints behave [1]')
 if HAS_TRADES and not tv.empty:
     tv['qty_group'] = qty_group(tv['msrb_quantity'])
     if 'industry_bucket' in model.columns:
@@ -2146,6 +2190,7 @@ else:
 # how far from the evaluation the market actually trades.
 
 # %%
+CELL_T('9c. Where prints sit relative to our quote and to the evalua [1]')
 if HAS_TRADES and not tv.empty and 'y_close_trade_date' in tv.columns:
     ps = tv[tv['side'].isin(['P', 'S'])].copy(); ps['s'] = np.where(ps['side'] == 'P', 1.0, -1.0)
     ps['o_quote'] = ps['s'] * ps['e_algo_bp']                                            # + = print on the aggressive side of our quote: we would have filled
@@ -2215,6 +2260,7 @@ else:
 # by-side table; the full breakdowns live in the registry.
 
 # %%
+CELL_T('10. Quote rules: the same-side memory, the ladder, the re-op [1]')
 try:
     import lightgbm as lgb  # type: ignore
     HAS_LGB = True
@@ -2673,6 +2719,7 @@ else:
 # are the result; the dollar level is an upper bound.
 
 # %%
+CELL_T('11. Markout: the quote judged in dollars [1]')
 if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
     mo = ecp[ecp['side'].isin(['P', 'S'])].copy(); mo['s'] = np.where(mo['side'] == 'P', 1.0, -1.0)
     _q = pd.to_numeric(mo['msrb_quantity'], errors='coerce').replace([np.inf, -np.inf], np.nan)
@@ -2997,6 +3044,7 @@ else:
 # replace the desk curve inside the production objective without changing the mid.
 
 # %%
+CELL_T('11b. Fill probability: the desks curve, conditioned, modell [1]')
 if HAS_TRADES and 'mo' in globals() and not mo.empty:
     from sklearn.ensemble import HistGradientBoostingClassifier  # noqa: E402
     PF_DELTAS = [float(d) for d in CFG.pfill_deltas]; PFD = np.asarray(PF_DELTAS)
@@ -3271,6 +3319,7 @@ else:
 # weights, together with the marginal side x size grid as the fallback.
 
 # %%
+CELL_T('12. Quantile grid: the conditional distribution the optimize [1]')
 if HAS_TRADES and 'mo' in globals() and not mo.empty:
     TAUS = list(CFG.grid_taus)
     mo['cluster_id'] = mo['beta_cluster'].astype('Int64').astype(str).replace('<NA>', 'NA') if 'beta_cluster' in mo.columns else 'NA'
@@ -3370,6 +3419,7 @@ else:
 # (b) is higher: the mark-noise estimate explains how far prints sit from the evaluation (Section 9).
 
 # %%
+CELL_T('12b. The residual side: the forecast as a concession modifie [1]')
 if HAS_TRADES and 'mo' in globals() and not mo.empty and 'ssm_signal' in mo.columns and mo['ssm_signal'].notna().mean() > 0.3:
     phi_bar = float(ssm_params['phi'].iloc[-1]) if 'ssm_params' in globals() and not ssm_params.empty and 'phi' in ssm_params.columns else 0.99
     _mult = sum(phi_bar ** k for k in range(2, HR + 1))
@@ -3500,11 +3550,21 @@ else:
 # month, against the production rule with the usual bar. The gap between what the production objective expects per
 # print and what the round trip pays is the cost of assuming the charge is earned in full.
 #
+# **By side, and the cover.** The desk reads a quote rule through its win rate on the bid and on the offer and
+# through where the quote sat against the print. For each variant, on the same prints: the share of P (bid) and S
+# (offer) prints won, the distance $|o - x^*|$ between the quote and the MSRB print (on wins, the bp given up
+# through the print; on misses, the bp short of it), the share of quotes within 2 bp of the print, and the realised
+# P&L, with the daily differences from production bootstrapped. Then the same win rate and P&L by trade size,
+# duration, rating, call structure, beta-space cluster and industry, bid and offer separately, for the two swaps
+# that matter (the fill curve alone, and all three parts): a variant that wins where production loses, or loses
+# where it wins, is a conditioning gain the pooled table hides.
+#
 # **Reading it.** If swapping the fill curve moves the dollars and swapping the mid does not, the desk's lever is
 # the fill model; if the expected-P&L value moves them, the lever is where the quote earns its edge, not how often it
 # fills. A variant that wins on its own objective but loses on realised dollars is a model that flatters itself.
 
 # %%
+CELL_T('12c. The production objective: pfill(x) x (x + charge), rebu [1]')
 if HAS_TRADES and 'mo' in globals() and not mo.empty and 'METHODS' in globals() and common.sum() >= 200:
     XGa = np.arange(*CFG.objective_grid_bp).astype(float); XG = [float(x_) for x_ in XGa]
     # ---- (1) charges per print: the per-trade track store as of the print, else charge columns on the matched trades, else the static track, else zero
@@ -3682,6 +3742,93 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'METHODS' in globals() 
         xmix = pd.DataFrame({name: pd.Series(XSTAR[name][okm]).value_counts(normalize=True).sort_index() for name in POL}).fillna(0.0); xmix.index = ['no quote' if np.isinf(i_) else f'x = {float(i_):g}' for i_ in xmix.index]
         print('Concession chosen, share of prints by policy:'); display(xmix.round(3))
 
+        # ---- (3) by side: win rate, distance to the print (the cover), P&L; daily differences from production bootstrapped
+        ALLPOL = {**{k_: v_[:2] + (XSTAR[k_],) for k_, v_ in POL.items()}, 'A at 0 (no concession)': (errA, O_A, np.zeros(len(mo))), 'S at 0 (no concession)': (errS, O_S, np.zeros(len(mo)))}
+        side_rows, side_daily = [], {}
+        for name, (err_, o_, xs) in ALLPOL.items():
+            for sd_, msk in [('P', IS_P), ('S', IS_S)]:
+                ok = okm & msk; fin = ok & np.isfinite(xs); win = fin & (o_ >= xs); miss = fin & ~(o_ >= xs); gap = o_ - xs
+                pnl = BASE_RT - o_ + np.where(np.isfinite(xs), xs, 0.0); v = np.where(win, pnl, 0.0)
+                d_win = pd.Series(win[ok].astype(float)).groupby(TD[ok]).mean(); d_pnl = pd.Series(v[ok]).groupby(TD[ok]).mean(); side_daily[(name, sd_)] = (d_win, d_pnl)
+                side_rows.append({'policy': name, 'side': sd_, 'prints': int(ok.sum()), 'win rate': float(win.sum() / max(ok.sum(), 1)), 'declined': float((ok & ~np.isfinite(xs)).sum() / max(ok.sum(), 1)), 'mean x* (bp)': float(np.mean(xs[fin])) if fin.any() else np.nan,
+                                  '|quote - print| (bp)': float(np.mean(np.abs(gap[fin]))) if fin.any() else np.nan, 'within 2 bp of the print': float((np.abs(gap[fin]) <= 2.0).mean()) if fin.any() else np.nan,
+                                  'through the print | win (bp)': float(gap[win].mean()) if win.any() else np.nan, 'short of the print | miss (bp)': float(-gap[miss].mean()) if miss.any() else np.nan,
+                                  'RT P&L | win (bp)': float(pnl[win].mean()) if win.any() else np.nan, 'RT P&L per print (bp)': float(d_pnl.mean()) if len(d_pnl) else np.nan, '$ per month ($k)': float((pnl[win] * DPB[win]).sum() / 1e3 / _nm)})
+        by_side = pd.DataFrame(side_rows).set_index(['policy', 'side'])
+        for (name, sd_) in by_side.index:
+            if name == PRODN:
+                continue
+            dw = (side_daily[(name, sd_)][0] - side_daily[(PRODN, sd_)][0]).dropna(); dp = (side_daily[(name, sd_)][1] - side_daily[(PRODN, sd_)][1]).dropna()
+            by_side.loc[(name, sd_), 'win rate boot t vs production'] = block_bootstrap_t(dw.to_numpy(), CFG.block_days, CFG.n_boot, CFG.seed)
+            by_side.loc[(name, sd_), 'RT P&L boot t vs production'] = block_bootstrap_t(dp.to_numpy(), CFG.block_days, CFG.n_boot, CFG.seed)
+        print('By side: win rate, distance of the quote at x* from the MSRB print (the cover), and realised P&L, on the same prints (P = bid, S = offer; bootstrap t of the daily difference from production):'); display(by_side.round(3))
+        _bs = by_side.unstack('side')
+        print('Win rate and P&L per print, bid vs offer, production and the two swaps that matter:')
+        display(_bs.loc[[p_ for p_ in [PRODN, 'A, GBM + IPCA fill model, x + charge', 'S, GBM + IPCA fill model, expected P&L (the Section 11b engine)', 'A at 0 (no concession)'] if p_ in _bs.index], [('win rate', 'P'), ('win rate', 'S'), ('|quote - print| (bp)', 'P'), ('|quote - print| (bp)', 'S'), ('RT P&L per print (bp)', 'P'), ('RT P&L per print (bp)', 'S')]].round(3))
+
+        # ---- (4) by characteristic x side for production and the two key swaps
+        KEYP = [p_ for p_ in [PRODN, 'A, GBM + IPCA fill model, x + charge', 'S, GBM + IPCA fill model, expected P&L (the Section 11b engine)'] if p_ in POL]
+        _dimv = {'trade size': QTY_ARR, 'duration bucket': pd.cut(mo['modified_duration_lag1'], bins=[-1, 1, 2.5, 4, 6, 8, 11, 100], labels=['<1', '1-2.5', '2.5-4', '4-6', '6-8', '8-11', '>11']).astype(str).to_numpy(),
+                 'rating bucket': pd.cut(mo['rating_score'].fillna(-1), bins=[-2, -0.5, 14.5, 17.5, 20.5, 21.5], labels=['NR', 'BBB and below', 'A', 'AA', 'AAA']).astype(str).to_numpy(),
+                 'beta-space cluster': np.array([CLUSTER_LABEL.get(int(c_), 'NA') if str(c_).lstrip('-').isdigit() else 'NA' for c_ in CL_ARR])}
+        for dname, col in [('call structure', 'call_structure'), ('industry', 'industry_bucket')]:
+            if col in mo.columns and mo[col].notna().any():
+                _dimv[dname] = mo[col].astype(str).to_numpy()
+        _dimo = {'trade size': QTY_LABELS, 'duration bucket': ['<1', '1-2.5', '2.5-4', '4-6', '6-8', '8-11', '>11'], 'rating bucket': ['NR', 'BBB and below', 'A', 'AA', 'AAA']}
+        ch_rows = []
+        for dname, arr in _dimv.items():
+            for lvl in (_dimo.get(dname) or sorted(pd.unique(arr[okm]))):
+                for sd_, msk in [('P', IS_P), ('S', IS_S)]:
+                    sel = okm & msk & (arr == lvl)
+                    if sel.sum() < max(100, CFG.n_min_cell // 10):
+                        continue
+                    for name in KEYP:
+                        err_, o_, _, _, _ = POL[name]; xs = XSTAR[name]; fin = sel & np.isfinite(xs); win = fin & (o_ >= xs); pnl = BASE_RT - o_ + np.where(np.isfinite(xs), xs, 0.0)
+                        ch_rows.append({'dimension': dname, 'cell': str(lvl), 'side': sd_, 'policy': name, 'prints': int(sel.sum()), 'win rate': float(win.sum() / sel.sum()), 'RT P&L per print (bp)': float(np.where(win, pnl, 0.0)[sel].mean()), '$ per month ($k)': float((pnl[win] * DPB[win]).sum() / 1e3 / _nm)})
+        by_char = pd.DataFrame(ch_rows)
+        _short = {PRODN: 'production', 'A, GBM + IPCA fill model, x + charge': 'fill-curve swap', 'S, GBM + IPCA fill model, expected P&L (the Section 11b engine)': 'all three'}
+        char_tabs = {}
+        if len(by_char):
+            by_char['policy_s'] = by_char['policy'].map(_short)
+            for dname, g in by_char.groupby('dimension', sort=False):
+                pv = g.pivot_table(index=['cell', 'side'], columns='policy_s', values=['win rate', 'RT P&L per print (bp)'], aggfunc='first')
+                order = [c_ for c_ in (_dimo.get(dname) or sorted(g['cell'].unique())) if c_ in pv.index.get_level_values(0)]
+                pv = pv.reindex([(c_, sd_) for c_ in order for sd_ in ['P', 'S'] if (c_, sd_) in pv.index])
+                for sw in ['fill-curve swap', 'all three']:
+                    if ('RT P&L per print (bp)', sw) in pv.columns:
+                        pv[('delta P&L vs production (bp)', sw)] = pv[('RT P&L per print (bp)', sw)] - pv[('RT P&L per print (bp)', 'production')]; pv[('delta win rate vs production', sw)] = pv[('win rate', sw)] - pv[('win rate', 'production')]
+                pv['prints'] = g.pivot_table(index=['cell', 'side'], values='prints', aggfunc='first').reindex(pv.index)['prints']
+                char_tabs[dname] = pv
+                print(f'By {dname} x side: win rate and round-trip P&L per print (bp) for production and the two swaps, with the deltas vs production:'); display(pv.round(3))
+
+        # ---- figures: by side, then by characteristic
+        fig, ax = plt.subplots(1, 3, figsize=(20, 7))
+        _ord = [p_ for p_ in list(POL) + ['A at 0 (no concession)', 'S at 0 (no concession)'] if p_ in _bs.index]; y_ = np.arange(len(_ord)); w = 0.38
+        for a, col, ttl in zip(ax, ['win rate', '|quote - print| (bp)', 'RT P&L per print (bp)'], ['Win rate (share of prints crossed at x*)', 'Distance of the quote from the MSRB print (bp, the cover)', 'Realised round-trip P&L per print (bp)']):
+            for i_, (sd_, c_) in enumerate([('P', '#4C72B0'), ('S', '#DD8452')]):
+                a.barh(y_ + (i_ - 0.5) * w, _bs.loc[_ord, (col, sd_)], w, color=c_, label={'P': 'P bid', 'S': 'S offer'}[sd_])
+            a.set_yticks(y_); a.set_yticklabels([p_[:48] for p_ in _ord], fontsize=7); a.set_title(ttl, fontsize=10); a.axvline(0, color='k', lw=0.5); a.invert_yaxis()
+            for sd_, c_ in [('P', '#4C72B0'), ('S', '#DD8452')]:
+                a.axvline(_bs.loc[PRODN, (col, sd_)], color=c_, ls=':', lw=1.0)
+        ax[0].legend(fontsize=8); fig.suptitle('The objective variants by side on the same prints (dotted = production)', fontsize=12); plt.tight_layout(); savefig('12c_objective_by_side')
+        if char_tabs:
+            nd = len(char_tabs); fig, axs = plt.subplots(2, nd, figsize=(4.4 * nd, 11), squeeze=False)
+            for j_, (dname, pv) in enumerate(char_tabs.items()):
+                for i_, (blk, ttl, cmap, fmt) in enumerate([('delta P&L vs production (bp)', 'delta RT P&L per print vs production (bp)', 'RdYlGn', '{:+.1f}'), ('delta win rate vs production', 'delta win rate vs production', 'RdBu', '{:+.2f}')]):
+                    cols = [c_ for c_ in pv.columns if c_[0] == blk]
+                    if not cols:
+                        axs[i_, j_].set_axis_off(); continue
+                    tab = pv[cols].unstack('side'); tab.columns = [f'{c_[1]} | {c_[2]}' for c_ in tab.columns]; tab = tab.reindex([c_ for c_ in (_dimo.get(dname) or sorted(tab.index)) if c_ in tab.index])
+                    v_ = tab.to_numpy(float); lim = np.nanmax(np.abs(v_)) if np.isfinite(v_).any() else 1.0; lim = lim if lim > 0 else 1.0
+                    a = axs[i_, j_]; im = a.imshow(v_, cmap=cmap, aspect='auto', vmin=-lim, vmax=lim); a.set_xticks(range(tab.shape[1])); a.set_xticklabels(tab.columns, rotation=40, fontsize=7, ha='right'); a.set_yticks(range(len(tab))); a.set_yticklabels([str(i__)[:22] for i__ in tab.index], fontsize=7); a.grid(False)
+                    for r_ in range(tab.shape[0]):
+                        for c_ in range(tab.shape[1]):
+                            if np.isfinite(v_[r_, c_]):
+                                a.text(c_, r_, fmt.format(v_[r_, c_]), ha='center', va='center', fontsize=7)
+                    a.set_title(f'{dname}: {ttl}', fontsize=9)
+            fig.suptitle('Where the swaps win and lose, bid (P) and offer (S) separately: the fill-curve swap and all three parts, vs production', fontsize=11); plt.tight_layout(); savefig('12c_objective_by_characteristic')
+        record('production_objective', by_side=by_side.round(4).reset_index().to_dict(orient='records'), by_characteristic=by_char.round(4).to_dict(orient='records'))
+
         # ---- figures
         fig, ax = plt.subplots(2, 2, figsize=(18, 11))
         if len(charge_tab):
@@ -3724,6 +3871,7 @@ else:
 # the v3.9 run and the v3.8 paper; they are not repeated here.
 
 # %%
+CELL_T('13. Where the P&L lives: markout by characteristic, factor c [1]')
 if HAS_TRADES and 'mo' in globals() and not mo.empty:
     bk = mo.copy()
     bk['dur_bucket'] = pd.cut(bk['modified_duration_lag1'], bins=[-1, 1, 2.5, 4, 6, 8, 11, 100], labels=['<1', '1-2.5', '2.5-4', '4-6', '6-8', '8-11', '>11']).astype(str)
@@ -3843,6 +3991,7 @@ else:
 # ## 14. Results registry and summary
 
 # %%
+CELL_T('14. Results registry and summary [1]')
 score = resid[['cusip', 'date', 'gamma_version', 'fold', 'target_bp', 'fitted_bp', 'pit_residual', 'activity_bucket'] + beta_cols + [c for c in ['ssm_signal', 'ssm_drift', 'ssm_mark_noise'] if c in resid.columns]].copy()
 score['pit_residual_rank'] = score.groupby('date', observed=True)['pit_residual'].rank(pct=True)
 if 'ssm_signal' in score.columns:
@@ -3935,6 +4084,11 @@ if 'production_objective' in REGISTRY and REGISTRY['production_objective']['poli
     summary_rows.append((f"Production objective (charges: {REGISTRY['production_objective']['charge_source'].split(',')[0]}, {REGISTRY['production_objective']['charge_units']}): expected | realised round trip per print (bp); mean x*; fill share", f"{_po.loc[_pp, 'objective value per print (expected)']:+.2f} | {_po.loc[_pp, 'round trip: P&L per print (bp)']:+.2f}; {_po.loc[_pp, 'mean x* (bp)']:.1f} bp; {_po.loc[_pp, 'fill share']:.0%}"))
     _sw = pd.DataFrame(REGISTRY['production_objective']['swaps']).set_index('swap')
     summary_rows.append(('Replacing one part of the production objective (delta round-trip P&L per print vs production, boot t): mid | fill curve | value of a fill | all three', ' | '.join(f"{r_['delta RT P&L per print (bp)']:+.2f} (t {r_['boot t']:+.1f})" for _, r_ in _sw.iterrows())))
+    if REGISTRY['production_objective'].get('by_side'):
+        _bsr = pd.DataFrame(REGISTRY['production_objective']['by_side']).set_index(['policy', 'side'])
+        for _pn, _lab in [(_pp, 'production (algo yield)'), ('A, GBM + IPCA fill model, x + charge', 'fill-curve swap'), ('S, GBM + IPCA fill model, expected P&L (the Section 11b engine)', 'all three')]:
+            if (_pn, 'P') in _bsr.index and (_pn, 'S') in _bsr.index:
+                summary_rows.append((f'{_lab}: win rate bid | offer; |quote - print| bid | offer (bp); RT P&L per print bid | offer (bp)', f"{_bsr.loc[(_pn, 'P'), 'win rate']:.0%} | {_bsr.loc[(_pn, 'S'), 'win rate']:.0%}; {_bsr.loc[(_pn, 'P'), '|quote - print| (bp)']:.1f} | {_bsr.loc[(_pn, 'S'), '|quote - print| (bp)']:.1f}; {_bsr.loc[(_pn, 'P'), 'RT P&L per print (bp)']:+.2f} | {_bsr.loc[(_pn, 'S'), 'RT P&L per print (bp)']:+.2f}"))
     _win = _po[_po['beats production (bar, round trip)'].astype(bool)]
     summary_rows.append(('Variants that clear the bar against production (round trip)', '; '.join(f"{i_}: {r_['round trip: P&L per print (bp)']:+.2f} bp" for i_, r_ in _win.iterrows()) if len(_win) else 'none'))
 if 'residual_side' in REGISTRY:
@@ -3983,6 +4137,7 @@ if len(_cl):
 # ## 15. Robustness: dispersion-day exclusions, bootstrap inference, pre-registered choices
 
 # %%
+CELL_T('15. Robustness: dispersion-day exclusions, bootstrap inferen [1]')
 rob_rows = [{'check': 'Residual ACF lag 1 (Pearson)', 'all days': acf.loc[1, 'pearson'], 'ex dispersion days': acf.loc[1, 'pearson_ex_dispersion']},
             {'check': 'Residual ACF lag 1 (Spearman)', 'all days': acf.loc[1, 'spearman'], 'ex dispersion days': acf.loc[1, 'spearman_ex_dispersion']}]
 for nm in fc_table.index:
@@ -3998,5 +4153,21 @@ if HAS_TRADES and not tv.empty:
     record('robustness', fm_vs_bootstrap=key.round(4).to_dict(orient='records'))
 print('Pre-registered choices (fixed before this run):'); display(pd.Series(PRE_REGISTERED).to_frame('value'))
 record('robustness', residual_checks=robust.round(4).reset_index().to_dict(orient='records'), pre_registered=PRE_REGISTERED)
+# ---- per-cell runtimes (v4.5): this run against the previous one, with the cached stages each cell touched
+CELL_T('end')
+ct = pd.DataFrame(CELL_LOG); ct['share'] = ct['seconds'] / ct['seconds'].sum(); ct['order'] = np.arange(len(ct))
+_rt_path = ARTIFACTS / 'cell_runtimes.csv'
+if _rt_path.exists():
+    try:
+        _prev = pd.read_csv(_rt_path)[['cell', 'seconds']].drop_duplicates('cell').rename(columns={'seconds': 'previous run (s)'}); ct = ct.merge(_prev, on='cell', how='left'); ct['delta (s)'] = ct['seconds'] - ct['previous run (s)']
+    except Exception as exc:  # noqa: BLE001
+        print('previous runtimes unreadable:', exc)
+if CACHE_LOG:
+    _cl = pd.DataFrame(CACHE_LOG); ct['cached stages'] = ct['cell'].map(_cl.groupby('cell').apply(lambda g: ', '.join(f'{r.stage} ({r.status}, {r.seconds:.0f}s)' for r in g.itertuples()), include_groups=False)).fillna('')
+ct.to_csv(_rt_path, index=False)
+_tot = ct['seconds'].sum(); _top = ct.sort_values('seconds', ascending=False).head(15)
+print(f'Runtime: {_tot / 60:.1f} min over {len(ct)} cells; the 15 slowest carry {_top["seconds"].sum() / _tot:.0%} of it. Cells without a cached stage that recur near the top are the next caching candidates:')
+display(_top.set_index('cell')[[c for c in ['seconds', 'previous run (s)', 'delta (s)', 'share', 'cached stages'] if c in ct.columns]].round(1))
+record('runtime', total_seconds=float(_tot), cells=ct.drop(columns=['order']).round(2).to_dict(orient='records'))
 (ARTIFACTS / 'results_registry.json').write_text(json.dumps(REGISTRY, indent=2, default=str), encoding='utf-8')
 print('registry updated:', ARTIFACTS / 'results_registry.json')
