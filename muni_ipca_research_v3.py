@@ -1,6 +1,12 @@
 # %% [markdown]
 # # Muni IPCA v4 — From Fair Mid to Markout: the Factor Model as Risk Layer, the Quote Judged in Dollars
 #
+# **v5.3.** Runtime of 12c. The v48 run spent 25 minutes in the production objective (22 s in v47); the only additions
+# since were replica B's desk curve on the wide grid, a prints x grid matrix built from per-date sorts of the full
+# print history, and its continuous concession table. The desk curve is now a cumulative histogram on the grid (one
+# pass over the history, the same values), replica B reads the per-(side, date) curve table directly, the concession
+# mix is shown to the bp, and 12c prints the time of each of its blocks. No number changes.
+#
 # **v5.2.** Portfolio research on the fixed window (Section 8c). The sample cannot be extended, so 8c asks what
 # about 125 held-out days and fifty thousand bonds can say about expected returns: every held-out day forms quintile
 # sorts on a zoo of point-in-time signals (the Kelly-Palhares-Pruitt expected return, carry, the bond's own momentum
@@ -3931,17 +3937,29 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty:
     CL_ARR = mo['beta_cluster'].astype('Int64').astype(str).replace('<NA>', 'NA').to_numpy() if 'beta_cluster' in mo.columns else np.full(len(mo), 'NA')
     MONTHS_MO = sorted(mo['month'].unique())
 
-    def rolling_ecdf_pfill(h_dates: np.ndarray, h_o: np.ndarray, h_side: np.ndarray, q_dates: np.ndarray, q_side: np.ndarray, deltas: list[float], window_days: int, min_n: int = 500) -> np.ndarray:
-        """The desk's curve: for each query print, the share of same-side history prints in the trailing window (strictly before the date) with o >= delta."""
-        out = np.full((len(q_dates), len(deltas)), np.nan); dl = np.asarray(deltas, float)
+    def rolling_ecdf_table(h_dates: np.ndarray, h_o: np.ndarray, h_side: np.ndarray, q_dates: np.ndarray, q_side: np.ndarray, deltas: list[float], window_days: int, min_n: int = 500) -> dict:
+        """The desk's curve per (side, query date): the share of same-side history prints in the trailing window (strictly before the date) with
+        o >= delta for every delta on the grid. v5.3: a cumulative histogram of the history on the grid, one pass over the prints instead of a sort
+        of the window per date (the same values). Returns {side: (query rows on that side, their row in the table, the table dates x grid)}."""
+        dl = np.asarray(deltas, float); K = len(dl); out = {}
         for sd_ in ['P', 'S']:
-            hm = (h_side == sd_) & np.isfinite(h_o); hd = h_dates[hm]; ho = h_o[hm]; order = np.argsort(hd, kind='stable'); hd = hd[order]; ho = ho[order]
-            qm = np.flatnonzero(q_side == sd_); qd = q_dates[qm]
-            for d in np.unique(qd):
-                lo = np.searchsorted(hd, d - np.timedelta64(window_days, 'D'), 'left'); hi = np.searchsorted(hd, d, 'left')
-                if hi - lo < min_n:
-                    continue
-                w = np.sort(ho[lo:hi]); out[qm[qd == d]] = 1.0 - np.searchsorted(w, dl, 'left') / len(w)
+            hm = (h_side == sd_) & np.isfinite(h_o); qm = np.flatnonzero(q_side == sd_)
+            if not hm.any() or not len(qm):
+                continue
+            hd = h_dates[hm].astype('datetime64[D]'); ho = h_o[hm]; qd = q_dates[qm].astype('datetime64[D]')
+            d0 = min(hd.min(), qd.min() - np.timedelta64(window_days, 'D')); nd = int((max(hd.max(), qd.max()) - d0).astype(int)) + 2
+            di = (hd - d0).astype(int); b = np.searchsorted(dl, ho, 'right')                      # b = number of grid points <= o: o >= dl[k] iff b >= k + 1
+            C = np.zeros((nd + 1, K + 1)); np.add.at(C, (di + 1, b), 1.0); C = np.cumsum(C, axis=0)   # C[i] = counts on days before day i, by bin
+            ud, inv = np.unique(qd, return_inverse=True); qi = (ud - d0).astype(int)
+            W = C[np.clip(qi, 0, nd)] - C[np.clip(qi - window_days, 0, nd)]; tot = W.sum(1); tail = np.cumsum(W[:, ::-1], axis=1)[:, ::-1]
+            out[sd_] = (qm, inv, np.where(tot[:, None] >= min_n, tail[:, 1:] / np.maximum(tot, 1.0)[:, None], np.nan))
+        return out
+
+    def rolling_ecdf_pfill(h_dates: np.ndarray, h_o: np.ndarray, h_side: np.ndarray, q_dates: np.ndarray, q_side: np.ndarray, deltas: list[float], window_days: int, min_n: int = 500) -> np.ndarray:
+        """The desk's curve for each query print on the grid (the table expanded to the prints)."""
+        out = np.full((len(q_dates), len(deltas)), np.nan)
+        for qm, inv, share in rolling_ecdf_table(h_dates, h_o, h_side, q_dates, q_side, deltas, window_days, min_n).values():
+            out[qm] = share[inv]
         return out
 
     # ---- (1) the production curve on the algo quote, from the full print history, and its calibration at delta = 0
@@ -4473,6 +4491,10 @@ else:
 CELL_T('12c. The production objective: pfill(x) x (x + charge), rebu [1]')
 if HAS_TRADES and 'mo' in globals() and not mo.empty and 'METHODS' in globals() and common.sum() >= 200:
     XGa = np.arange(*CFG.objective_grid_bp).astype(float); XG = [float(x_) for x_ in XGa]
+    _lap0 = time.perf_counter(); _lap = [_lap0]
+
+    def _t(label: str) -> None:
+        now = time.perf_counter(); print(f'  [12c] {label}: {now - _lap[0]:.0f}s (cumulative {now - _lap0:.0f}s)'); _lap[0] = now
     # ---- (1) charges per print: the per-trade track store as of the print, else charge columns on the matched trades, else the static track, else zero
     def _charge_cols(frame) -> list:
         """Numeric columns whose name contains 'charge' (v4.6: comment / note / key / flag columns and non-numeric columns are left out)."""
@@ -4543,7 +4565,7 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'METHODS' in globals() 
         tot = np.full(len(mo), np.nan); units = 'none'; charge_tab = pd.DataFrame()
         print('Charges: no column containing "charge" in the track_charges, algosignal_msrb or track_static stores. The objective runs with a zero charge (max pfill(x) x x). '
               'Regenerate the pipeline with the track_charges source (see the final note of the run) to populate it.')
-    CHG = tot.copy()
+    CHG = tot.copy(); _t('charges joined')
     for sd_, msk in [('P', IS_P), ('S', IS_S)]:
         _m = float(np.nanmedian(CHG[msk])) if np.isfinite(CHG[msk]).any() else 0.0; CHG[msk & ~np.isfinite(CHG)] = _m
 
@@ -4561,11 +4583,12 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'METHODS' in globals() 
         return out
 
     _h = trades_all[['side', 'trade_date', 'e_algo_bp']].dropna(); _h = _h[_h['side'].isin(['P', 'S'])]
-    desk_A_x = rolling_ecdf_pfill(to_ns(_h['trade_date']).to_numpy(), np.where(_h['side'].to_numpy() == 'P', 1.0, -1.0) * _h['e_algo_bp'].to_numpy(float), _h['side'].astype(str).to_numpy(), TD, SIDE_ARR, XG, CFG.pfill_window_days)
-    # v4.9: replica B puts the charge inside the quote, so the desk curve is needed out to grid + charge
+    _hd = to_ns(_h['trade_date']).to_numpy(); _ho = np.where(_h['side'].to_numpy() == 'P', 1.0, -1.0) * _h['e_algo_bp'].to_numpy(float); _hs = _h['side'].astype(str).to_numpy(); del _h
+    desk_A_x = rolling_ecdf_pfill(_hd, _ho, _hs, TD, SIDE_ARR, XG, CFG.pfill_window_days)
+    # v4.9: replica B puts the charge inside the quote, so the desk curve is needed out to grid + charge; v5.3: kept as the per-(side, date) table
     XW = [float(x_) for x_ in np.arange(XGa[0], XGa[-1] + 60.0, 1.0)]; XWa = np.asarray(XW)
-    desk_A_w = rolling_ecdf_pfill(to_ns(_h['trade_date']).to_numpy(), np.where(_h['side'].to_numpy() == 'P', 1.0, -1.0) * _h['e_algo_bp'].to_numpy(float), _h['side'].astype(str).to_numpy(), TD, SIDE_ARR, XW, CFG.pfill_window_days)
-    desk_S_x = rolling_ecdf_pfill(TD, O_S, SIDE_ARR, TD, SIDE_ARR, XG, CFG.pfill_window_days)
+    _tabA = rolling_ecdf_table(_hd, _ho, _hs, TD, SIDE_ARR, XW, CFG.pfill_window_days); del _hd, _ho, _hs
+    desk_S_x = rolling_ecdf_pfill(TD, O_S, SIDE_ARR, TD, SIDE_ARR, XG, CFG.pfill_window_days); _t('desk curves')
     gbm_S_x = interp_rows(_mat('pf_ipca'), PFD, XGa); gbm_A_x = interp_rows(_mat('pf_ipcaA'), PFD, XGa)
     grid_S_x = np.full((len(mo), len(XG)), np.nan); TAUa = np.asarray(TAUS, float); _nt = len(TAUa)
     for m in MONTHS_MO[1:]:
@@ -4595,7 +4618,7 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'METHODS' in globals() 
                     selj = sel0 & (o_mid >= x); ADJx[tem & msk, g_i] = (float(be[selj].mean()) - m0) if selj.sum() >= max(100, CFG.pfill_min_train // 20) else 0.0
         return ADJx
 
-    ADJ_S = adj_curve(O_S, BASE_RT); ADJ_A = adj_curve(O_A, BASE_RT)
+    _t('model fill curves and the quantile grid'); ADJ_S = adj_curve(O_S, BASE_RT); ADJ_A = adj_curve(O_A, BASE_RT); _t('selection adjustment')
     V_charge = XGa[None, :] + CHG[:, None]; V_exp_S = e_S[:, None] + XGa[None, :] + ADJ_S; V_exp_A = e_A[:, None] + XGa[None, :] + ADJ_A
 
     def pnl_policy(err: np.ndarray, xs: np.ndarray | float, mask: np.ndarray, base_arr: np.ndarray) -> dict:
@@ -4614,9 +4637,12 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'METHODS' in globals() 
         return xs, best
 
     # replica B: the quote sits at the algo mid plus the charge plus x; the fill curve is read at x + charge and the value is x + charge
-    _cshift = np.clip(CHG, 0.0, 60.0); _pB = np.full((len(mo), len(XGa)), np.nan); _rows = np.arange(len(mo))
-    for g_i, x in enumerate(XGa):
-        xs_ = np.clip(x + _cshift, XWa[0], XWa[-1]); j = np.clip(np.searchsorted(XWa, xs_, 'right') - 1, 0, len(XWa) - 2); w = (xs_ - XWa[j]) / (XWa[j + 1] - XWa[j]); _pB[:, g_i] = (1.0 - w) * desk_A_w[_rows, j] + w * desk_A_w[_rows, j + 1]
+    _cshift = np.clip(CHG, 0.0, 60.0); _pB = np.full((len(mo), len(XGa)), np.nan)
+    for qm_, inv_, share_ in _tabA.values():                       # v5.3: read off the (side, date) table, linear between its grid points
+        for g_i, x in enumerate(XGa):
+            xs_ = np.clip(x + _cshift[qm_], XWa[0], XWa[-1]); j = np.clip(np.searchsorted(XWa, xs_, 'right') - 1, 0, len(XWa) - 2); w = (xs_ - XWa[j]) / (XWa[j + 1] - XWa[j])
+            _pB[qm_, g_i] = (1.0 - w) * share_[inv_, j] + w * share_[inv_, j + 1]
+    del _tabA; _t('replica B')
     POL = {'production: A, desk curve, x + charge': (errA, O_A, desk_A_x, V_charge, False),
            'production B: A + charge + x, desk curve at x + charge, value x + charge': (errA, O_A, _pB, V_charge, False),
            'A, desk curve, expected P&L (edge model on A)': (errA, O_A, desk_A_x, V_exp_A, True),
@@ -4648,7 +4674,7 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'METHODS' in globals() 
             r_rt = pnl_policy(err_, 0.0, okm, BASE_RT); r_ev = pnl_policy(err_, 0.0, okm, BASE_EVAL); obj_daily[name] = (r_rt.pop('_daily'), r_ev.pop('_daily')); XSTAR[name] = np.zeros(len(mo))
             obj_rows.append({'policy': name, 'mean x* (bp)': 0.0, 'share declined': 0.0, 'fill share': r_rt['fill share'], 'objective value per print (expected)': np.nan, 'booked spread | fill (x + charge, bp)': np.nan, 'round trip: P&L per print (bp)': r_rt['P&L per print (bp)'], 'round trip: $ per month ($k)': r_rt['$ per month ($k)'],
                              'evaluation: P&L per print (bp)': r_ev['P&L per print (bp)'], 'evaluation: $ per month ($k)': r_ev['$ per month ($k)']})
-        objective = pd.DataFrame(obj_rows).set_index('policy'); PRODN = 'production: A, desk curve, x + charge'; _p_rt, _p_ev = obj_daily[PRODN]
+        objective = pd.DataFrame(obj_rows).set_index('policy'); PRODN = 'production: A, desk curve, x + charge'; _p_rt, _p_ev = obj_daily[PRODN]; _t('policies chosen and judged')
         for name in objective.index:
             d_rt = (obj_daily[name][0] - _p_rt).dropna(); d_ev = (obj_daily[name][1] - _p_ev).dropna(); dm = d_rt.groupby(pd.DatetimeIndex(d_rt.index).to_period('M')).mean()
             objective.loc[name, 'round trip: boot t vs production'] = block_bootstrap_t(d_rt.to_numpy(), CFG.block_days, CFG.n_boot, CFG.seed) if name != PRODN else np.nan
@@ -4666,8 +4692,8 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'METHODS' in globals() 
         print('What each replacement is worth on its own (round-trip P&L per print vs the production rule):'); display(comp.round(3))
         _pB_name = 'production B: A + charge + x, desk curve at x + charge, value x + charge'
         print(f'Replica B (the charge inside the quote): mean effective concession {float(np.nanmean(XSTAR[_pB_name][okm])):+.1f} bp on the algo mid, fill share {objective.loc[_pB_name, "fill share"]:.0%}, round trip {objective.loc[_pB_name, "round trip: P&L per print (bp)"]:+.2f} bp per print. Section 12d says which replica production\'s logged concession is closer to.')
-        xmix = pd.DataFrame({name: pd.Series(XSTAR[name][okm]).value_counts(normalize=True).sort_index() for name in POL}).fillna(0.0); xmix.index = ['no quote' if np.isinf(i_) else f'x = {float(i_):g}' for i_ in xmix.index]
-        print('Concession chosen, share of prints by policy:'); display(xmix.round(3))
+        xmix = pd.DataFrame({name: pd.Series(np.where(np.isfinite(XSTAR[name][okm]), np.round(XSTAR[name][okm]), XSTAR[name][okm])).value_counts(normalize=True).sort_index() for name in POL}).fillna(0.0); xmix.index = ['no quote' if np.isinf(i_) else f'x = {float(i_):g}' for i_ in xmix.index]
+        print('Concession chosen, share of prints by policy (replica B\'s effective concession x + charge to the nearest bp):'); display(xmix.round(3)); _t('objective tables')
 
         # ---- (3) by side: win rate, distance to the print (the cover), P&L; daily differences from production bootstrapped
         ALLPOL = {**{k_: v_[:2] + (XSTAR[k_],) for k_, v_ in POL.items()}, 'A at 0 (no concession)': (errA, O_A, np.zeros(len(mo))), 'S at 0 (no concession)': (errS, O_S, np.zeros(len(mo)))}
@@ -4693,6 +4719,7 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'METHODS' in globals() 
         print('Win rate and P&L per print, bid vs offer, production and the two swaps that matter:')
         display(_bs.loc[[p_ for p_ in [PRODN, 'A, GBM + IPCA fill model, x + charge', 'S, GBM + IPCA fill model, expected P&L (the Section 11b engine)', 'A at 0 (no concession)'] if p_ in _bs.index], [('win rate', 'P'), ('win rate', 'S'), ('|quote - print| (bp)', 'P'), ('|quote - print| (bp)', 'S'), ('RT P&L per print (bp)', 'P'), ('RT P&L per print (bp)', 'S')]].round(3))
 
+        _t('by side')
         # ---- (4) by characteristic x side for production and the two key swaps
         KEYP = [p_ for p_ in [PRODN, 'A, GBM + IPCA fill model, x + charge', 'S, GBM + IPCA fill model, expected P&L (the Section 11b engine)'] if p_ in POL]
         _dimv = {'trade size': QTY_ARR, 'duration bucket': pd.cut(mo['modified_duration_lag1'], bins=[-1, 1, 2.5, 4, 6, 8, 11, 100], labels=['<1', '1-2.5', '2.5-4', '4-6', '6-8', '8-11', '>11']).astype(str).to_numpy(),
@@ -4728,6 +4755,7 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'METHODS' in globals() 
                 char_tabs[dname] = pv
                 print(f'By {dname} x side: win rate and round-trip P&L per print (bp) for production and the two swaps, with the deltas vs production:'); display(pv.round(3))
 
+        _t('by characteristic')
         # ---- figures: by side, then by characteristic
         fig, ax = plt.subplots(1, 3, figsize=(20, 7))
         _ord = [p_ for p_ in list(POL) + ['A at 0 (no concession)', 'S at 0 (no concession)'] if p_ in _bs.index]; y_ = np.arange(len(_ord)); w = 0.38
@@ -4778,7 +4806,7 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'METHODS' in globals() 
         ax[1, 0].set_yticks(y_); ax[1, 0].set_yticklabels([f'{i_}  (t {t_:+.1f})' if np.isfinite(t_) else i_ for i_, t_ in zip(_ob.index, _ob['round trip: boot t vs production'])], fontsize=7)
         ax[1, 0].axvline(objective.loc[PRODN, 'round trip: P&L per print (bp)'], color='#4C72B0', ls='--', lw=0.9); ax[1, 0].set_xlabel('realised round-trip P&L per print (bp)'); ax[1, 0].set_title('Every variant on the same realised outcome (blue = production; green = clears the bar)', fontsize=10)
         xmix.T.plot.bar(ax=ax[1, 1], stacked=True, colormap='viridis', width=0.8); ax[1, 1].set_title('Concession chosen by each policy (share of prints)', fontsize=10); ax[1, 1].set_xlabel(''); ax[1, 1].tick_params(axis='x', rotation=20, labelsize=6); ax[1, 1].legend(fontsize=6, ncol=2)
-        plt.tight_layout(); savefig('12c_production_objective')
+        plt.tight_layout(); savefig('12c_production_objective'); _t('figures')
         record('production_objective', charge_source=charge_src, charge_units=units, charge_columns=ccols, prints=int(okm.sum()), months=_nm, grid=XG, charge_by_cell=flat_records(charge_tab.reset_index()) if len(charge_tab) else [],
                policies=objective.round(4).reset_index().to_dict(orient='records'), swaps=comp.round(4).reset_index().to_dict(orient='records'), concession_mix=flat_records(xmix.reset_index()), reality_gap_bp=float(_gap))
 else:
