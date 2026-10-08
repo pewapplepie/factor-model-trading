@@ -4227,8 +4227,9 @@ TRACK_RFQ_COLUMNS: dict[str, str] = {}   # optional overrides by role, e.g. {'ti
 HAS_RFQ = False
 if HAS_TRADES and 'mo' in globals() and not mo.empty and 'okm' in globals() and okm.sum() >= 200:
     _rdir = PIPE.path(PIPE.data_dir, 'track_rfq')
-    rfq_raw = PIPE.store('track_rfq').read(categorical=False) if _rdir.exists() and any(_rdir.glob('*.parquet')) else None
-    if rfq_raw is None or rfq_raw.empty:
+    _rfq_ds = PIPE.store('track_rfq').dataset() if _rdir.exists() and any(_rdir.glob('*.parquet')) else None   # v4.8: the schema first, then only the columns the roles need (the track has ~100 columns)
+    rfq_raw = None
+    if _rfq_ds is None:
         print('Section 12d: no track_rfq store under the pipeline root. Pull it (mdp.pull(mdp.Config(root=..., sources=("track_rfq",)))) and rerun; the production ledger is skipped on this run.')
     else:
         CAND = {'time': ['rfq_received_time', 'rfq_time', 'rfq_ts', 'received_time', 'timestamp', 'ts', 'time', 'quote_time', 'signal_ts', 'signal_time', 'date'],
@@ -4246,22 +4247,23 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'okm' in globals() and 
                 'won': ['algo_won', 'won', 'is_won', 'filled', 'is_filled', 'traded', 'executed', 'win', 'done', 'hit'],
                 'side': ['side', 'msrb_side', 'signal_side', 'quote_side', 'rfq_side', 'msrb_tradetype'],
                 'cover': ['cover', 'cover_yield', 'cover_yld', 'cover_bp']}
-        cols_l = {str(c).lower(): c for c in rfq_raw.columns}
+        _rfq_cols = list(_rfq_ds.schema.names); cols_l = {str(c).lower(): c for c in _rfq_cols}
 
         def _pick(role: str):
-            if TRACK_RFQ_COLUMNS.get(role) in rfq_raw.columns:
+            if TRACK_RFQ_COLUMNS.get(role) in _rfq_cols:
                 return TRACK_RFQ_COLUMNS[role]
             return next((cols_l[c] for c in CAND[role] if c in cols_l), None)
 
         RC = {r: _pick(r) for r in CAND}
-        print(f'track_rfq: {len(rfq_raw):,} rows, {rfq_raw.shape[1]} columns: {list(rfq_raw.columns)}'); print('column roles detected (override with TRACK_RFQ_COLUMNS):', RC)
+        print(f'track_rfq: {len(_rfq_cols)} columns: {_rfq_cols}'); print('column roles detected (override with TRACK_RFQ_COLUMNS):', RC)
         _need = [r for r in ['time', 'optimal_yield'] if RC[r] is None]
         if RC['algo_yield'] is None:
             print('the track carries no algo mid yield column: the concession x_prod is measured against the match table\'s algo signal yield on the joined requests')
-        if _need or 'cusip' not in rfq_raw.columns:
+        if _need or 'cusip' not in _rfq_cols:
             print(f'Section 12d: cannot identify {_need or ["cusip"]} on the track from its column names; set TRACK_RFQ_COLUMNS and rerun. The production ledger is skipped on this run.')
         else:
-            HAS_RFQ = True
+            rfq_raw = PIPE.store('track_rfq').read(columns=['cusip'] + sorted({v for v in RC.values() if v}), categorical=False)
+            print(f'track_rfq: {len(rfq_raw):,} rows read with {rfq_raw.shape[1]} columns'); HAS_RFQ = not rfq_raw.empty
 
 # %%
 CELL_T('12d. The production ledger: the RFQs we received [2]')
@@ -4360,7 +4362,10 @@ if HAS_RFQ:
     _yalgo_mo = pd.to_numeric(mo['algo_signal_yield'], errors='coerce').to_numpy(float)[P]
     if not HAS_ALGO_Y:
         rp['algo_yield'] = _yalgo_mo; rp['x_prod'] = sP * 100.0 * (rp['optimal_yield'].to_numpy(float) - _yalgo_mo)
-        rp = rp[~(rp['x_prod'].abs() > 100.0)].reset_index(drop=True); P = rp['pos'].to_numpy(); sP = S_ARR[P]; ypP = pd.to_numeric(mo['msrb_yield'], errors='coerce').to_numpy(float)[P]; TDP = TD[P]
+        _nxp = len(rp); rp = rp[~(rp['x_prod'].abs() > 100.0)].reset_index(drop=True); P = rp['pos'].to_numpy(); sP = S_ARR[P]; ypP = pd.to_numeric(mo['msrb_yield'], errors='coerce').to_numpy(float)[P]; TDP = TD[P]
+        _yalgo_mo = pd.to_numeric(mo['algo_signal_yield'], errors='coerce').to_numpy(float)[P]
+        if _nxp - len(rp):
+            print(f'{_nxp - len(rp):,} joined requests dropped for |x_prod| > 100 bp against the match-table algo yield')
         xq, _share_in = _xq_table(rp, 'joined requests, against the match table\'s algo signal yield')
         rq = rq.drop(columns=['x_prod']).merge(rp[['req_id', 'x_prod']].drop_duplicates('req_id'), on='req_id', how='left') if RC['req_id'] else rq
     o_prod = sP * 100.0 * (ypP - rp['optimal_yield'].to_numpy(float)); o_algo_t = sP * 100.0 * (ypP - rp['algo_yield'].to_numpy(float)); x_prodP = rp['x_prod'].to_numpy(float)
@@ -4414,6 +4419,8 @@ if HAS_RFQ:
     for v_ in EST.values():
         okg &= np.isfinite(v_)
     grp_rows = []; _mP = MONTH_ARR[P].astype(str); _base_b = None
+    if okg.sum() < 100:
+        print(f'grouping test: only {int(okg.sum())} requests carry every estimator (the logged pfill is present on {float(np.isfinite(EST["logged pfill (production)"][okr]).mean()):.0%} of scorable requests); skipped on this run'); EST = {}
     for name, v_ in EST.items():
         p_ = np.clip(v_, 1e-4, 1 - 1e-4); y_ = winP.astype(float)
         bm = pd.Series((p_[okg] - y_[okg]) ** 2).groupby(_mP[okg]).mean()
@@ -4422,12 +4429,12 @@ if HAS_RFQ:
         rel = (1.0 - bm / _base_b) if _base_b is not None else pd.Series(np.nan, index=bm.index)
         grp_rows.append({'estimator': name, 'requests': int(okg.sum()), 'Brier': float(np.mean((p_[okg] - y_[okg]) ** 2)), 'log-loss': float(-np.mean(y_[okg] * np.log(p_[okg]) + (1 - y_[okg]) * np.log(1 - p_[okg]))), 'mean predicted': float(p_[okg].mean()), 'realised': float(y_[okg].mean()),
                          'Brier removed vs logged': float(1.0 - np.mean((p_[okg] - y_[okg]) ** 2) / np.mean((np.clip(EST['logged pfill (production)'], 1e-4, 1 - 1e-4)[okg] - y_[okg]) ** 2)), 'months >= bar': int((rel >= CFG.grouping_bar).sum()), 'months': int(len(bm))})
-    grouping = pd.DataFrame(grp_rows).set_index('estimator')
+    grouping = pd.DataFrame(grp_rows).set_index('estimator') if grp_rows else pd.DataFrame(columns=['requests', 'Brier', 'log-loss', 'mean predicted', 'realised', 'Brier removed vs logged', 'months >= bar', 'months'])
     grouping['passes bar'] = (grouping['Brier removed vs logged'] >= CFG.grouping_bar) & (grouping['months >= bar'] >= min(4, int(grouping['months'].max())))
     print(f'The grouping test at production\'s own quote on {int(okg.sum()):,} requests: Pr(o_A >= x_prod) from each estimator, scored on the realised crossing. Bar: >= {CFG.grouping_bar:.0%} of the logged pfill\'s Brier removed in >= 4 held-out months:'); display(grouping.round(4))
 
     # ---- (4) production's quote against ours on the same requests
-    RPOL = {'production (logged optimal yield)': o_prod, 'algo mid at 0 (track algo yield)': o_algo_t, 'A at 0 (match-table algo yield)': O_A[P], 'S at 0': O_S[P], 'SQ at 0': sP * errSQ[P], 'S + production concession x_prod': O_S[P] - x_prodP}
+    RPOL = {'production (logged optimal yield)': o_prod, ('algo mid at 0 (track algo yield)' if HAS_ALGO_Y else 'algo mid at 0 (match-table algo yield, same as A)'): o_algo_t, 'A at 0 (match-table algo yield)': O_A[P], 'S at 0': O_S[P], 'SQ at 0': sP * errSQ[P], 'S + production concession x_prod': O_S[P] - x_prodP}
     if RC['final_quote_yield'] and rp['final_quote_yield'].notna().mean() > 0.5:
         _ofq = sP * 100.0 * (ypP - rp['final_quote_yield'].to_numpy(float))
         if np.nanmean(np.abs(_ofq - o_prod)) > 0.05:
@@ -4491,7 +4498,8 @@ if HAS_RFQ:
         print('By characteristic: production vs S at 0 vs the engine on the requests:'); display(_pv.round(3))
 
     # ---- (5) the production proxy for the universe: the algo mid plus the median production concession of the bond's key
-    kk = rq[(rq['pfill_key'] != 'NA') & rq['x_prod'].notna()].copy()
+    _xsrc = rq if rq['x_prod'].notna().sum() >= CFG.proxy_min_rfqs else rp.assign(pfill_key=rp['pfill_key'].astype('string'))   # the joined requests when the track carries no algo yield and no request id
+    kk = _xsrc[(_xsrc['pfill_key'].astype(str) != 'NA') & _xsrc['x_prod'].notna()].copy()
     if len(kk) >= CFG.proxy_min_rfqs:
         kk['prefix'] = kk['pfill_key'].str.rsplit('_', n=1).str[0]; kk['qtok'] = kk['pfill_key'].str.rsplit('_', n=1).str[-1]
         bond_prefix = kk.groupby('cusip')['prefix'].agg(lambda x: x.value_counts().index[0]); qtok_map = kk.groupby('qty_group', observed=True)['qtok'].agg(lambda x: x.value_counts().index[0])
@@ -4500,9 +4508,9 @@ if HAS_RFQ:
         x_key = u_key.map(med_key).to_numpy(float); proxy_src = 'key'
     else:
         x_key = np.full(len(mo), np.nan); print('too few requests with a pfill key for a key-level proxy; the side x size medians are used throughout')
-    med_sq = rq.dropna(subset=['x_prod']).groupby(['side', 'qty_group'], observed=True)['x_prod'].median()
+    med_sq = _xsrc.dropna(subset=['x_prod']).groupby(['side', 'qty_group'], observed=True)['x_prod'].median()
     _sq_side = SIDE_ARR if (rq['side'] == 'S').any() else np.full(len(mo), 'P')           # no offers on the track: the offer takes the bid's medians (flagged)
-    x_sq = med_sq.reindex(pd.MultiIndex.from_arrays([_sq_side, QTY_ARR])).to_numpy(float); x_sq = np.where(np.isfinite(x_sq), x_sq, float(rq['x_prod'].dropna().median()) if rq['x_prod'].notna().any() else 0.0)
+    x_sq = med_sq.reindex(pd.MultiIndex.from_arrays([_sq_side, QTY_ARR])).to_numpy(float); x_sq = np.where(np.isfinite(x_sq), x_sq, float(_xsrc['x_prod'].dropna().median()) if _xsrc['x_prod'].notna().any() else 0.0)
     x_proxy = np.where(np.isfinite(x_key), x_key, x_sq); _cov_key = float(np.isfinite(x_key[okm]).mean())
     # validation on the overlap: the proxy and the 12c replica against production's logged concession on the same requests
     _val = pd.DataFrame({'proxy (median x_prod by key)': x_proxy[P], 'replica (12c, desk curve x (x + charge))': XSTAR[PRODN][P] if PRODN in XSTAR else np.nan, 'logged x_prod': x_prodP})[okr]
@@ -4530,7 +4538,7 @@ if HAS_RFQ:
     # ---- figures
     fig, ax = plt.subplots(2, 3, figsize=(20, 11))
     for sd_, c_ in [('P', '#4C72B0'), ('S', '#DD8452')]:
-        v_ = rq.loc[rq['side'] == sd_, 'x_prod'].dropna()
+        v_ = _xsrc.loc[_xsrc['side'] == sd_, 'x_prod'].dropna()
         if len(v_):
             ax[0, 0].hist(v_.clip(-30, 30), bins=60, alpha=0.6, color=c_, label=f'{sd_}: production x_prod ({len(v_):,} requests)')
     if PRODN in XSTAR:
@@ -4543,7 +4551,7 @@ if HAS_RFQ:
         ax[0, 1].barh(np.arange(len(_ct)), _ct.to_numpy(float), color=['#2E8B57' if v_ >= 0 else '#C44E52' for v_ in _ct]); ax[0, 1].set_yticks(np.arange(len(_ct))); ax[0, 1].set_yticklabels(_ct.index, fontsize=7); ax[0, 1].axvline(0, color='k', lw=0.6); ax[0, 1].set_xlabel('realised crossing share - logged pfill'); ax[0, 1].set_title('Calibration gap of the production fill curve by key component', fontsize=10)
     else:
         ax[0, 1].set_axis_off()
-    _gp = grouping.sort_values('Brier', ascending=False); y_ = np.arange(len(_gp))
+    _gp = grouping.sort_values('Brier', ascending=False) if len(grouping) else grouping; y_ = np.arange(len(_gp))
     ax[0, 2].barh(y_, _gp['Brier'], color=['#2E8B57' if b_ else ('#4C72B0' if i_.startswith('logged') else '#8C8C8C') for i_, b_ in zip(_gp.index, _gp['passes bar'])]); ax[0, 2].set_yticks(y_); ax[0, 2].set_yticklabels([f'{i_}  ({r_:+.1%})' for i_, r_ in zip(_gp.index, _gp['Brier removed vs logged'])], fontsize=7); ax[0, 2].set_xlabel('Brier at production\'s quote'); ax[0, 2].set_title('The grouping test on production\'s own requests (blue = logged pfill; green = clears the bar)', fontsize=10)
     _rt = rfq_tab.sort_values('RT P&L per request (bp)'); y_ = np.arange(len(_rt))
     ax[1, 0].barh(y_, _rt['win rate (print crossed)'], color=['#4C72B0' if i_ == _pn else '#8C8C8C' for i_ in _rt.index]); ax[1, 0].set_yticks(y_); ax[1, 0].set_yticklabels([i_[:44] for i_ in _rt.index], fontsize=7); ax[1, 0].set_title('Win rate on the requests (blue = production)', fontsize=10); ax[1, 0].axvline(rfq_tab.loc[_pn, 'win rate (print crossed)'], color='#4C72B0', ls=':', lw=1)
