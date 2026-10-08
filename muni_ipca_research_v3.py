@@ -2933,8 +2933,9 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
     # ---- (4) the cell-optimal concession, walk-forward: delta* per side x quantity bin on prior months, applied to the test month, on the S quote
     # ---- realised round trip (v4.2): exit at the next opposite-side print in the same bond, hedged over the holding period
     # ---- v4.8: the print tape: every MSRB print of the universe with a yield (the msrb store), else the matched prints
-    if HAS_MSRB and 'yield' in msrb_raw.columns and pd.to_numeric(msrb_raw['yield'], errors='coerce').notna().mean() > 0.5:
-        tape = pd.DataFrame({'cusip': msrb_raw['cusip'].astype('string').to_numpy(), 'ts': to_ns(msrb_raw['tradetime']).to_numpy(), 'side': msrb_raw['side'].astype('string').str.upper().str[0].to_numpy(), 'y': pd.to_numeric(msrb_raw['yield'], errors='coerce').to_numpy(float), 'q': pd.to_numeric(msrb_raw['quantity'], errors='coerce').to_numpy(float)}); TAPE_SRC = 'the full MSRB tape'
+    _msrb_side_col = next((c_ for c_ in ['side', 'tradetype', 'trade_type', 'msrb_tradetype'] if HAS_MSRB and c_ in msrb_raw.columns), None)   # the MSRB table carries the side as tradetype (P / S / D)
+    if HAS_MSRB and _msrb_side_col and 'yield' in msrb_raw.columns and pd.to_numeric(msrb_raw['yield'], errors='coerce').notna().mean() > 0.5:
+        tape = pd.DataFrame({'cusip': msrb_raw['cusip'].astype('string').to_numpy(), 'ts': to_ns(msrb_raw['tradetime']).to_numpy(), 'side': msrb_raw[_msrb_side_col].astype('string').str.upper().str.strip().str[0].to_numpy(), 'y': pd.to_numeric(msrb_raw['yield'], errors='coerce').to_numpy(float), 'q': pd.to_numeric(msrb_raw['quantity'], errors='coerce').to_numpy(float)}); TAPE_SRC = f'the full MSRB tape (side from {_msrb_side_col})'
     else:
         tape = pd.DataFrame({'cusip': trades_all['cusip'].astype('string').to_numpy(), 'ts': to_ns(trades_all['trade_ts']).to_numpy(), 'side': trades_all['side'].astype(str).to_numpy(), 'y': pd.to_numeric(trades_all['msrb_yield'], errors='coerce').to_numpy(float), 'q': pd.to_numeric(trades_all['msrb_quantity'], errors='coerce').to_numpy(float)}); TAPE_SRC = 'the matched prints (the msrb store carries no yield)'
     tape = tape.dropna(subset=['cusip', 'ts', 'y']); tape = tape[tape['side'].isin(['P', 'S', 'D']) & (tape['y'] > -5.0) & (tape['y'] < 30.0)]
@@ -4243,7 +4244,7 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'okm' in globals() and 
                 'msrb_yield': ['msrb_yield', 'msrb_yld', 'print_yield', 'trade_yield'],
                 'msrb_trade_id': ['msrb_trade_id', 'trade_id', 'msrb_id'],
                 'won': ['algo_won', 'won', 'is_won', 'filled', 'is_filled', 'traded', 'executed', 'win', 'done', 'hit'],
-                'side': ['side', 'msrb_side', 'signal_side', 'quote_side', 'rfq_side'],
+                'side': ['side', 'msrb_side', 'signal_side', 'quote_side', 'rfq_side', 'msrb_tradetype'],
                 'cover': ['cover', 'cover_yield', 'cover_yld', 'cover_bp']}
         cols_l = {str(c).lower(): c for c in rfq_raw.columns}
 
