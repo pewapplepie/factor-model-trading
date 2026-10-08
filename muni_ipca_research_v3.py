@@ -1,6 +1,15 @@
 # %% [markdown]
 # # Muni IPCA v4 — From Fair Mid to Markout: the Factor Model as Risk Layer, the Quote Judged in Dollars
 #
+# **v5.0.** One sample, one objective, paired dollars. Section 10 selects the mid on MAE and says so; that is the
+# accuracy criterion and it stays there. The economic comparison moves to Section 12e: every engine, with and without
+# the factor model in each of its three slots (the mid, the fill curve, the value of a fill), is run on one common
+# sample of prints where every input exists and judged on one declared objective, the realised dollar P&L of the raw
+# round trip to the next opposite-side print, which carries no model. Inference is the paired daily-dollar difference
+# against the incumbent, block-bootstrapped, with the month count, so a rule is selected on dollars by a test of
+# dollars and not by the significance of unweighted basis points. The re-ranking tables of Sections 11 and 11c
+# gain the same paired-dollar columns and a dollar bar beside the per-print one.
+#
 # **v4.9.** What the first real ledger run taught. The logged probability on the track is in percent and is read as such.
 # The track's won flag lets the crossing proxy be checked: the share of crossed prints production actually won and the
 # share of wins that crossed, overall and by size, so the would-have-filled numbers of the universe carry a known
@@ -311,6 +320,10 @@ PRE_REGISTERED = {
     'v43_pfill': 'fill probability P(o >= delta | x) for the S quote at delta in {-3, 0, 3, 6, 10} bp; four estimators scored by Brier and log-loss on the next month: the desk curve (side, trailing 100-day empirical CDF), a side x size x cluster cell table on prior months (shrunk), a gradient-boosted classifier on trade features, and the same with IPCA and state-space features',
     'v43_edge_model': 'expected round-trip edge of a fill at delta 0, gradient-boosted on the same two feature sets, walk-forward; scored by out-of-sample R2 and realised edge by predicted decile',
     'v43_engine_bar': 'the reduced-form engine (concession per print = argmax over the delta grid of pfill(delta | x) x (expected edge + delta)) replaces S at 0 only if its round-trip P&L per print is higher by 0.10 bp with bootstrap t > 3 and positive in 4 of 5 months',
+    'v50_mae_selection': 'Section 10 selects the mid on held-out MAE against the print; the selected mid is carried into the economic comparison as one policy, not as the quote of record',
+    'v50_one_objective': 'the engines are compared on one common sample (prints with every mid, every fill curve, both edge models and a raw round-trip exit) and one declared objective: realised dollar P&L per month of the raw round trip (no hedge, no evaluation); the next-print mark is the secondary objective',
+    'v50_paired_dollars': 'inference on dollars is the paired daily-dollar difference against S at 0 (and against the production proxy), block-bootstrapped in 5-day blocks with the month count; the dollar bar is a positive monthly difference with bootstrap t > 3 in >= 4 of the held-out months; the per-print basis-point bar is reported beside it, never in its place',
+    'v50_ipca_contrasts': 'the factor model\'s economic value is read from pairs of engines that differ only in one slot: D vs D- (the mid), the GBM fill curve with vs without IPCA features, the edge model with vs without IPCA features, and both together; each pair is a paired daily-dollar difference on the common sample',
     'v49_proxy_check': 'on the requests production received, a print that crossed the logged quote is compared with the logged won flag: P(won | crossed) is the competition correction to the would-have-filled proxy and P(crossed | won) its coverage; both reported overall and by size; the universe numbers are read with that correction, not restated',
     'v49_replica_b': 'a second replica of the production objective puts the charge inside the quote: fill iff the print crossed the algo mid shifted by charge + x, value x + charge; the replica whose concession distribution is closer to the logged one on the overlap is the one the universe comparison reads',
     'v48_trade_markout': 'a would-be fill is marked to the next real MSRB print in the bond within 10 calendar days: any side, converted to a mid-equivalent by half the dealer round trip of the mark\'s size bin (median P - S spread of same bond-day prints on prior months; inter-dealer prints unadjusted), and separately to the next inter-dealer, opposite-side and same-side print; and to the last print within 1, 5, 10 business days; the trade-based ranking of record is the next-print mark, raw; date-demeaned and factor-hedged shown as checks; the bar is unchanged',
@@ -2674,6 +2687,9 @@ if HAS_TRADES and not tv.empty and 'cum_fitted_bp' in tv.columns:
                                'FM t': {k_: _o.get(f't {MID_LETTER[k_]}', np.nan) for k_ in PREDS}, 'bootstrap t': {k_: boot_gain.get(k_, np.nan) for k_ in PREDS}}).sort_values('gain over algo (bp)', ascending=False)
     scoreboard['MAE rank'] = np.arange(1, len(scoreboard) + 1)
     print(f'MAE scoreboard on {len(ecp):,} held-out trades (the accuracy view; Section 11 re-ranks the same rules in dollars):'); display(scoreboard.round(3))
+    MAE_SELECTED = scoreboard['MAE vs print (bp)'].idxmin()
+    print(f'Selected on MAE (the accuracy criterion of this section): {MAE_SELECTED} at {scoreboard.loc[MAE_SELECTED, "MAE vs print (bp)"]:.2f} bp, {scoreboard.loc[MAE_SELECTED, "MAE vs print (bp)"] - scoreboard.loc["S same-side EWMA", "MAE vs print (bp)"]:+.2f} bp against S. Section 12e judges it on dollars with the other engines.')
+    record('error_correction', mae_selected=MAE_SELECTED)
     side_gain = pd.DataFrame({sd_: {k_: ec_side.loc[sd_, f'gain {MID_LETTER[k_]} (bp)'] for k_ in list(PREDS)[1:]} for sd_ in ec_side.index}).rename(columns={'P': 'P dealer buys (bid)', 'S': 'S dealer sells (offer)', 'D': 'D inter-dealer'})
     print('Gain over the algo by MSRB side (bp of MAE):'); display(side_gain.round(3))
     # ---- the pre-registered bar: does a conditioned variant replace S?
@@ -2876,6 +2892,7 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
             ok = mask & np.isfinite(pnl) & np.isfinite(edge); f_ok = fill & ok
             v = np.where(f_ok, pnl, 0.0)
             d_ = pd.Series(v[ok]).groupby(td[ok]).mean(); daily[k_] = d_
+            daily[('$', k_)] = pd.Series(np.where(f_ok, pnl * DPB / 1e3, 0.0)[ok]).groupby(td[ok]).sum()   # v5.0: daily dollars ($k) for the paired-dollar inference
             rows.append({'mid': k_, 'fill share': f_ok.sum() / max(ok.sum(), 1), 'edge at quote | fill (bp)': edge[f_ok].mean() if f_ok.any() else np.nan,
                          'residual move after | fill (bp)': (pnl - edge)[f_ok].mean() if f_ok.any() else np.nan, 'P&L | fill (bp)': pnl[f_ok].mean() if f_ok.any() else np.nan,
                          'P&L per print (bp)': float(d_.mean()), '$ per month ($k)': float((pnl[f_ok] * DPB[f_ok]).sum() / 1e3 / months_mo)})
@@ -2920,6 +2937,12 @@ if HAS_TRADES and 'ecp' in globals() and not ecp.empty:
         rr_all.loc[k_, 'months above S'] = int((dm > 0).sum()) if k_ != 'S same-side EWMA' else np.nan
     rr_all['$ vs S per month ($k)'] = rr_all['$ per month ($k)'] - rr_all.loc['S same-side EWMA', '$ per month ($k)']
     rr_all['beats S (bar)'] = (rr_all['$ vs S per month ($k)'] > 0) & (rr_all['boot t vs S'] > 3) & (rr_all['months above S'] >= min(4, months_mo))
+    _dS_usd = daily_all[('$', 'S same-side EWMA')]
+    for k_ in rr_all.index:
+        dd = (daily_all[('$', k_)] - _dS_usd).dropna(); dm = dd.groupby(pd.DatetimeIndex(dd.index).to_period('M')).sum()
+        rr_all.loc[k_, '$ boot t vs S (paired daily $)'] = block_bootstrap_t(dd.to_numpy(), CFG.block_days, CFG.n_boot, CFG.seed) if k_ != 'S same-side EWMA' else np.nan
+        rr_all.loc[k_, 'months above S ($)'] = int((dm > 0).sum()) if k_ != 'S same-side EWMA' else np.nan
+    rr_all['beats S ($ bar)'] = (rr_all['$ vs S per month ($k)'] > 0) & (rr_all['$ boot t vs S (paired daily $)'] > 3) & (rr_all['months above S ($)'] >= min(4, months_mo))
     rr_all['MAE rank'] = scoreboard['MAE rank'].reindex(rr_all.index); rr_all['$ rank'] = rr_all['$ per month ($k)'].rank(ascending=False).astype(int)
     rr_all[f'P&L per print h={CFG.markout_horizons[1]} (bp)'] = rr_h1['P&L per print (bp)']; rr_all[f'P&L per print h={CFG.markout_horizons[-1]} (bp)'] = rr_h10['P&L per print (bp)']
     rr_all = rr_all.sort_values('$ per month ($k)', ascending=False)
@@ -3222,6 +3245,7 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'tape' in globals():
         for k_, c in PREDS.items():
             o = S_ARR * mo[c].to_numpy(float); fill = o >= 0; pnl = base - o; ok = mask & np.isfinite(pnl) & np.isfinite(o); f_ok = fill & ok
             v = np.where(f_ok, pnl, 0.0); d_ = pd.Series(v[ok]).groupby(TD[ok]).mean(); daily[k_] = d_
+            daily[('$', k_)] = pd.Series(np.where(f_ok, pnl * DPB / 1e3, 0.0)[ok]).groupby(TD[ok]).sum()
             rows.append({'mid': k_, 'fill share': f_ok.sum() / max(ok.sum(), 1), 'P&L | fill (bp)': float(pnl[f_ok].mean()) if f_ok.any() else np.nan, 'median P&L | fill (bp)': float(np.median(pnl[f_ok])) if f_ok.any() else np.nan,
                          'P&L per print (bp)': float(d_.mean()) if len(d_) else np.nan, '$ per month ($k)': float((pnl[f_ok] * DPB[f_ok]).sum() / 1e3 / max(int(pd.Series(MONTH_ARR[ok]).nunique()), 1))})
         return pd.DataFrame(rows).set_index('mid'), daily
@@ -3232,6 +3256,12 @@ if HAS_TRADES and 'mo' in globals() and not mo.empty and 'tape' in globals():
         tr_all.loc[k_, 'boot t vs S'] = block_bootstrap_t(dv.to_numpy(), CFG.block_days, CFG.n_boot, CFG.seed) if k_ != 'S same-side EWMA' else np.nan
         tr_all.loc[k_, 'months above S'] = int((dm > 0).sum()) if k_ != 'S same-side EWMA' else np.nan
     tr_all['beats S (bar)'] = ((tr_all['P&L per print (bp)'] - tr_all.loc['S same-side EWMA', 'P&L per print (bp)']) >= CFG.interaction_bar_bp) & (tr_all['boot t vs S'] > 3) & (tr_all['months above S'] >= min(4, months_mo))
+    _dS_usd_t = tr_daily[('$', 'S same-side EWMA')]
+    for k_ in tr_all.index:
+        dd = (tr_daily[('$', k_)] - _dS_usd_t).dropna(); dm = dd.groupby(pd.DatetimeIndex(dd.index).to_period('M')).sum()
+        tr_all.loc[k_, '$ boot t vs S (paired daily $)'] = block_bootstrap_t(dd.to_numpy(), CFG.block_days, CFG.n_boot, CFG.seed) if k_ != 'S same-side EWMA' else np.nan
+        tr_all.loc[k_, 'months above S ($)'] = int((dm > 0).sum()) if k_ != 'S same-side EWMA' else np.nan
+    tr_all['beats S ($ bar)'] = ((tr_all['$ per month ($k)'] - tr_all.loc['S same-side EWMA', '$ per month ($k)']) > 0) & (tr_all['$ boot t vs S (paired daily $)'] > 3) & (tr_all['months above S ($)'] >= min(4, months_mo))
     for kname, h in [('inter-dealer only', None), ('opposite side (round trip)', None), ('any side, mid-equivalent', 1), ('any side, mid-equivalent', 5), ('any side, mid-equivalent', 10)]:
         _t, _ = rerank_trade(TM[(kname, h)], ALL); tr_all[f'per print: {kname}, {_hl(h)}'] = _t['P&L per print (bp)']
     tr_all['evaluation $ rank'] = rr_all['$ rank'].reindex(tr_all.index); tr_all['trade $ rank'] = tr_all['$ per month ($k)'].rank(ascending=False).astype(int); tr_all['MAE rank'] = rr_all['MAE rank'].reindex(tr_all.index)
@@ -4623,6 +4653,137 @@ elif 'rfq_raw' in globals() and rfq_raw is not None and not rfq_raw.empty:
     print('Section 12d: the ledger could not be scored on this run (see the messages above).')
 
 # %% [markdown]
+# ### 12e. One sample, one objective: the engines compared in paired dollars
+#
+# The sections before this one judge rules on several metrics with inference on unweighted basis points per print,
+# and dollars entered the bar only as a sign. A desk selects on dollars, so the test has to be on dollars. This
+# section fixes three things and holds them fixed.
+#
+# **One sample.** The customer prints where every input exists: every mid (the algo quote, S, the level model with
+# and without the factor features), every fill curve for S (the desk curve, the gradient-boosted model on trade
+# features, the same with the factor features), both edge models, the charge, and a realised round-trip exit.
+# **One objective.** The realised dollar P&L per month of the **raw** round trip, print to the next opposite-side
+# print, converted at the trade's dollar value of a basis point. No evaluation, no hedge, no model in the target;
+# the next-print mark is the secondary objective, reported beside it. **One inference.** Every policy's daily dollar
+# P&L is paired with the incumbent's on the same days; the daily difference is block-bootstrapped in five-day blocks
+# and counted by month. The dollar bar is a positive monthly difference with bootstrap t above 3 in at least four of
+# the held-out months. Basis points per print are shown, never used to select.
+#
+# **The policies.** The four mids at zero concession, the production proxy (the algo mid plus production's own
+# median concession by key), and nine engines on S: three fill curves by three values of a fill. **The factor
+# model's value** is read from the pairs that differ in one slot only: the level model with and without the factor
+# features, the fill curve with and without them, the edge model with and without them, and all three together.
+# A concentration column says what share of a policy's dollars sits in its largest 1% of fills, so a dollar lead
+# that is a few tickets reads as such. Where the ledger measured P(won | crossed) at production's level, the
+# competition-corrected dollars are shown as a sensitivity.
+
+# %%
+CELL_T('12e. One sample, one objective: the engines in paired dollars [1]')
+if HAS_TRADES and 'mo' in globals() and not mo.empty and 'XSTAR' in globals() and 'choose' in globals() and okm.sum() >= 200:
+    OBJ = {'raw round trip (declared objective)': RT_RAW}
+    if 'BASE_TRADE' in globals():
+        OBJ['next real print, any side (secondary)'] = BASE_TRADE
+    e_tr = pred['edge_trade_rt'].to_numpy(float) if 'edge_trade_rt' in pred.columns else np.full(len(mo), np.nan)
+    gbm_S_tr = interp_rows(_mat('pf_trade'), PFD, XGa)
+    LET = {MID_LETTER[k_]: v_ for k_, v_ in PREDS.items()}
+    MIDS = {'A algo quote': errA, 'S same-side EWMA': errS}
+    for L_, lab in [('D-', 'D- level model, no factor features'), ('D', 'D level model, + factor features')]:
+        if L_ in LET:
+            MIDS[lab] = mo[LET[L_]].to_numpy(float)
+    _mae_lab = next((lab for lab in MIDS if 'MAE_SELECTED' in globals() and MID_LETTER.get(MAE_SELECTED, '') == lab.split()[0]), None)
+    common_e = tested & okm & np.isfinite(RT_RAW) & np.isfinite(e_S) & np.isfinite(e_tr) & np.isfinite(gbm_S_tr).all(axis=1) & np.isfinite(gbm_S_x).all(axis=1) & np.isfinite(desk_S_x).all(axis=1) & np.isfinite(CHG)
+    for v_ in MIDS.values():
+        common_e &= np.isfinite(v_)
+    nme = max(int(pd.Series(MONTH_ARR[common_e]).nunique()), 1)
+    ENG = {}
+    for lab, err_ in MIDS.items():
+        ENG[f'{lab}, at 0' + (' [MAE-selected]' if lab == _mae_lab else '')] = (err_, 0.0)
+    if 'x_proxy' in globals():
+        ENG['production proxy: A + median logged concession by key'] = (errA, x_proxy)
+    V_ch = XGa[None, :] + CHG[:, None]; V_tr = e_tr[:, None] + XGa[None, :] + ADJ_S; V_ip = e_S[:, None] + XGa[None, :] + ADJ_S
+    PFS = {'desk curve': desk_S_x, 'GBM fill, trade features': gbm_S_tr, 'GBM fill, + factor features': gbm_S_x}
+    VALS = {'x + charge': (V_ch, False), 'expected P&L, edge on trade features': (V_tr, True), 'expected P&L, edge + factor features': (V_ip, True)}
+    for pn, pf_ in PFS.items():
+        for vn, (v_, dec_) in VALS.items():
+            xs, _ = choose(pf_, v_, dec_); ENG[f'engine on S: {pn} | {vn}'] = (errS, xs)
+    BASE_E = 'S same-side EWMA, at 0'
+    _wq = None
+    if 'proxy_check' in globals() and len(proxy_check) and 'P(won | crossed)' in proxy_check.columns:
+        _wq = pd.Series(QTY_ARR).map(proxy_check['P(won | crossed)'].drop(index='ALL', errors='ignore')).fillna(float(proxy_check.loc['ALL', 'P(won | crossed)'])).to_numpy(float)
+
+    def engine_daily(err_: np.ndarray, xs, base: np.ndarray, mask: np.ndarray) -> tuple[pd.Series, pd.Series, np.ndarray, np.ndarray]:
+        o = S_ARR * err_; xs_ = np.broadcast_to(np.asarray(xs, float), len(mo)); fill = mask & np.isfinite(xs_) & (o >= xs_) & np.isfinite(base)
+        pnl = base - o + np.where(np.isfinite(xs_), xs_, 0.0); usd = np.where(fill, pnl * DPB / 1e3, 0.0)
+        return pd.Series(usd[mask]).groupby(TD[mask]).sum(), pd.Series(np.where(fill, pnl, 0.0)[mask]).groupby(TD[mask]).mean(), fill, usd
+
+    tabs = {}
+    for oname, base in OBJ.items():
+        rows, DUSD, DBP = [], {}, {}
+        for name, (err_, xs) in ENG.items():
+            d_usd, d_bp, fill, usd = engine_daily(err_, xs, base, common_e); DUSD[name] = d_usd; DBP[name] = d_bp
+            _u = usd[common_e]; _top = np.sort(np.abs(_u))[::-1]; _k = max(int(0.01 * (_u != 0).sum()), 1)
+            r_ = {'policy': name, 'prints': int(common_e.sum()), 'fill share': float(fill[common_e].mean()), '$ per month ($k)': float(d_usd.sum() / nme), 'bp per print': float(d_bp.mean()), 'top 1% of fills, share of |$|': float(_top[:_k].sum() / max(np.abs(_u).sum(), 1e-9))}
+            if _wq is not None:
+                r_['$ per month, competition-corrected ($k)'] = float((usd * _wq)[common_e].sum() / nme)
+            rows.append(r_)
+        tab = pd.DataFrame(rows).set_index('policy')
+        for ref, tag in [(BASE_E, 'S at 0'), ('production proxy: A + median logged concession by key', 'production proxy')]:
+            if ref not in DUSD:
+                continue
+            for name in tab.index:
+                if name == ref:
+                    continue
+                dd = (DUSD[name] - DUSD[ref]).dropna(); dm = dd.groupby(pd.DatetimeIndex(dd.index).to_period('M')).sum(); db = (DBP[name] - DBP[ref]).dropna()
+                tab.loc[name, f'delta $ per month vs {tag} ($k)'] = float(dd.sum() / nme); tab.loc[name, f'$ boot t vs {tag}'] = block_bootstrap_t(dd.to_numpy(), CFG.block_days, CFG.n_boot, CFG.seed)
+                tab.loc[name, f'months above {tag} ($)'] = int((dm > 0).sum()); tab.loc[name, f'bp boot t vs {tag}'] = block_bootstrap_t(db.to_numpy(), CFG.block_days, CFG.n_boot, CFG.seed)
+            tab[f'beats {tag} ($ bar)'] = (tab[f'delta $ per month vs {tag} ($k)'] > 0) & (tab[f'$ boot t vs {tag}'] > 3) & (tab[f'months above {tag} ($)'] >= min(4, nme))
+        tabs[oname] = (tab, DUSD)
+        print(f'[{oname}] {int(common_e.sum()):,} prints, {nme} months. Policies on one sample, judged in dollars with paired daily-dollar inference (dollar bar: positive monthly difference, bootstrap t > 3, >= 4 months):'); display(tab.sort_values('$ per month ($k)', ascending=False).round(3))
+    engines_tab, DUSD_main = tabs['raw round trip (declared objective)']
+
+    # ---- the factor model's economic value: pairs of engines that differ in one slot only
+    PAIRS = [('the mid: level model with vs without factor features', 'D level model, + factor features, at 0', 'D- level model, no factor features, at 0'),
+             ('the fill curve: GBM with vs without factor features (x + charge)', 'engine on S: GBM fill, + factor features | x + charge', 'engine on S: GBM fill, trade features | x + charge'),
+             ('the edge model: with vs without factor features (desk curve)', 'engine on S: desk curve | expected P&L, edge + factor features', 'engine on S: desk curve | expected P&L, edge on trade features'),
+             ('all three slots: factor features in the fill curve and the edge model', 'engine on S: GBM fill, + factor features | expected P&L, edge + factor features', 'engine on S: GBM fill, trade features | expected P&L, edge on trade features')]
+    c_rows = []
+    for lab, a_, b_ in PAIRS:
+        a_ = next((k_ for k_ in DUSD_main if k_.startswith(a_)), None); b_ = next((k_ for k_ in DUSD_main if k_.startswith(b_)), None)
+        if a_ is None or b_ is None:
+            continue
+        dd = (DUSD_main[a_] - DUSD_main[b_]).dropna(); dm = dd.groupby(pd.DatetimeIndex(dd.index).to_period('M')).sum()
+        c_rows.append({'contrast': lab, 'with factor model': a_, 'without': b_, 'delta $ per month ($k)': float(dd.sum() / nme), '$ boot t': block_bootstrap_t(dd.to_numpy(), CFG.block_days, CFG.n_boot, CFG.seed), 'months positive': int((dm > 0).sum()), 'months': int(len(dm)),
+                       'delta bp per print': float(engines_tab.loc[a_, 'bp per print'] - engines_tab.loc[b_, 'bp per print'])})
+    contrasts = pd.DataFrame(c_rows).set_index('contrast') if c_rows else pd.DataFrame()
+    if len(contrasts):
+        contrasts['clears $ bar'] = (contrasts['delta $ per month ($k)'] > 0) & (contrasts['$ boot t'] > 3) & (contrasts['months positive'] >= min(4, nme))
+        print('The factor model\'s economic value, one slot at a time: paired daily-dollar difference of the engine with the factor features against the same engine without them, on the declared objective:'); display(contrasts.round(3))
+    _best = engines_tab['$ per month ($k)'].idxmax()
+    print(f'Winner on the declared objective: {_best} at {engines_tab.loc[_best, "$ per month ($k)"]:,.0f} $k per month' + (f', delta vs S at 0 {engines_tab.loc[_best, "delta $ per month vs S at 0 ($k)"]:+,.0f} $k (paired $ t {engines_tab.loc[_best, "$ boot t vs S at 0"]:+.1f}, {int(engines_tab.loc[_best, "months above S at 0 ($)"])} of {nme} months; dollar bar {"PASS" if bool(engines_tab.loc[_best, "beats S at 0 ($ bar)"]) else "no"})' if _best != BASE_E else ' (the incumbent)') + '.')
+
+    # ---- figures
+    fig, ax = plt.subplots(2, 2, figsize=(19, 12))
+    _et = engines_tab.sort_values('$ per month ($k)'); y_ = np.arange(len(_et))
+    ax[0, 0].barh(y_, _et['$ per month ($k)'], color=['#4C72B0' if i_ == BASE_E else ('#2E8B57' if bool(b_) else '#8C8C8C') for i_, b_ in zip(_et.index, _et['beats S at 0 ($ bar)'].fillna(False))])
+    ax[0, 0].set_yticks(y_); ax[0, 0].set_yticklabels([f'{i_[:58]}  ($ t {t_:+.1f})' if np.isfinite(t_) else i_[:58] for i_, t_ in zip(_et.index, _et['$ boot t vs S at 0'])], fontsize=7); ax[0, 0].axvline(engines_tab.loc[BASE_E, '$ per month ($k)'], color='#4C72B0', ls=':', lw=1)
+    ax[0, 0].set_xlabel('dollars per month (k), raw round trip'); ax[0, 0].set_title('One sample, one objective: dollars per month by policy (blue = S at 0; green = clears the dollar bar)', fontsize=10)
+    if len(contrasts):
+        y2 = np.arange(len(contrasts)); ax[0, 1].barh(y2, contrasts['delta $ per month ($k)'], color=['#2E8B57' if b_ else '#C44E52' for b_ in contrasts['clears $ bar']]); ax[0, 1].set_yticks(y2); ax[0, 1].set_yticklabels([f'{i_}  ($ t {t_:+.1f}, {m_} of {n_} months)' for i_, t_, m_, n_ in zip(contrasts.index, contrasts['$ boot t'], contrasts['months positive'], contrasts['months'])], fontsize=7)
+        ax[0, 1].axvline(0, color='k', lw=0.6); ax[0, 1].set_xlabel('delta dollars per month (k), with minus without the factor features'); ax[0, 1].set_title('The factor model\'s economic value, one slot at a time', fontsize=10)
+    ax[1, 0].scatter(engines_tab['bp per print'], engines_tab['$ per month ($k)'], color='#4C72B0')
+    for i_ in engines_tab.index:
+        ax[1, 0].annotate(i_.replace('engine on S: ', '')[:40], (engines_tab.loc[i_, 'bp per print'], engines_tab.loc[i_, '$ per month ($k)']), fontsize=6, xytext=(3, 3), textcoords='offset points')
+    ax[1, 0].set_xlabel('basis points per print (unweighted)'); ax[1, 0].set_ylabel('dollars per month (k)'); ax[1, 0].set_title('Where the two readings disagree, the dollars decide', fontsize=10)
+    for name, c_ in zip([k_ for k_ in engines_tab.index if k_ != BASE_E][:6], ['#2E8B57', '#DD8452', '#8172B2', '#937860', '#C44E52', '#8C8C8C']):
+        dd = (DUSD_main[name] - DUSD_main[BASE_E]).dropna().cumsum(); ax[1, 1].plot(dd.index, dd.to_numpy(), color=c_, lw=1.2, label=name.replace('engine on S: ', '')[:44])
+    ax[1, 1].axhline(0, color='k', lw=0.6); ax[1, 1].set_ylabel('cumulative dollars vs S at 0 (k)'); ax[1, 1].set_title('Cumulative paired daily-dollar difference against S at 0', fontsize=10); ax[1, 1].legend(fontsize=7); ax[1, 1].tick_params(axis='x', rotation=30, labelsize=8)
+    plt.tight_layout(); savefig('12e_one_objective')
+    record('one_objective', objective='raw round trip, dollars per month', prints=int(common_e.sum()), months=nme, incumbent=BASE_E, mae_selected=_mae_lab, engines=engines_tab.round(4).reset_index().to_dict(orient='records'),
+           secondary=tabs['next real print, any side (secondary)'][0].round(4).reset_index().to_dict(orient='records') if 'next real print, any side (secondary)' in tabs else [], contrasts=contrasts.round(4).reset_index().to_dict(orient='records') if len(contrasts) else [], winner=_best)
+else:
+    print('Section 12e skipped: needs Sections 11b, 11c and 12c.')
+
+# %% [markdown]
 # ## 13. Where the P&L lives: markout by characteristic, factor coordinate, side and size
 #
 # The same segmentation the fair-mid work used, now scored in the currency the desk uses. Every customer print
@@ -4811,7 +4972,7 @@ if 'markout' in REGISTRY:
     summary_rows.append((f'Markout P&L per print at h={_hr} (bp): algo | S | SQ | AQ | D', ' | '.join(f"{_rr.loc[k_, 'P&L per print (bp)']:+.2f}" for k_ in ['A algo quote', 'S same-side EWMA', 'SQ same-side EWMA + side x size intercept', 'AQ algo + side x size intercept', 'D level model with error features'] if k_ in _rr.index)))
     _tcx = pd.DataFrame(REGISTRY['markout']['trend_check']); _tcs = _tcx[_tcx['mid'] == 'S same-side EWMA'].set_index('side')
     summary_rows.append((f'Trend check, S at h={_hr}: P&L per print raw | date-demeaned | factor-hedged, P then S (bp)', '; '.join(f"{s_}: {_tcs.loc[s_, f'P&L per print, raw mark move (bp)']:+.1f} | {_tcs.loc[s_, f'P&L per print, date-demeaned move (bp)']:+.1f} | {_tcs.loc[s_, f'P&L per print, factor-hedged residual move (bp)']:+.1f}" for s_ in ['P', 'S'] if s_ in _tcs.index)))
-    summary_rows.append(('Markout winner ($ rank 1) and whether it clears the bar vs S', f"{_rr.index[0]}: {_rr.iloc[0]['$ per month ($k)']:,.0f} $k/month, MAE rank {int(_rr.iloc[0]['MAE rank'])}, boot t vs S {_rr.iloc[0]['boot t vs S']:+.1f}, bar {'PASS' if bool(_rr.iloc[0]['beats S (bar)']) else 'no'}"))
+    summary_rows.append(('Markout winner ($ rank 1) and whether it clears the bar vs S (per-print bar | paired-dollar bar)', f"{_rr.index[0]}: {_rr.iloc[0]['$ per month ($k)']:,.0f} $k/month, MAE rank {int(_rr.iloc[0]['MAE rank'])}, boot t vs S {_rr.iloc[0]['boot t vs S']:+.1f}, bar {'PASS' if bool(_rr.iloc[0]['beats S (bar)']) else 'no'}" + (f" | paired $ t {_rr.iloc[0]['$ boot t vs S (paired daily $)']:+.1f}, {'PASS' if bool(_rr.iloc[0]['beats S ($ bar)']) else 'no'}" if '$ boot t vs S (paired daily $)' in _rr.columns and np.isfinite(_rr.iloc[0]['$ boot t vs S (paired daily $)']) else '')))
     _ad = pd.DataFrame(REGISTRY['markout']['adverse_selection'])
     _adf = _ad[_ad['prints'] == 'would have filled'].set_index('side')
     summary_rows.append((f'Adverse selection on would-be fills (algo quote): edge at quote | factor-implied | residual move after {_hr}d, P / S (bp)', ' / '.join(f"{_adf.loc[s_, 'edge at our quote (bp)']:+.1f} | {_adf.loc[s_, f'factor-implied, h={_hr} (bp)']:+.1f} | {_adf.loc[s_, f'residual move, h={_hr} (bp)']:+.1f}" for s_ in _adf.index)))
@@ -4870,6 +5031,12 @@ if 'production_objective' in REGISTRY and REGISTRY['production_objective']['poli
                 summary_rows.append((f'{_lab}: win rate bid | offer; |quote - print| bid | offer (bp); RT P&L per print bid | offer (bp)', f"{_bsr.loc[(_pn, 'P'), 'win rate']:.0%} | {_bsr.loc[(_pn, 'S'), 'win rate']:.0%}; {_bsr.loc[(_pn, 'P'), '|quote - print| (bp)']:.1f} | {_bsr.loc[(_pn, 'S'), '|quote - print| (bp)']:.1f}; {_bsr.loc[(_pn, 'P'), 'RT P&L per print (bp)']:+.2f} | {_bsr.loc[(_pn, 'S'), 'RT P&L per print (bp)']:+.2f}"))
     _win = _po[_po['beats production (bar, round trip)'].astype(bool)]
     summary_rows.append(('Variants that clear the bar against production (round trip)', '; '.join(f"{i_}: {r_['round trip: P&L per print (bp)']:+.2f} bp" for i_, r_ in _win.iterrows()) if len(_win) else 'none'))
+if 'one_objective' in REGISTRY and REGISTRY['one_objective']['engines']:
+    _oe = pd.DataFrame(REGISTRY['one_objective']['engines']).set_index('policy'); _ob = REGISTRY['one_objective']['incumbent']; _ow = REGISTRY['one_objective']['winner']
+    summary_rows.append(('One sample, one objective (raw round-trip $ per month): S at 0 | MAE-selected mid | best engine; winner (paired $ t vs S, months, $ bar)', f"{_oe.loc[_ob, '$ per month ($k)']:,.0f} | " + (f"{_oe.loc[[i_ for i_ in _oe.index if 'MAE-selected' in i_][0], '$ per month ($k)']:,.0f}" if any('MAE-selected' in i_ for i_ in _oe.index) else 'n/a') + f" | {_oe.loc[[i_ for i_ in _oe.index if i_.startswith('engine')], '$ per month ($k)'].max():,.0f} $k; {_ow}" + (f" ($ t {_oe.loc[_ow, '$ boot t vs S at 0']:+.1f}, {int(_oe.loc[_ow, 'months above S at 0 ($)'])} months, {'PASS' if bool(_oe.loc[_ow, 'beats S at 0 ($ bar)']) else 'no'})" if _ow != _ob else ' (the incumbent)')))
+    if REGISTRY['one_objective']['contrasts']:
+        _oc = pd.DataFrame(REGISTRY['one_objective']['contrasts']).set_index('contrast')
+        summary_rows.append(('Factor model, economic value by slot (delta $k per month, paired $ t): mid | fill curve | edge model | all three', ' | '.join(f"{r_['delta $ per month ($k)']:+,.0f} (t {r_['$ boot t']:+.1f})" for _, r_ in _oc.iterrows())))
 if 'rfq_ledger' in REGISTRY and REGISTRY['rfq_ledger'].get('policies'):
     _rl = REGISTRY['rfq_ledger']; _rp = pd.DataFrame(_rl['policies']).set_index('policy'); _pn_ = 'production (logged optimal yield)'
     summary_rows.append(('RFQ ledger: requests | printed | joined | scored (months)', f"{_rl['requests']:,} | {_rl['printed']:,} | {_rl['joined']:,} | {_rl['scored']:,} ({_rl['months']})"))
