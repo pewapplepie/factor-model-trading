@@ -1,0 +1,119 @@
+# IPCA as the desk's risk model: lab v4.6 (Sections 14d and 14e)
+
+Companion to `muni_ipca_factor_lab.py` / `.ipynb`. The notebook in the repo is the v4 lab reconstructed from
+`muni_ipca_factor_lab_v4.html` (markdown cells re-derived from the rendered html, code cells verbatim) with two new
+sections appended between 14c and 15. Nothing in cells 1 to 14c is changed, so every existing cache on the lab machine
+is reused; the new cells read the objects those cells leave behind.
+
+Regenerate the `.ipynb` from the `.py` with the percent-format converter (no jupytext metadata in the repo):
+
+```python
+import re, sys
+import nbformat
+from nbformat.v4 import new_code_cell, new_markdown_cell, new_notebook
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src, encoding='utf-8').read()
+parts = re.split(r'^# %%(.*)$', text, flags=re.M)
+cells = []
+for i in range(1, len(parts), 2):
+    marker, body = parts[i].strip(), parts[i + 1].strip('\n')
+    if 'markdown' in marker:
+        cells.append(new_markdown_cell('\n'.join(re.sub(r'^# ?', '', ln) for ln in body.split('\n'))))
+    else:
+        cells.append(new_code_cell(body))
+nbformat.write(new_notebook(cells=cells, metadata={'kernelspec': {'name': 'python3', 'display_name': 'Python 3', 'language': 'python'}, 'language_info': {'name': 'python'}}), dst)
+```
+
+## Why these cells exist
+
+The v4 run (Sections 13 to 14c) read as a test of IPCA as the book's risk model. Four things made it not that test:
+
+1. On the winnable requests only 20 percent carried the bond's own beta; 77 percent used a tenor-by-call bucket mean.
+   In the variance decomposition the factors carried 1 to 24 percent, the rate block and the idiosyncratic block the rest.
+2. The core IPCA property, beta as a function of characteristics (`beta = Gamma' z`), was unused: a bond outside the
+   estimation panel got a bucket mean, and a bond with a three-week-old mark got nothing fresh.
+3. The expanding-window Sigma under-forecast the realised daily move of both books by about 1.5 times.
+4. Every positive result in 14 and 14c lived in new wins, valued at the bond's own next other-side print, which carries
+   the bid-offer and the reversion of a noisy print. The flat formation at equal win rate showing 500k dollars a month
+   against production's 355k was the symptom.
+
+## What each new cell does
+
+| Cell | What it builds | Pre-registered bar | Objects it leaves |
+|---|---|---|---|
+| 14d [13] | `z` for every requested bond from the evaluation panel's last row, the request (fair value as the yield level, our bid price as the price level, DV01 as duration, tenor / call / coupon / rating buckets), the static track and the print tape; rank-normalised against the model panel on the last model date before the request; `beta = Gamma' z` with the aligned Gamma strictly before the request; a ridge of log residual sd on `z`; the fresh factor-implied move since the bond's last observation | Pearson >= 0.9 on factors 1 and 2 between the request-fields `Gamma' z` and the beta of record, on requests that have both; else everything downstream is labelled uncalibrated | `BT_BETA_GZ`, `BT_SRC_GZ`, `BT_IDV_GZ`, `BT_EXPO_GZ`, `BT_V_GZ`, `GZ_Z`, `BT['bt_level_fresh_bp']`, `GZ_LABEL` |
+| 14d [14] | EWMA covariances (half-lives 10, 20, 40) of the stacked MMD tenor moves and factor realisations against the expanding window; EWMA idiosyncratic variance; scored on the vanilla and objective books by the realised over ex-ante ratio and the Gaussian log score; walk-forward pick; the 14c risk attribution redone on the new betas | the picked Sigma's ratio in [0.8, 1.25] on the vanilla book in >= 4 of 5 test months and in the last month | `BT_SIGMA_C`, `BT_IDV_C`, `BT_V_C`, `BT_VOL_C`, `bt_book_g`, `SIGMA_LABEL` |
+| 14d [15] | the objective rebuilt with the selection bias on the other-side markout net of the day's common markout (`Xm`), as a leaderboard row; every variant and every 14c formation re-scored with new wins valued at (a) the record exit, (b) the common markout only, (c) the factor-implied move over the holding | the objective line is kept only if the net-b row has delta >= 0.05 bp net of common with NW t >= 2 and >= 4 months positive; a variant that raises the win rate passes only on (a) and (b) together | `BT_VARIANTS[...net b]`, `BT_OBJ_B_NET`, `bt_board` (one row added), `bt_cons`, `bt_fm_cons`, `_obj_label` |
+| 14e [16] | `s_i` decomposed into rate, factor, idiosyncratic and the book cross term on vanilla's book; the 14b replay under two definitions (full; hedged = rate block sold at `HEDGE_COST_BP`, default 1 bp per fill) on vanilla, the objective and the net-b objective, k in {1, 2, 3, 5}; the k pick by the weekly Sharpe of the hedged dollar P&L; frontiers raw, net of common, hedged | a pick passes if its hedged dollars per dollar of ex-ante sd >= 1.3x its base's and hedged P&L >= 70% of its base's in >= 4 of 5 months | `BT_RISK_OPTO_GZ` (cached stage `lab_rfq_riskaware_gz`), `bt_risk_gz`, `bt_pick_gz`, `_PPG`, `BT_RISK_BOOKS_GZ` |
+| 14e [17] | the manual charge regressed on the risk measures, size, signal age, call and tenor buckets, the bond's recent losses on the desk's own fills, and a month effect (pooled R2, partial R2 per block, weekly Fama-MacBeth); a reallocation that keeps the traders' monthly level and allocates it by risk, lambda multiple picked on earlier months by cover saved | keeps >= 80% of vanilla's wins, saves >= 1 bp of cover on kept cover wins against the flat reallocation, delta vs vanilla at the common-markout valuation >= 0 | `bt_manual_reg`, `bt_manual_fm`, `BT_RL_OPTO` (cached stage `lab_rfq_realloc`), `bt_rl_tab` |
+| 14e [18] | the risk-adjusted exposure table (raw, net-of-common and hedged dollars; calibrated ex-ante and realised sd; hedged dollars per dollar of sd; gross DV01; factor exposures; idiosyncratic share; worst week; Sharpe raw and hedged) and the frontier figure for every policy | none; a report | `bt_exposure`, registry section `14e` |
+
+Every bar is written into `PRE_REGISTERED` at the top of the cell that scores it, dated 2026-10-21, before any result.
+Registry keys: `lab_gz_betas`, `lab_sigma_calibration`, `lab_rfq_netb`, `lab_rfq_riskaware_gz`, `lab_rfq_realloc`, `14e`.
+Figures: `14d_gamma_z_betas`, `14d_sigma_calibration`, `14d_conservative_valuation`, `14e_riskaware_gz`,
+`14e_manual_reallocation`, `14e_exposure_report`.
+
+Two lines are closed in the 14d markdown on the v4 evidence: the request-level skew of Section 13 and the alpha
+overlays of Section 14. No further overlay variants are built.
+
+## Definitions worth having in one place
+
+- **Full book**: the 14b exposure `e_i = u_i [1_tenor, beta_i]`, nothing hedged. **Hedged book**: the tenor block is
+  zero, the fill's tenor DV01 is sold on the fill day, a fill's hedged P&L is `100 (y - y_trade) + M - (MMD move at tenor
+  over the holding) - HEDGE_COST_BP`, and every risk-aware policy under the hedged definition also carries the cost in
+  its charge. `HEDGE_COST_BP` can be set in the kernel before the cell runs (default 1.0).
+- **Marginal risk** `s_i = h (2 e_i' Sigma E_d + e_i' Sigma e_i + v_i) / (2 u_i)` as in 14b; `gamma_k = k / median(s)`
+  on the vanilla book in the first month with Sigma, per definition, so `k` stays the median extra charge in bp.
+- **Conservative valuation of a new win**: `100 (y - y_trade) + mkt_h` where `mkt_h` is the day's median other-side
+  markout over winnable requests; **factor-implied**: `100 (y - y_trade) + BT_MKT + BT_FAC`, the 14c attribution's
+  market and factor parts, the common-markout value where the attribution is missing. Common fills and wins given up
+  are unchanged, so the three deltas differ only through new wins.
+- **Reallocation**: `charge_i = mean manual of the test month + lambda (g_i - mean g of the month)`, `lambda = m x
+  sd(manual) / sd(g)` over the earlier months, `m` in {0.5, 1, 2}. The month's level is in-sample by construction and
+  is said so in the cell; the question is allocation, not level.
+
+## The synthetic smoke test
+
+No real data was available here. A harness under the session scratch directory
+(`lab46/smoke/harness.py`, not committed) fabricates 600 bonds over 190 business days, a model panel with the 20
+instruments, six Gamma versions, a factor path, residuals of record, a ten-tenor MMD curve, a 60k-print tape and a
+7,000-request `BT` with the column names and dtypes the lab uses, then executes the lab's own Section 14 cells
+(61, 66, 67, 70, 71, 73, 74 of the v4 html, verbatim) and the six new cells on top. Cells 62 to 65 reach the pipeline,
+the pricing service and the tape, so their pure function definitions are executed from source and their frame-building
+lines are replicated on the synthetic data; the vanilla outcome check (`BT_VANILLA_PASS`) holds on the synthetic frame.
+
+Result of the last run: every new cell runs to the end, every figure and registry section is produced, and the
+registry stays JSON-serialisable. Runtimes on the synthetic scale: [13] 1 s, [14] 1 s, [15] 1 s, [16] 11 s (24
+sequential replays), [17] 1 s, [18] 1 s. The lab's own cells 66 to 74 ran in 25 s on the same data.
+
+On the synthetic world the bars come out as expected for noise: the request-fields `Gamma' z` correlates 0.89 / 0.95 /
+0.95 with the beta of record (fails the 0.9 bar on factor 1 by design of the synthetic instruments), the EWMA
+candidates do not beat the expanding window on a stationary synthetic path, the net-b objective fails, no
+reallocation passes. None of those numbers mean anything for the desk; they only show the code paths.
+
+## What only the real run will show
+
+- The share of winnable requests with own or `Gamma' z` betas (the target is >= 95 percent) and whether the
+  request-fields `z` clears the 0.9 correlation bar on factors 1 and 2. If it fails, the first thing to look at is the
+  missing-instrument table: `z_liquidity_20` is always at the panel median (the raw column is not kept in `model`), and
+  `trade_size_lag` / `print_freq_lag` fall back to a 60-day print window.
+- Whether an EWMA half-life brings the realised over ex-ante ratio into [0.8, 1.25] in September, when the expanding
+  window could not.
+- Whether `b` net of the common markout stays positive. On won-with-cover fills the raw other-side markout was 14.6 bp
+  and 9.9 bp net of the day's common move, so the objective's 2 to 3.5 bp of selection bias may not survive.
+- How much of the manual charge is a regime level (the month effect) against request-level information, and whether
+  any reallocation keeps 80 percent of wins.
+- The replay runtime of [16] at 1.55M requests: 24 replays against the 10 of 14b [10]; if 14b [10] took around 100 s,
+  expect 4 to 5 minutes, cached after the first run.
+
+## Assumptions made without the data
+
+- `BT['our_bid_price']`, `BT['dv01']`, `BT['final_comp_rating']`, `BT['tenor_bucket']`, `BT['call_bucket']`,
+  `BT['coupon_bucket']` exist as the v4 cells build them; each is guarded, and a missing one sends that instrument to
+  the panel median.
+- `track_static` may be `None`; column names tried for a static source are `maturity` / `maturity_date`, `cpn` /
+  `coupon`, `nxt_call_dt` / `next_call_date`, `state_code` / `state`, `issuer_industry` / `INDUSTRY`.
+- `msrb_raw` carries `quantity` and `tradetime` (the Section 2 load); without it the print instruments sit at the
+  median.
+- Call-bucket labels parse as in the v4 output (`0-3m` ... `9-12m`, `1y` ... `10y`, `No Call`); tenor buckets as
+  `1y` ... `21y+`.
