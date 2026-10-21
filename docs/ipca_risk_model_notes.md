@@ -1,4 +1,4 @@
-# IPCA as the desk's risk model: lab v4.6 (Sections 14d and 14e)
+# IPCA as the desk's risk model: lab v4.7 (Sections 14d, 14e and 14f)
 
 Companion to `muni_ipca_factor_lab.py` / `.ipynb`. The notebook in the repo is the v4 lab reconstructed from
 `muni_ipca_factor_lab_v4.html` (markdown cells re-derived from the rendered html, code cells verbatim) with two new
@@ -55,6 +55,32 @@ Figures: `14d_gamma_z_betas`, `14d_sigma_calibration`, `14d_conservative_valuati
 
 Two lines are closed in the 14d markdown on the v4 evidence: the request-level skew of Section 13 and the alpha
 overlays of Section 14. No further overlay variants are built.
+
+## 14f: the exit of record (added in v4.7, after the real run of 14d and 14e)
+
+The real run of 14d [15] showed that every positive result in Sections 14 and 14c depended on how a *new win* was valued:
+the bond's own next print on the other side of the trade, which carries the bid-offer and exists only on the liquid two
+thirds of winnable requests. The backtest framework (Section 6b, agreed 2026-10-20) had specified a different exit,
+comparable-bond prints anchored at the evaluated close, P or D only, mark-to-P primary, validated against realised own
+prints, with a circularity guard. Section 14f builds that exit and re-scores everything under it.
+
+| Cell | What it builds | Pre-registered rule | Objects it leaves |
+|---|---|---|---|
+| 14f [19] | anchors (last evaluated close before the date) for every request and every P/D print; print deviations from their own anchors; five estimators of the peer level over (t, t+5]: bucket (coupon bin x call structure x rating group x tenor bucket, characteristics only), IPCA peers (the Section 11 baskets, widened to the bucket where thin), factor / MMD, own P and own D print within 10 business days; validation of each against the realised own P print (coverage, bias, MAE, slope, by month) | exit of record = the comparable-bond mark-to-P estimator with the lowest pooled MAE and coverage >= 50% of winnable requests; the bucket mark-to-P exit is the guard | `BT_ANCHOR`, `BT_BUCKET`, `BT_EXIT_LVL`, `BT_M_EXIT` (markouts per exit in the Section 14 convention), `EX_RECORD`, `EX_GUARD`, `bt_exit_val` |
+| 14f [20] | every variant, the 14c formations, the 14e reallocations and the risk-aware policies re-scored under the exit of record with the Section 14 machinery; manual requests as a segment; the hedged P&L of production's own fills under the exit of record | a variant passes if it clears the 14 bar under the exit of record and, when built on a model, also under the guard | `bt_board_f`, `bt_policies_f`, registry `lab_exit_of_record`, `lab_rfq_rescore` |
+
+Decisions the runs resolved, written into the 14f markdown for the framework's log: settle T+2; the call-structure pfill
+keys start 2026-03-27; quantity is par dollars; manual requests are 17 percent of the flow, scored as a segment.
+
+On the synthetic smoke run the exit of record came out as the IPCA peers mark-to-P (MAE 8.3 bp against 8.8 for the bucket
+and 15.2 for factor / MMD, coverage 87% / 62% / 94% of winnable requests), zero of 17 variants pass with the guard, and the
+mark-to-P exits carry no bid-offer (production's fills mark 6 bp against 24 bp on the other-side exit). Those numbers only
+show the code paths. Runtime on the synthetic scale: [19] 4 s, [20] 2 s; at the lab's scale expect the two merge_asof
+anchors and the own-print lookup (cached stage `lab_rfq_exits_own10`) to dominate, around two to three minutes.
+
+What only the real run will show: which comparable-bond exit validates best and with what MAE against the own print
+(if none reaches 50% coverage, the bucket is the record by construction); whether any variant survives the exit of
+record and the guard; and the hedge contribution under the exit of record, which no longer carries the S-side bid-offer.
 
 ## Definitions worth having in one place
 

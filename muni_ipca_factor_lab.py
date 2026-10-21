@@ -1,5 +1,5 @@
-# muni_ipca_factor_lab.py: lab v4.6. Cells 1 to 15 reconstructed from the v4 run (muni_ipca_factor_lab_v4.html; markdown re-derived from the rendered cells, code verbatim);
-# Sections 14d and 14e are new. Percent format; regenerate the .ipynb with the converter in docs/ipca_risk_model_notes.md.
+# muni_ipca_factor_lab.py: lab v4.7. Cells 1 to 15 reconstructed from the v4 run (muni_ipca_factor_lab_v4.html; markdown re-derived from the rendered cells, code verbatim);
+# Sections 14d, 14e and 14f are new. Percent format; regenerate the .ipynb with the converter in docs/ipca_risk_model_notes.md.
 
 # %% [markdown]
 # # Muni IPCA factor lab: the factor model from data to factor premia
@@ -6359,6 +6359,7 @@ savefig('14d_conservative_valuation')
 record('lab_rfq_netb', net_b=flat_records(_obn.reset_index()), netb_row={k: (v.item() if hasattr(v, 'item') else v) for k, v in _r_net.items() if not isinstance(v, (list, dict))}, objective_verdict=_obj_label,
        conservative=flat_records(bt_cons), conservative_verdict=BT_CONS_VERDICT, formations=flat_records(bt_fm_cons), leaderboard=flat_records(bt_board), seconds=time.perf_counter() - _nb_t0)
 print(f'[15] {time.perf_counter() - _nb_t0:.0f}s')
+
 # %% [markdown]
 # ## 14e. Risk-adjusted exposure: the hedged book, the charge decomposed, the manual charge reallocated, and the report
 #
@@ -6765,6 +6766,345 @@ ax[1].bar(_xs - 0.2, _e['$ per month, hedged ($k)'], 0.4, color='#4C72B0', label
 ax[1].set_xticks(_xs); ax[1].set_xticklabels(_e.index, rotation=25, ha='right', fontsize=7); ax[1].legend(fontsize=8); ax[1].set_title('P&L and risk by policy', fontsize=10)
 savefig('14e_exposure_report')
 record('14e', exposure=flat_records(bt_exposure), headline=_head, best_reallocation=_best_rl, labels={'betas': GZ_LABEL, 'sigma': SIGMA_LABEL, 'objective': _obj_label})
+
+# %% [markdown]
+# ## 14f. The exit of record: comparable-bond markouts, validated against real prints, and everything re-scored
+#
+# **Why.** The backtest framework (`docs/rfq_backtest_framework.html`, Section 6b, agreed with the desk on 2026-10-20) fixes the exit as the level
+# where *comparable bonds* print after the request, anchored at each bond's own evaluated close: exit prints P or D only, mark-to-P primary, every
+# estimator validated against realised own prints before any variant is scored, and a circularity guard (a variant built on a model must also win under
+# an exit that does not use that model). Section 14 did not build that exit. It used the bond's own next print on the *other side* of the trade (a P fill
+# exits on S or D prints), which carries the bid-offer every fill earns and exists only on the liquid two thirds of winnable requests. 14d [15] showed
+# that every positive result in 14 and 14c depended on it. This section builds the framework's exit, validates it, fixes the exit of record by a
+# pre-registered rule, and re-scores every variant, formation, reallocation and risk-aware policy under it.
+#
+# **The exit.** For bond $i$ requested at $t$, anchor $E_i$ = its evaluated close strictly before $t$. For any P (or D) print of a comparable bond $j$ on
+# day $\tau \in (t, t+h]$, the deviation from its own anchor is $d_{j\tau} = 100\,(y_{j\tau} - E_j)$. The peer level is $L_h$ = the median of $d_{j\tau}$
+# over the peer set's prints in the window, at least three prints. A fill at $y_q$ is then worth $100\,(y_q - E_i) - L_h$: the entry concession to the
+# anchor minus where the peers print against theirs. No level at entry is needed, and the P/D basis to evaluations is carried by $L_h$ itself.
+#
+# | Estimator | Peer set | Role |
+# |---|---|---|
+# | bucket, mark-to-P (and mark-to-D) | coupon bin x call structure x rating group x tenor bucket, from characteristics only | model-free; exit-of-record candidate and the circularity guard |
+# | IPCA peers, mark-to-P (and mark-to-D) | the 20 nearest bonds in point-in-time beta space within call structure (Section 11 baskets) | model-based |
+# | factor / MMD | $\beta' \Delta f$ + the MMD move at the bond's tenor over the holding, from evaluations | full coverage; evaluator-driven |
+# | own print, P (and D) | the bond's own next P (D) print within 10 business days | ground truth on the subset that prints; the validation target |
+# | lab other side (14 [4]) | the bond's own last S or D print by day 5 | the Section 14 record, kept for continuity |
+#
+# | Cell | Content |
+# |---|---|
+# | [19] | anchors, print deviations, the five estimators at h = 5 (1 and 3 for the bucket), validation against the own P print, the exit of record |
+# | [20] | the leaderboard, the 14c formations, the 14e reallocations and the risk-aware policies re-scored under the exit of record, the guard, the manual segment |
+#
+# **Decisions resolved by the runs, written back here for the framework's log:** settle is T+2 (the convention check reproduces logged yields at T+2,
+# not T+1); the call-structure pfill keys start 2026-03-27; quantity is par dollars; manual requests are 17 percent of the flow and are scored as a segment.
+
+# %%
+CELL_T('14f. Comparable-bond exits, validated; the exit of record [19]')
+PRE_REGISTERED.update({
+    'lab_exit_of_record': ('fixed 2026-10-21 before any re-scoring: anchor = the bond\'s last evaluated close strictly before the request date (Step 3 panel closing yield); print '
+                           'deviation = 100 (print yield - the printing bond\'s own anchor), P and D prints only, |d| <= 300 bp; peer level L_h = median deviation over the peer '
+                           'set\'s prints in (t, t + h business days], >= 3 prints; estimators: bucket (coupon bin x call structure x rating group x tenor bucket from characteristics '
+                           'only; mark-to-P and mark-to-D), IPCA peers (the Section 11 frozen baskets of the latest weekly formation on or before the previous close, widened to the '
+                           'bucket where fewer than 3 peer prints; mark-to-P and mark-to-D), factor / MMD (Gamma-z beta\' dF + MMD move at tenor over h days), own P and own D print '
+                           'within 10 business days; validation = on winnable requests with an anchor and an own P print within 10 business days, each estimator\'s predicted deviation '
+                           'against the realised own-print deviation: coverage of winnable requests, bias, MAE, slope, by month and pooled, h = 5; exit of record = among the three '
+                           'comparable-bond estimators at mark-to-P, the lowest pooled MAE with coverage >= 50% of winnable requests; the bucket mark-to-P exit is the circularity '
+                           'guard; the Section 14 other-side own-print exit is reported, not record'),
+})
+_ef_t0 = time.perf_counter()
+EX_H, EX_H_OWN, EX_MIN_PRINTS, EX_DEV_CLIP, EX_MIN_COVER = (1, 3, 5), 10, 3, 300.0, 0.5
+EX_BINS = np.arange(-EX_DEV_CLIP, EX_DEV_CLIP + 1.0, 1.0); EX_NBIN = len(EX_BINS) - 1
+_ex_dates = BT['date'].to_numpy('datetime64[ns]'); _ex_cusip = BT['cusip'].astype(str).to_numpy()
+_TEN_EDGES, _TEN_LABELS = [0, 1.5, 2.5, 3.5, 4.5, 7.5, 9.5, 15.5, 20.5, np.inf], ['1y', '2y', '3y', '4y', '5-7y', '8-9y', '10-15y', '16-20y', '21y+']
+
+
+def ex_rating_group(score: np.ndarray) -> np.ndarray:
+    s = np.asarray(score, float)
+    return np.where(s >= 21, 'AAAs', np.where(s >= 18, 'AAs', np.where(s >= 15, 'As', np.where(np.isfinite(s), 'BBBs', 'NR'))))
+
+
+def ex_coupon_bin(cpn: np.ndarray) -> np.ndarray:
+    c = np.asarray(cpn, float)
+    return np.where(c < 4, 'cpn3', np.where(c < 5, 'cpn4', np.where(np.isfinite(c), 'cpn5', 'cpnNA')))
+
+
+def ex_call_structure(is_call: np.ndarray, call_date, mat_date, cpn: np.ndarray, yld: np.ndarray, date) -> np.ndarray:
+    """The Section 3 rule: priced-to-call if callable, a future call date and the coupon above the yield; else callable to maturity; else bullet."""
+    ptc = np.asarray(is_call, bool) & pd.notna(call_date).to_numpy() & (pd.to_datetime(call_date) > pd.to_datetime(date)).to_numpy() & (np.nan_to_num(np.asarray(cpn, float), nan=-1.0) > np.asarray(yld, float))
+    ext = ((pd.to_datetime(mat_date) - pd.to_datetime(call_date)).dt.days / 365.25).to_numpy(float)
+    ptc = ptc & (np.nan_to_num(ext) > 0.5)
+    return np.where(ptc, 'priced-to-call', np.where(np.asarray(is_call, bool), 'callable, to maturity', 'bullet'))
+
+
+def ex_tenor_bucket(years: np.ndarray) -> np.ndarray:
+    return pd.cut(pd.Series(np.asarray(years, float)), _TEN_EDGES, labels=_TEN_LABELS).astype(str).replace('nan', 'NA').to_numpy()
+
+
+# ---- anchors: the request's bond and every printing bond at their last evaluated close strictly before the date
+_rp_cols = ['closing_yield', 'maturity', 'cpn', 'callable', 'nxt_call_dt', 'final_comp_rating', 'comp_rating']
+_ex_req = gz_last_row_before(_ex_dates, _ex_cusip, raw_panel, _rp_cols)
+BT_ANCHOR = pd.to_numeric(_ex_req['closing_yield'], errors='coerce').to_numpy(float) if 'closing_yield' in _ex_req else np.full(len(BT), np.nan)
+_tape = BT_TAPE[BT_TAPE['type'].isin(['P', 'D'])].reset_index(drop=True); _tape['date'] = _tape['ts'].dt.normalize().astype('datetime64[ns]')
+_tp_req = gz_last_row_before(_tape['date'].to_numpy('datetime64[ns]'), _tape['cusip'].astype(str).to_numpy(), raw_panel, _rp_cols)
+_tape['anchor'] = pd.to_numeric(_tp_req['closing_yield'], errors='coerce').to_numpy(float) if 'closing_yield' in _tp_req else np.nan
+_tape['dev'] = 100.0 * (_tape['y'].to_numpy(float) - _tape['anchor'].to_numpy(float))
+_tape['di'] = _pb_days.searchsorted(_tape['date'].to_numpy('datetime64[ns]'), side='left')
+_tp_keep = (np.isfinite(_tape['dev']) & (_tape['dev'].abs() <= EX_DEV_CLIP) & (_tape['di'] < _pb_nd)).to_numpy() & (np.asarray(_pb_days)[np.minimum(_tape['di'].to_numpy(), _pb_nd - 1)] == _tape['date'].to_numpy())
+_tape = _tape[_tp_keep].reset_index(drop=True); _tp_req = _tp_req[_tp_keep].reset_index(drop=True)
+print(f'print tape for the exits: {len(_tape):,} P/D prints with an anchor ({(_tape["type"] == "P").mean():.0%} P) on {_tape["cusip"].nunique():,} bonds; request anchors on {np.isfinite(BT_ANCHOR).mean():.1%} of requests, '
+      f'{np.isfinite(BT_ANCHOR[_winable]).mean():.1%} of winnable')
+# characteristics of the printing bonds for the bucket (the same rule as the request side)
+_tp_mat = pd.to_datetime(pd.to_numeric(_tp_req['maturity'], errors='coerce'), unit='ms', errors='coerce')
+if _tp_mat.isna().mean() > 0.5:
+    _tp_mat = pd.to_datetime(_tp_req['maturity'], errors='coerce')
+_tp_call = pd.to_datetime(_tp_req['nxt_call_dt'], errors='coerce'); _tp_is_call = _tp_req['callable'].astype('string').str.upper().isin(['Y', 'YES', 'TRUE', '1']).fillna(False).to_numpy(bool)
+_tp_cpn = pd.to_numeric(_tp_req['cpn'], errors='coerce').to_numpy(float)
+_tp_score = clean_rating(_tp_req['final_comp_rating']).fillna(clean_rating(_tp_req['comp_rating'])).map(RATING_SCALE).astype(float).to_numpy() if 'final_comp_rating' in _tp_req else np.full(len(_tape), np.nan)
+_tape['bucket'] = np.char.add(np.char.add(np.char.add(np.char.add(np.char.add(ex_coupon_bin(_tp_cpn).astype(str), '|'), ex_call_structure(_tp_is_call, _tp_call, _tp_mat, _tp_cpn, _tape['anchor'].to_numpy(), _tape['date']).astype(str)), '|'),
+                                          np.char.add(ex_rating_group(_tp_score).astype(str), '|')), ex_tenor_bucket(((_tp_mat - _tape['date']).dt.days / 365.25).to_numpy()).astype(str))
+# the request's bucket: coupon bin from the key, rating group and call structure from [13], tenor bucket from the track
+_rq_cb = BT['pfill_key'].astype(str).str.extract(r'^(cpn\d)')[0].fillna(pd.Series(ex_coupon_bin(_gz_cpn.to_numpy(float)), index=BT.index)).to_numpy(str)
+_rq_cs = np.where(_gz_ptc, 'priced-to-call', np.where(_gz_is_call, 'callable, to maturity', 'bullet'))
+BT_BUCKET = np.char.add(np.char.add(np.char.add(np.char.add(np.char.add(_rq_cb, '|'), _rq_cs.astype(str)), '|'), np.char.add(ex_rating_group(_gz_rscore).astype(str), '|')), BT['tenor_bucket'].astype(str).to_numpy(str))
+_bk_ids, _bk_names = pd.factorize(np.concatenate([_tape['bucket'].to_numpy(), BT_BUCKET]))
+_tape['bk'] = _bk_ids[:len(_tape)]; _rq_bk = _bk_ids[len(_tape):]
+print(f'buckets: {len(_bk_names):,} cells of coupon bin x call structure x rating group x tenor bucket; prints per bucket median {_tape.groupby("bk").size().median():,.0f}; '
+      f'requests whose bucket has prints: {np.isin(_rq_bk, _tape["bk"].unique()).mean():.1%}')
+
+
+def ex_bucket_levels(tape: pd.DataFrame, rq_bk: np.ndarray, rq_di: np.ndarray, h: int, side: str) -> tuple[np.ndarray, np.ndarray]:
+    """Median deviation of the bucket's prints of one side in (t, t + h], and the print count, by cumulative 1-bp histograms per bucket and day."""
+    t = tape[tape['type'] == side]
+    b = np.digitize(t['dev'].to_numpy(float), EX_BINS) - 1; b = np.clip(b, 0, EX_NBIN - 1)
+    H = np.zeros((len(_bk_names), _pb_nd + 1, EX_NBIN), dtype=np.int32); np.add.at(H, (t['bk'].to_numpy(), t['di'].to_numpy() + 1, b), 1); H = H.cumsum(1)
+    lvl, cnt = np.full(len(rq_bk), np.nan), np.zeros(len(rq_bk))
+    lo, hi = rq_di + 1, np.minimum(rq_di + h, _pb_nd - 1) + 1; ok = (rq_bk >= 0) & (lo <= _pb_nd - 1)
+    for s in range(0, len(rq_bk), 100_000):
+        r = np.flatnonzero(ok[s:s + 100_000]) + s
+        if not len(r):
+            continue
+        W = H[rq_bk[r], hi[r]] - H[rq_bk[r], lo[r]]; n = W.sum(1); C = W.cumsum(1)
+        med = np.argmax(C >= np.ceil(n / 2.0)[:, None], axis=1); lvl[r] = np.where(n >= EX_MIN_PRINTS, EX_BINS[med] + 0.5, np.nan); cnt[r] = n
+    return lvl, cnt
+
+
+def ex_bond_daily(tape: pd.DataFrame, side: str) -> np.ndarray:
+    """(days x RV bonds) median deviation of each bond's prints of one side per day; NaN where none."""
+    t = tape[tape['type'] == side]; bi = pd.Index(RV_BONDS.astype(str)).get_indexer(t['cusip'].astype(str)); ok = bi >= 0
+    g = pd.DataFrame({'di': t['di'].to_numpy()[ok], 'bi': bi[ok], 'dev': t['dev'].to_numpy(float)[ok]}).groupby(['di', 'bi'])['dev'].median()
+    D = np.full((_pb_nd, RV_NB), np.nan, dtype=np.float32); D[g.index.get_level_values(0).to_numpy(), g.index.get_level_values(1).to_numpy()] = g.to_numpy(np.float32)
+    return D
+
+
+def ex_peer_levels(D: np.ndarray, peers: np.ndarray, rq_di: np.ndarray, h: int) -> tuple[np.ndarray, np.ndarray]:
+    """Median over the peers' daily deviations in (t, t + h]; the count of (bond, day) values; NaN where fewer than EX_MIN_PRINTS."""
+    lvl, cnt = np.full(len(rq_di), np.nan), np.zeros(len(rq_di)); has = (peers >= 0).any(axis=1)
+    days = np.arange(1, h + 1)
+    for s in range(0, len(rq_di), 50_000):
+        r = np.flatnonzero(has[s:s + 50_000]) + s
+        if not len(r):
+            continue
+        dd = np.minimum(rq_di[r][:, None] + days[None, :], _pb_nd - 1); valid_d = (rq_di[r][:, None] + days[None, :]) <= _pb_nd - 1
+        P = peers[r]; pm = P >= 0
+        V = D[dd[:, :, None], np.maximum(P, 0)[:, None, :]]                       # (n, h, k)
+        V = np.where(pm[:, None, :] & valid_d[:, :, None], V, np.nan).reshape(len(r), -1)
+        n = np.isfinite(V).sum(axis=1); cnt[r] = n
+        m = np.nanmedian(np.where(np.isfinite(V), V, np.nan), axis=1) if V.size else np.full(len(r), np.nan)
+        lvl[r] = np.where(n >= EX_MIN_PRINTS, m, np.nan)
+    return lvl, cnt
+
+
+# ---- the estimators at h = 5 (bucket also at 1 and 3)
+_rq_di = _pb_di
+BT_EXIT_LVL, BT_EXIT_CNT = {}, {}
+for side in ('P', 'D'):
+    for h in EX_H:
+        if h != BT_H_RECORD and side == 'D':
+            continue
+        BT_EXIT_LVL[f'bucket {side} h={h}'], BT_EXIT_CNT[f'bucket {side} h={h}'] = ex_bucket_levels(_tape, _rq_bk, _rq_di, h, side)
+_dq_rq = _d02 + 1
+_peers_rq = rfq_peer_matrix(np.where(_on2, _dq_rq, 0), np.where(_on2, _bi2, 0), RV_FORMS, RV_NB, RV_K) if 'RV_FORMS' in globals() and len(RV_FORMS) else np.full((len(BT), RV_K), -1, dtype=np.int64)
+_peers_rq[~_on2] = -1
+for side in ('P', 'D'):
+    D_ = ex_bond_daily(_tape, side); lvl, cnt = ex_peer_levels(D_, _peers_rq, _rq_di, BT_H_RECORD); own_ok = np.isfinite(lvl)
+    wide = ~own_ok & np.isfinite(BT_EXIT_LVL[f'bucket {side} h={BT_H_RECORD}'])
+    lvl[wide] = BT_EXIT_LVL[f'bucket {side} h={BT_H_RECORD}'][wide]                # widened to the bucket where the basket is thin
+    BT_EXIT_LVL[f'IPCA peers {side} h={BT_H_RECORD}'], BT_EXIT_CNT[f'IPCA peers {side} h={BT_H_RECORD}'] = lvl, cnt
+    print(f'IPCA peers mark-to-{side}: basket level on {own_ok[_winable].mean():.1%} of winnable requests, {wide[_winable].mean():.1%} widened to the bucket')
+# factor / MMD over h business days from the evaluation: beta' dF + the MMD move at tenor (yield change, bp)
+_ex_i0 = np.clip(_d02, 0, len(RV_DATES) - 1); _ex_d5 = _pb_days[np.minimum(_rq_di + BT_H_RECORD, _pb_nd - 1)]
+_ex_j0 = _fo.index.searchsorted(RV_DATES[_ex_i0].to_numpy(), side='right'); _ex_j1 = _fo.index.searchsorted(_ex_d5.to_numpy(), side='right')
+_ex_m0 = _mmd_idx.searchsorted(RV_DATES[_ex_i0].to_numpy(), side='right') - 1; _ex_m1 = _mmd_idx.searchsorted(_ex_d5.to_numpy(), side='right') - 1
+_ex_fac = np.einsum('ij,ij->i', BT_BETA_GZ, _fcum[np.clip(_ex_j1, 0, len(_fcum) - 1)] - _fcum[np.clip(_ex_j0, 0, len(_fcum) - 1)])
+_ex_mmd = 100.0 * (_mmd_v[np.maximum(_ex_m1, 0), _tcol] - _mmd_v[np.maximum(_ex_m0, 0), _tcol])
+_ex_fok = (_d02 >= 0) & (_ex_m0 >= 0) & (_ex_m1 >= 0) & (_rq_di + BT_H_RECORD <= _pb_nd - 1)
+BT_EXIT_LVL[f'factor / MMD h={BT_H_RECORD}'] = np.where(_ex_fok, _ex_fac + _ex_mmd, np.nan)
+# own prints within 10 business days, P and D separately
+_own10 = cached('lab_rfq_exits_own10', lambda: bt_exits(BT, BT_TAPE, horizons=(EX_H_OWN,), types=('P', 'D')),
+                deps=[STAGE_KEYS['lab_rfq_exits'], EX_H_OWN], code=[bt_exits])
+BT_OWN_P10, BT_OWN_D10 = _own10[f'yx_{EX_H_OWN}_P'].to_numpy(float), _own10[f'yx_{EX_H_OWN}_D'].to_numpy(float)
+_own_devP, _own_devD = 100.0 * (BT_OWN_P10 - BT_ANCHOR), 100.0 * (BT_OWN_D10 - BT_ANCHOR)
+
+# ---- validation against the own P print (and the own D print) on winnable requests with an anchor
+_est_names = {f'bucket P h={BT_H_RECORD}': 'bucket, mark-to-P', f'IPCA peers P h={BT_H_RECORD}': 'IPCA peers, mark-to-P', f'factor / MMD h={BT_H_RECORD}': 'factor / MMD',
+              f'bucket D h={BT_H_RECORD}': 'bucket, mark-to-D', f'IPCA peers D h={BT_H_RECORD}': 'IPCA peers, mark-to-D'}
+_val_base = _winable & np.isfinite(BT_ANCHOR)
+_val_rows = []
+for key, nm in _est_names.items():
+    pred = BT_EXIT_LVL[key]
+    for tgt_nm, tgt in [('own P print', _own_devP), ('own D print', _own_devD)]:
+        ok = _val_base & np.isfinite(pred) & np.isfinite(tgt) & (np.abs(tgt) <= EX_DEV_CLIP)
+        for m_ in ['ALL'] + BT_MONTHS:
+            r = ok if m_ == 'ALL' else ok & (_month == m_)
+            if r.sum() < 50:
+                continue
+            e = pred[r] - tgt[r]; sl = np.polyfit(pred[r], tgt[r], 1)[0] if np.std(pred[r]) > 0 else np.nan
+            _val_rows.append({'estimator': nm, 'target': tgt_nm, 'month': m_, 'requests': int(r.sum()), 'coverage of winnable': float(np.isfinite(pred[_winable]).mean()),
+                              'bias (bp)': float(e.mean()), 'MAE (bp)': float(np.abs(e).mean()), 'slope': float(sl), 'corr': float(np.corrcoef(pred[r], tgt[r])[0, 1])})
+bt_exit_val = pd.DataFrame(_val_rows).set_index(['target', 'estimator', 'month'])
+_pooled = bt_exit_val.xs('own P print', level='target').xs('ALL', level='month')
+print(f'Validation at h = {BT_H_RECORD} against the realised own P print within {EX_H_OWN} business days (winnable requests with an anchor; MAE and bias in bp of the deviation from the anchor):')
+display(_pooled.round(3))
+print('... by month, MAE against the own P print:'); display(bt_exit_val.xs('own P print', level='target')['MAE (bp)'].unstack('month').round(2))
+_cands = [k for k in [f'bucket P h={BT_H_RECORD}', f'IPCA peers P h={BT_H_RECORD}', f'factor / MMD h={BT_H_RECORD}'] if _est_names[k] in _pooled.index and _pooled.loc[_est_names[k], 'coverage of winnable'] >= EX_MIN_COVER]
+EX_RECORD_KEY = min(_cands, key=lambda k: _pooled.loc[_est_names[k], 'MAE (bp)']) if _cands else f'bucket P h={BT_H_RECORD}'
+EX_GUARD_KEY = f'bucket P h={BT_H_RECORD}'
+print(f'EXIT OF RECORD (lab_exit_of_record): {_est_names[EX_RECORD_KEY]} (lowest pooled MAE among comparable-bond mark-to-P estimators with coverage >= {EX_MIN_COVER:.0%}); '
+      f'circularity guard: {_est_names[EX_GUARD_KEY]}')
+
+# ---- markouts per estimator in the Section 14 convention: M = 100 (y_trade - exit level), positive = the bond richened after the trade
+BT_M_EXIT = {'lab other side (14)': _M}
+for key, nm in _est_names.items():
+    BT_M_EXIT[nm] = 100.0 * (_y_tr - BT_ANCHOR) - BT_EXIT_LVL[key]
+BT_M_EXIT['own P within 10d'] = 100.0 * (_y_tr - BT_OWN_P10); BT_M_EXIT['own D within 10d'] = 100.0 * (_y_tr - BT_OWN_D10)
+for h in (1, 3):
+    BT_M_EXIT[f'bucket, mark-to-P h={h}'] = 100.0 * (_y_tr - BT_ANCHOR) - BT_EXIT_LVL[f'bucket P h={h}']
+EX_RECORD, EX_GUARD = _est_names[EX_RECORD_KEY], _est_names[EX_GUARD_KEY]
+_cov_tab = pd.DataFrame({'coverage of winnable requests': {k: float(np.isfinite(v[_winable]).mean()) for k, v in BT_M_EXIT.items()},
+                         'mean markout on vanilla fills (bp)': {k: float(np.nanmean(v[_wv0])) for k, v in BT_M_EXIT.items()},
+                         'median markout on vanilla fills (bp)': {k: float(np.nanmedian(v[_wv0])) for k, v in BT_M_EXIT.items()}})
+print('Every exit: coverage and the markout of production\'s own fills (the lab\'s other-side exit carries the bid-offer; mark-to-P does not):'); display(_cov_tab.round(3))
+
+fig, ax = plt.subplots(1, 3, figsize=(22, 5.5))
+_mae = bt_exit_val.xs('own P print', level='target')['MAE (bp)'].unstack('month').drop(columns='ALL', errors='ignore')
+for nm, row in _mae.iterrows():
+    ax[0].plot(row.index, row.to_numpy(float), 'o-', lw=1.1, label=nm)
+ax[0].legend(fontsize=8); ax[0].set_title(f'MAE against the own P print by month (bp), h = {BT_H_RECORD}', fontsize=10)
+_sm = np.flatnonzero(_val_base & np.isfinite(BT_EXIT_LVL[EX_RECORD_KEY]) & np.isfinite(_own_devP)); _sm = RNG.choice(_sm, min(20000, len(_sm)), replace=False) if len(_sm) else _sm
+ax[1].scatter(BT_EXIT_LVL[EX_RECORD_KEY][_sm], _own_devP[_sm], s=3, alpha=0.3, color='#4C72B0'); ax[1].plot([-60, 60], [-60, 60], 'k--', lw=0.8)
+ax[1].set_xlim(-80, 80); ax[1].set_ylim(-150, 150); ax[1].set_xlabel(f'{EX_RECORD}: predicted deviation (bp)'); ax[1].set_ylabel('realised own P print deviation (bp)'); ax[1].set_title('Exit of record against the realised own print', fontsize=10)
+_cv = _cov_tab['coverage of winnable requests']; ax[2].barh(_cv.index, _cv.to_numpy(), color='#55A868'); ax[2].set_xlim(0, 1); ax[2].set_title('Coverage of winnable requests by exit', fontsize=10); ax[2].tick_params(axis='y', labelsize=8)
+savefig('14f_exit_validation')
+record('lab_exit_of_record', validation=flat_records(bt_exit_val.reset_index()), exit_of_record=EX_RECORD, guard=EX_GUARD, coverage=flat_records(_cov_tab), buckets=int(len(_bk_names)),
+       anchor_coverage_winnable=float(np.isfinite(BT_ANCHOR[_winable]).mean()), seconds=time.perf_counter() - _ef_t0)
+print(f'[19] {time.perf_counter() - _ef_t0:.0f}s')
+
+# %%
+CELL_T('14f. Everything re-scored under the exit of record, with the circularity guard [20]')
+PRE_REGISTERED.update({
+    'lab_rfq_rescore': ('fixed 2026-10-21 before re-scoring: every variant of 14 and 14d, every 14c formation, every 14e reallocation and every 14e risk-aware policy is scored '
+                        'under the exit of record from [19] with the Section 14 machinery (paired against vanilla on the same requests, weekly NW t, months positive, the width '
+                        'frontier at its win rate); the P&L sample is the winnable requests where the exit of record exists; a variant passes if NW t >= 3, >= 4 test months '
+                        'positive and above the width frontier under the exit of record AND, for a variant built on a model (alpha overlays, the objective, the fill-curve refit, '
+                        'the risk-aware policies, the model-based reallocations), the same under the bucket mark-to-P exit (the guard); the lab\'s other-side exit and the own-print '
+                        'exits are reported beside; manual requests are a reported segment'),
+})
+_rs_t0 = time.perf_counter()
+_MREC, _MGUARD = BT_M_EXIT[EX_RECORD], BT_M_EXIT[EX_GUARD]
+_mmd5 = np.where(_ex_fok, _ex_mmd, np.nan)                                            # the MMD move at tenor over the h-day holding, for the hedged P&L
+_report_exits = {k: v for k, v in BT_M_EXIT.items() if k in (EX_RECORD, EX_GUARD, 'lab other side (14)', 'IPCA peers, mark-to-P', 'bucket, mark-to-D', 'own P within 10d', 'factor / MMD')}
+MODEL_BUILT = ('alpha overlay (street)', 'alpha overlay (exit)', 'fill curve', 'objective')
+
+
+def bt_score_f(name: str, y: np.ndarray, M_rec: np.ndarray, exits: dict, family: str) -> tuple[dict, pd.DataFrame]:
+    rows = np.flatnonzero(np.isfinite(y)); months = sorted(set(_month[rows])); yv, y0 = y[rows], _y_van[rows]
+    ov, o0 = bt_outcomes(BT.iloc[rows], yv), bt_outcomes(BT.iloc[rows], y0); wv, w0 = ov['win'].to_numpy(), o0['win'].to_numpy(); grp = ov['group'].to_numpy()
+    pv, p0 = bt_pnl_rows(rows, yv, wv, M_rec), bt_pnl_rows(rows, y0, w0, M_rec); S = np.isfinite(pv); nS = max(int(S.sum()), 1); d = pv - p0
+    both, new, gone = wv & w0 & S, wv & ~w0 & S, w0 & ~wv & S
+    per = pd.DataFrame({'week': _week[rows], 'month': _month[rows], 'd': d, 'S': S, 'usd_v': pv * _usd[rows], 'usd_0': p0 * _usd[rows], 'manual': BT['manual'].to_numpy(bool)[rows]})
+    wk = per[per['S']].groupby('week')['d'].mean(); mm = per[per['S']].groupby('month')['d'].mean()
+    res = {'variant': name, 'family': family, 'months': len(months), 'requests': len(rows), 'win rate': float(wv.mean()), 'win rate, vanilla': float(w0.mean()),
+           'new wins': int((wv & ~w0).sum()), 'wins given up': int((w0 & ~wv).sum()), 'P&L sample share': nS / len(rows),
+           'P&L per request (bp)': float(np.nanmean(pv)), '... vanilla (bp)': float(np.nanmean(p0)), 'delta per request (bp)': float(np.nanmean(d)),
+           'delta: common fills price': float(np.sum(100.0 * (yv - y0)[both]) / nS), 'delta: new wins': float(np.sum(pv[new]) / nS), 'delta: wins given up': float(-np.sum(p0[gone]) / nS),
+           'delta $ per month ($k)': float((np.nansum(per['usd_v']) - np.nansum(per['usd_0'])) / 1e3 / len(months)), 'NW t (weekly)': nw_t(wk.to_numpy()), 'months > 0': int((mm > 0).sum()),
+           'delta, manual requests (bp)': float(np.nanmean(d[S & per['manual'].to_numpy()])) if (S & per['manual'].to_numpy()).any() else np.nan,
+           'delta, algo requests (bp)': float(np.nanmean(d[S & ~per['manual'].to_numpy()])) if (S & ~per['manual'].to_numpy()).any() else np.nan}
+    for key, M_ in exits.items():
+        a, b = bt_pnl_rows(rows, yv, wv, M_), bt_pnl_rows(rows, y0, w0, M_); da = a - b; Sa = np.isfinite(da)
+        wka = pd.Series(da[Sa]).groupby(_week[rows][Sa]).mean(); mma = pd.Series(da[Sa]).groupby(_month[rows][Sa]).mean()
+        res[f'delta | {key} (bp)'] = float(np.nanmean(da)); res[f'NW t | {key}'] = nw_t(wka.to_numpy()); res[f'months > 0 | {key}'] = int((mma > 0).sum())
+    # the width frontier at the variant's win rate under the record exit
+    pts = []
+    for c, yg in _gw.items():
+        wg = bt_outcomes(BT.iloc[rows], yg[rows])['win'].to_numpy(); pg = bt_pnl_rows(rows, yg[rows], wg, M_rec); pts.append((float(wg.mean()), float(np.nanmean(pg))))
+    feas = [p for w_, p in pts if w_ >= res['win rate'] - 1e-12]
+    res['above width frontier (bp)'] = res['P&L per request (bp)'] - (max(feas) if feas else np.nan)
+    return res, per.assign(pv=pv, p0=p0, win_v=wv, win_0=w0, rows=rows)
+
+
+_rs_rows, BT_PER_F = [], {}
+for nm, v_ in BT_VARIANTS.items():
+    r_, per_ = bt_score_f(nm, v_['y'], _MREC, _report_exits, v_['family']); _rs_rows.append(r_); BT_PER_F[nm] = per_
+bt_board_f = pd.DataFrame(_rs_rows).set_index('variant')
+_bar_rec = (bt_board_f['NW t (weekly)'] >= BT_BAR_T) & (bt_board_f['months > 0'] >= np.minimum(BT_BAR_MONTHS, bt_board_f['months'])) & (bt_board_f['above width frontier (bp)'] >= 0)
+_bar_guard = (bt_board_f[f'NW t | {EX_GUARD}'] >= BT_BAR_T) & (bt_board_f[f'months > 0 | {EX_GUARD}'] >= np.minimum(BT_BAR_MONTHS, bt_board_f['months']))
+_is_model = bt_board_f['family'].isin(MODEL_BUILT)
+bt_board_f['passes, exit of record'] = _bar_rec & (bt_board_f.index != 'vanilla (production replay)')
+bt_board_f['passes, with the guard'] = bt_board_f['passes, exit of record'] & (~_is_model | _bar_guard)
+bt_board_f = bt_board_f.sort_values('NW t (weekly)', ascending=False, na_position='last'); bt_board_f.insert(0, 'rank', np.arange(1, len(bt_board_f) + 1))
+_show_f = ['rank', 'family', 'win rate', 'new wins', 'wins given up', 'P&L sample share', 'delta per request (bp)', 'delta: common fills price', 'delta: new wins', 'delta: wins given up',
+           'delta $ per month ($k)', 'NW t (weekly)', 'months > 0', 'above width frontier (bp)', f'delta | {EX_GUARD} (bp)', f'NW t | {EX_GUARD}', 'passes, exit of record', 'passes, with the guard']
+print(f'LEADERBOARD under the exit of record ({EX_RECORD}, h = {BT_H_RECORD}); the guard column is the bucket mark-to-P exit:'); display(bt_board_f[_show_f].round(4))
+print('The same delta under every reported exit (bp per request; the lab\'s other-side exit of Section 14 beside the comparable-bond exits):')
+display(bt_board_f[[f'delta | {k} (bp)' for k in _report_exits]].round(4))
+print('Manual requests as a segment (delta vs vanilla, bp per request, under the exit of record):'); display(bt_board_f[['delta, manual requests (bp)', 'delta, algo requests (bp)']].round(4))
+BT_F_VERDICT = (f'{int(bt_board_f["passes, with the guard"].sum())} of {len(bt_board_f) - 1} variants pass under the exit of record with the guard'
+                + (f': {bt_board_f.index[bt_board_f["passes, with the guard"]].tolist()}' if bt_board_f['passes, with the guard'].any() else ''))
+print('VERDICT (lab_rfq_rescore, variants):', BT_F_VERDICT)
+
+
+def bt_policy_rows_f(name: str, opto: np.ndarray, hedged_cost: float = 0.0) -> dict:
+    """A policy scored on the test months under the exit of record: P&L per request and $ per month, raw and hedged (MMD at tenor over the holding), and under the guard."""
+    y = opto + _adj; win = np.zeros(len(BT), bool); ok = np.isfinite(y) & _tm; win[ok] = bt_win_fast(np.flatnonzero(ok), y[ok]) & _winable[ok]
+    px = 100.0 * (y - _y_tr); out = {'policy': name, 'win rate': float(win[_tm].sum() / _tm.sum())}
+    for lab, M_ in [('exit of record', _MREC), ('guard', _MGUARD), ('lab other side', _M)]:
+        pv = np.where(win & _tm, px + M_, 0.0); pv[_tm & _winable & ~np.isfinite(M_)] = np.nan
+        out[f'P&L per request, {lab} (bp)'] = float(np.nanmean(pv[_tm])); out[f'$ per month, {lab} ($k)'] = float(np.nansum(pv[_tm] * _pb_u[_tm]) / len(_test_m) / 1e3)
+    hed = np.where(win & _tm, px + _MREC + np.nan_to_num(_mmd5) - hedged_cost, 0.0); hed[_tm & _winable & ~(np.isfinite(_MREC) & np.isfinite(_mmd5))] = np.nan
+    out['$ per month, hedged, exit of record ($k)'] = float(np.nansum(hed[_tm] * _pb_u[_tm]) / len(_test_m) / 1e3)
+    return out
+
+
+_pol_rows = [bt_policy_rows_f('production (vanilla)', _opt_van)]
+_pol_rows += [bt_policy_rows_f(f'14c formation: {k}', o) for k, o in BT_FM_OPTO.items()]
+_pol_rows += [bt_policy_rows_f(k, o) for k, o in _rl_pol.items()]
+for nm in [f'{b} | {d} | hedged-Sharpe pick' for d in GZ_DEFS for b in _gz_bases] + [f'{b} | {d} | k=1' for d in GZ_DEFS for b in ('vanilla',)]:
+    _pol_rows.append(bt_policy_rows_f(f'risk-aware: {nm}', _pols_gz[nm], GZ_HEDGE_COST_BP if nm.split(' | ')[1] == 'hedged' else 0.0))
+bt_policies_f = pd.DataFrame(_pol_rows).set_index('policy')
+for lab in ['exit of record', 'guard', 'lab other side']:
+    bt_policies_f[f'delta vs production, {lab} (bp)'] = bt_policies_f[f'P&L per request, {lab} (bp)'] - bt_policies_f.loc['production (vanilla)', f'P&L per request, {lab} (bp)']
+print(f'The 14c formations, the 14e reallocations and the risk-aware policies on the test months {_test_m[0]}..{_test_m[-1]}, under the exit of record, the guard and the lab\'s other-side exit:')
+display(bt_policies_f.round(4))
+_hedge_gain = float(bt_policies_f.loc['production (vanilla)', '$ per month, hedged, exit of record ($k)'] - bt_policies_f.loc['production (vanilla)', '$ per month, exit of record ($k)'])
+print(f'production\'s own fills under the exit of record: ${bt_policies_f.loc["production (vanilla)", "$ per month, exit of record ($k)"]:,.0f}k a month raw, '
+      f'${bt_policies_f.loc["production (vanilla)", "$ per month, hedged, exit of record ($k)"]:,.0f}k hedged (MMD at tenor over {BT_H_RECORD} days): hedge contribution ${_hedge_gain:+,.0f}k a month')
+
+fig, ax = plt.subplots(1, 3, figsize=(22, 6))
+_top = [n for n in bt_board_f.index if n != 'vanilla (production replay)'][:8]; _xs = np.arange(len(_top))
+for k_, (lab, col) in enumerate([('lab other side (14)', '#999999'), (EX_RECORD, '#000000'), (EX_GUARD, '#4C72B0')]):
+    ax[0].bar(_xs + (k_ - 1) * 0.27, bt_board_f.loc[_top, f'delta | {lab} (bp)'], 0.27, color=col, label=lab)
+ax[0].axhline(0, color='k', lw=0.6); ax[0].set_xticks(_xs); ax[0].set_xticklabels(_top, rotation=25, ha='right', fontsize=8); ax[0].legend(fontsize=8); ax[0].set_title('Delta vs vanilla by exit, top variants (bp per request)', fontsize=10)
+_hm = bt_board_f[[f'delta | {k} (bp)' for k in _report_exits]].drop(index='vanilla (production replay)', errors='ignore'); _vm = float(np.nanmax(np.abs(_hm.to_numpy(float)))) or 1.0
+im = ax[1].imshow(_hm.to_numpy(float), cmap='RdBu', vmin=-_vm, vmax=_vm, aspect='auto'); ax[1].set_yticks(range(len(_hm))); ax[1].set_yticklabels(_hm.index, fontsize=7); ax[1].set_xticks(range(_hm.shape[1])); ax[1].set_xticklabels(list(_report_exits), rotation=30, ha='right', fontsize=7)
+ax[1].set_title('Does the sign survive the exit? delta vs vanilla (blue = better)', fontsize=10); fig.colorbar(im, ax=ax[1], fraction=0.03)
+_pp = bt_policies_f['delta vs production, exit of record (bp)'].drop(index='production (vanilla)'); ax[2].barh(_pp.index, _pp.to_numpy(float), color='#937860'); ax[2].axvline(0, color='k', lw=0.6)
+ax[2].set_title('Formations, reallocations and risk-aware policies: delta vs production under the exit of record (bp per request)', fontsize=9); ax[2].tick_params(axis='y', labelsize=7)
+savefig('14f_rescore')
+record('lab_rfq_rescore', exit_of_record=EX_RECORD, guard=EX_GUARD, leaderboard=flat_records(bt_board_f), policies=flat_records(bt_policies_f), verdict=BT_F_VERDICT, hedge_contribution_k=_hedge_gain,
+       seconds=time.perf_counter() - _rs_t0)
+print(f'[20] {time.perf_counter() - _rs_t0:.0f}s')
 
 # %% [markdown]
 # ## 15. Registry and runtimes
