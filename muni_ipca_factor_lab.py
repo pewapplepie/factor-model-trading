@@ -1,5 +1,5 @@
-# muni_ipca_factor_lab.py: lab v4.7. Cells 1 to 15 reconstructed from the v4 run (muni_ipca_factor_lab_v4.html; markdown re-derived from the rendered cells, code verbatim);
-# Sections 14d, 14e and 14f are new. Percent format; regenerate the .ipynb with the converter in docs/ipca_risk_model_notes.md.
+# muni_ipca_factor_lab.py: lab v4.8. Cells 1 to 15 reconstructed from the v4 run (muni_ipca_factor_lab_v4.html; markdown re-derived from the rendered cells, code verbatim);
+# Sections 14d to 14g are new. Percent format; regenerate the .ipynb with the converter in docs/ipca_risk_model_notes.md.
 
 # %% [markdown]
 # # Muni IPCA factor lab: the factor model from data to factor premia
@@ -7105,6 +7105,218 @@ savefig('14f_rescore')
 record('lab_rfq_rescore', exit_of_record=EX_RECORD, guard=EX_GUARD, leaderboard=flat_records(bt_board_f), policies=flat_records(bt_policies_f), verdict=BT_F_VERDICT, hedge_contribution_k=_hedge_gain,
        seconds=time.perf_counter() - _rs_t0)
 print(f'[20] {time.perf_counter() - _rs_t0:.0f}s')
+
+# %% [markdown]
+# ## 14g. The manual charge kept and tilted: can the model re-allocate what the traders charge, at the same win rate?
+#
+# **Why.** 14c and 14e [17] replaced the manual charge, and the 14e regression showed why that failed: the traders' per-request information is the
+# call bucket, and both tests threw it away. The risk-aware charge of 14b and 14e [16] kept the manual charge but could only add to it, because a
+# bid-only book is always long. This section keeps every request's manual charge and tilts it with a model quantity, then removes the level effect of
+# the tilt with a constant width so that each month's win rate equals production's. What is left is pure re-allocation: the same number of wins,
+# placed by the model's risk measure instead of only the traders' call-bucket view, scored on cover, book risk and markouts under the exit of record.
+#
+# **Tilts** $g_i$ (standardised on the earlier months), additive $c_i = \text{manual}_i + \lambda (g_i - \bar g)$ with $\lambda$ a multiple of
+# $\text{sd(manual)}/\text{sd}(g)$, and multiplicative $c_i = \text{manual}_i \exp(\kappa z_i)$; liquidity and risk charges kept throughout:
+#
+# | tilt | $g_i$ | what it charges for |
+# |---|---|---|
+# | systematic vol | 5-day rate-plus-factor vol from the [14] Sigma and the [13] betas | the bond's factor and curve exposure |
+# | idiosyncratic vol | 5-day residual vol ([14]) | bond-specific noise |
+# | signed factor exposure vs the book | $h\,\beta_i' \Sigma_{ff} E^f_d$, the fill's factor covariance with production's own start-of-day book | two-sided: cheaper on a fill that offsets the book's factor exposure, dearer on one that adds to it |
+# | peer co-movement | trailing 40-day correlation of the bond's residual with its 20 beta-space peers' median residual (the dependence tier the Section 12 copula models) | how much of the bond's residual is shared with its peers after the factors |
+# | time to call | $1 / (0.25 + \text{years to call})$ on callable bonds, 0 on bullets | what the manual charge already prices, sharpened within the call bucket |
+#
+# **Level.** After the tilt, a constant width $w$ (bp) on the final yield is set by bisection so that the month's win rate on winnable requests equals
+# production's, within 0.05 points. $w$ is in-sample by construction, as the 14c calibration was; the object is allocation, not level.
+#
+# | Cell | Content |
+# |---|---|
+# | [21] | the five tilts, the four settings, the requotes and the equal-win widths (cached stage `lab_rfq_tilts`) |
+# | [22] | scoring at equal win rate: wins kept, cover, markout per fill under the exit of record (raw and hedged), ex-ante book risk, hedged dollars per dollar of risk; the bar; figures |
+
+# %%
+CELL_T('14g. Tilts on the manual charge, requoted and levelled to equal win rate [21]')
+PRE_REGISTERED.update({
+    'lab_rfq_tilts': ('fixed 2026-10-21 before scoring: charge = manual_i + liquidity + risk tilted by one of five model quantities, additively (lambda = m x sd(manual) / sd(g) over the '
+                      'earlier months, m in {0.5, 1, 2}, g centred at its mean over the month\'s winnable requests) or multiplicatively (manual x exp(kappa z), z the standardised g, '
+                      'kappa = 0.5); tilts: systematic vol, idiosyncratic vol ([13] betas, [14] Sigma), the signed factor covariance of the fill with production\'s own start-of-day '
+                      'book, the trailing 40-day correlation of the bond\'s residual with its 20 beta-space peers\' median residual, and 1 / (0.25 + years to call) on callable bonds; '
+                      'every setting goes through the production optimizer with the tilted charge, then a constant width on the final yield is set by bisection so that the month\'s '
+                      'win rate on winnable requests equals production\'s within 0.05 points (in-sample level, as in 14c); scored on the test months at equal win rate: vanilla wins '
+                      'kept, bp of cover saved on kept cover wins, crossing on new wins, markout per fill under the exit of record (raw and hedged by the MMD move at tenor), ex-ante '
+                      'daily sd of the policy\'s own book ([13] exposures, [14] Sigma), gross DV01, hedged dollars per dollar of ex-ante sd; a tilt passes if cover saved on kept '
+                      'cover wins >= -0.5 bp and either ex-ante sd <= 0.9 x production\'s or hedged markout per fill >= production\'s + 1 bp, in >= 4 of the 5 test months'),
+})
+_tg_t0 = time.perf_counter()
+TG_MULTS, TG_KAPPA, TG_WIN_TOL, TG_W_RANGE, TG_ITERS, TG_CORR_WINDOW = (0.5, 1.0, 2.0), 0.5, 0.0005, 40.0, 16, 40
+
+# ---- the five tilts
+_tg_fac_book = np.full(len(BT), np.nan)                                     # signed: h x beta_i' Sigma_ff E^f_d on production's own book
+for j in sorted(BT_SIGMA_C):
+    r_ = _pb_rows_day.get(j)
+    if r_ is None:
+        continue
+    S_ff = BT_SIGMA_C[j][_nT:, _nT:]; E_f = _bk_van_c['E'][j][_nT:]
+    _tg_fac_book[r_] = BT_HOLD * (BT_BETA_GZ[r_] @ (S_ff @ E_f)) / 1e3           # $k per bp of the fill's own DV01-free beta, a scale the lambda absorbs
+# peer co-movement: trailing correlation of the bond's residual with its peers' median residual, on the RV grid
+_pm = np.full((RV_ND, RV_NB), np.nan, dtype=np.float32)
+if 'RV_FORMS' in globals() and len(RV_FORMS):
+    _form_days = np.array([F_['d0'] for F_ in RV_FORMS])
+    for fi, F_ in enumerate(RV_FORMS):
+        d_lo, d_hi = F_['d0'], (_form_days[fi + 1] if fi + 1 < len(_form_days) else RV_ND)
+        ids, peers = F_['ids'], F_['peers']
+        for d in range(d_lo, d_hi):
+            _pm[d, ids] = np.nanmedian(_E[d][peers], axis=1)
+_x, _y = _E, _pm.astype(float); _ok = np.isfinite(_x) & np.isfinite(_y); _xz, _yz = np.where(_ok, _x, 0.0), np.where(_ok, _y, 0.0)
+_cs = lambda a: np.vstack([np.zeros((1, RV_NB)), np.cumsum(a, axis=0)])  # noqa: E731
+_Sn, _Sx, _Sy, _Sxy, _Sxx, _Syy = _cs(_ok.astype(float)), _cs(_xz), _cs(_yz), _cs(_xz * _yz), _cs(_xz ** 2), _cs(_yz ** 2)
+_W = TG_CORR_WINDOW; _hi = np.arange(1, RV_ND + 1); _lo = np.maximum(_hi - _W, 0)
+_n = _Sn[_hi] - _Sn[_lo]; _sx = _Sx[_hi] - _Sx[_lo]; _sy = _Sy[_hi] - _Sy[_lo]; _sxy = _Sxy[_hi] - _Sxy[_lo]; _sxx = _Sxx[_hi] - _Sxx[_lo]; _syy = _Syy[_hi] - _Syy[_lo]
+with np.errstate(invalid='ignore', divide='ignore'):
+    _cov = _sxy - _sx * _sy / np.maximum(_n, 1); _vx = _sxx - _sx ** 2 / np.maximum(_n, 1); _vy = _syy - _sy ** 2 / np.maximum(_n, 1)
+    _PCORR = np.where((_n >= 10) & (_vx > 0) & (_vy > 0), _cov / np.sqrt(_vx * _vy), np.nan)
+_tg_peer = bt_last_obs(_PCORR, _d02, _bi2, _on2)[0]
+_tg_ytc = ((_gz_call - pd.to_datetime(_gz_dates)).dt.days / 365.25).to_numpy(float)
+_tg_call = np.where(_gz_is_call & np.isfinite(_tg_ytc) & (_tg_ytc > 0), 1.0 / (0.25 + np.nan_to_num(_tg_ytc, nan=1.0)), 0.0)
+TG_TILTS = {'systematic vol': BT_VOL_C['rate + factor'], 'idiosyncratic vol': BT_VOL_C['idiosyncratic'], 'signed factor exposure vs book': _tg_fac_book, 'peer co-movement': _tg_peer, 'time to call': _tg_call}
+print('tilt coverage on winnable requests (missing sits at the month mean, no tilt):', {k: round(float(np.isfinite(v[_winable]).mean()), 3) for k, v in TG_TILTS.items()})
+print('tilt correlations with the manual charge (winnable requests, Spearman):',
+      {k: round(float(pd.Series(v[_winable]).corr(pd.Series(_man[_winable]), method='spearman')), 3) for k, v in TG_TILTS.items()})
+TG_SETTINGS = [('additive', m) for m in TG_MULTS] + [('multiplicative', TG_KAPPA)]
+
+
+def tg_charge(tilt: str, kind: str, par: float, m: str) -> tuple[np.ndarray, np.ndarray]:
+    """Winnable rows of month m and their tilted charge level (production's convention, negative = a cost)."""
+    r_ = np.flatnonzero((_month == m) & _winable); g = TG_TILTS[tilt][r_]
+    earlier = [x for x in BT_MONTHS if x < m] or [m]; e_ = np.isin(_month, earlier) & _winable & np.isfinite(TG_TILTS[tilt])
+    mu_e, sd_e = float(np.nanmean(TG_TILTS[tilt][e_])), float(np.nanstd(TG_TILTS[tilt][e_])); sd_man = float(np.std(_man[e_]))
+    gbar = float(np.nanmean(g)) if np.isfinite(g).any() else 0.0
+    if kind == 'additive':
+        lam = par * sd_man / sd_e if sd_e > 0 else 0.0; man_t = _man[r_] + lam * np.nan_to_num(g - gbar)
+    else:
+        z = np.where(np.isfinite(g), (g - mu_e) / (sd_e if sd_e > 0 else 1.0), 0.0); man_t = _man[r_] * np.exp(par * np.clip(z, -3, 3))
+    return r_, -(np.maximum(man_t, 0.0) + _liq[r_] + _rsk[r_])
+
+
+def tg_level(r_: np.ndarray, opto: np.ndarray, target: float) -> tuple[float, float]:
+    """The constant width (bp) that brings the month's win rate to production's; returns (width, achieved win rate)."""
+    def wr(w: float) -> float:
+        return float(bt_win_fast(r_, opto + _adj[r_] + w / 100.0).mean())
+    lo, hi = -TG_W_RANGE, TG_W_RANGE
+    if wr(lo) < target:
+        return lo, wr(lo)
+    if wr(hi) > target:
+        return hi, wr(hi)
+    for _ in range(TG_ITERS):
+        mid = 0.5 * (lo + hi); lo, hi = (mid, hi) if wr(mid) > target else (lo, mid)
+    return hi, wr(hi)
+
+
+def _bt_tilt_runs() -> pd.DataFrame:
+    out, rows = {}, []
+    for tilt in TG_TILTS:
+        for kind, par in TG_SETTINGS:
+            t0 = time.perf_counter(); o = np.full(len(BT), np.nan); nm = f'{tilt} | {kind} {par:g}'
+            for m in _test_m:
+                r_, c_ = tg_charge(tilt, kind, par, m); om = bt_requote(r_, c_); target = float(_wv0[r_].mean())
+                w, got = tg_level(r_, om, target); o[r_] = om + w / 100.0
+                rows.append({'tilt': tilt, 'setting': f'{kind} {par:g}', 'test month': m, 'width (bp)': w, 'production win rate': target, 'win rate': got,
+                             'mean |charge - manual| (bp)': float(np.mean(np.abs(-c_ - _liq[r_] - _rsk[r_] - _man[r_])))})
+            out[nm] = o; print(f'  {nm}: {time.perf_counter() - t0:.0f}s')
+    return pd.DataFrame(out).assign(_rows_json=json.dumps(rows, default=float))
+
+
+BT_TG = cached('lab_rfq_tilts', _bt_tilt_runs, deps=[STAGE_KEYS['lab_rfq_replay'], float(np.nansum(BT_VOL_C['total'])), float(np.nansum(_tg_fac_book)), float(np.nansum(_tg_peer)), float(_tg_call.sum()),
+                                                      _test_m, TG_MULTS, TG_KAPPA, TG_W_RANGE, TG_ITERS, float(_man.sum())],
+               code=[tg_charge, tg_level, bt_requote, bt_replay, bt_optimize, bt_opto, bt_win_fast])
+bt_tg_level = pd.DataFrame(json.loads(BT_TG['_rows_json'].iloc[0])).set_index(['tilt', 'setting', 'test month'])
+BT_TG_OPTO = {c: BT_TG[c].to_numpy(float) for c in BT_TG.columns if c != '_rows_json'}   # note: the width is folded into these optimal yields
+print('Equal-win levelling: the constant width that returns each month to production\'s win rate after the tilt (positive = cheaper), and the size of the tilt:')
+display(bt_tg_level.round(4))
+record('lab_rfq_tilts', levels=flat_records(bt_tg_level.reset_index()), tilt_coverage={k: float(np.isfinite(v[_winable]).mean()) for k, v in TG_TILTS.items()}, seconds=time.perf_counter() - _tg_t0)
+print(f'[21] {time.perf_counter() - _tg_t0:.0f}s')
+
+# %%
+CELL_T('14g. Scoring at equal win rate: cover, risk, markouts under the exit of record [22]')
+_ts_t0 = time.perf_counter()
+TG_COVER_BP, TG_SD_RATIO, TG_MARKOUT_BP, TG_MONTHS = -0.5, 0.9, 1.0, 4
+_hed_rec = _MREC + np.nan_to_num(_mmd5)                                      # hedged markout under the exit of record: + the MMD move at tenor over the holding
+_hed_rec[~(np.isfinite(_MREC) & np.isfinite(_mmd5))] = np.nan
+
+
+def tg_score(name: str, opto_final: np.ndarray, is_vanilla: bool = False) -> tuple[dict, dict]:
+    """A policy at (near) production's win rate on the test months: wins, cover, markouts under the exit of record, the book; plus the per-month pieces the bar needs."""
+    y = (_y_van if is_vanilla else opto_final + _adj); win = np.zeros(len(BT), bool); ok = np.isfinite(y) & _tmw; win[ok] = bt_win_fast(np.flatnonzero(ok), y[ok])
+    keep = _cov_w & win; d_v = 100.0 * (_thr - y); d_0 = 100.0 * (_thr - _y_van); newl = win & ~_wv0 & (_grp == 'lost, printed') & _tm; px = 100.0 * (y - _y_tr)
+    pv = np.where(win & _tm, px + _MREC, 0.0); pv[_tm & _winable & ~np.isfinite(_MREC)] = np.nan
+    hv = np.where(win & _tm, px + _hed_rec, 0.0); hv[_tm & _winable & ~np.isfinite(_hed_rec)] = np.nan
+    bk = bt_book_g(win, BT_EXPO_GZ, BT_V_C, BT_SIGMA_C); sdv = bk['sd'][_tdays]; sdv = sdv[np.isfinite(sdv)]
+    f = win & _tm & np.isfinite(_MREC)
+    res = {'policy': name, 'win rate': float(win[_tm].sum() / _tm.sum()), 'vanilla wins kept': float((win & _wv0 & _tm).sum() / max(int((_wv0 & _tm).sum()), 1)), 'new wins': int((win & ~_wv0 & _tm).sum()),
+           'bp left on kept cover wins': float(d_v[keep].mean()) if keep.any() else np.nan, 'bp saved on kept cover wins': float((d_0 - d_v)[keep].mean()) if keep.any() else np.nan,
+           'crossing on new wins (bp)': float(-d_v[newl].mean()) if newl.any() else np.nan, 'markout per fill, exit of record (bp)': float(np.nanmean((px + _MREC)[f])),
+           'hedged markout per fill (bp)': float(np.nanmean((px + _hed_rec)[f & np.isfinite(_hed_rec)])), '$ per month, exit of record ($k)': float(np.nansum(pv[_tm] * _pb_u[_tm]) / len(_test_m) / 1e3),
+           '$ per month, hedged ($k)': float(np.nansum(hv[_tm] * _pb_u[_tm]) / len(_test_m) / 1e3), 'ex-ante daily sd, mean ($k)': float(sdv.mean() / 1e3) if len(sdv) else np.nan,
+           'gross DV01, mean ($k/bp)': float(np.nanmean(bk['dv01'][_tdays]) / 1e3), **{f'|factor {k + 1}| ($k)': float(np.abs(bk['E'][_tdays][:, _nT + k]).mean() / 1e3) for k in range(3)}}
+    res['hedged $ per $ of ex-ante sd'] = res['$ per month, hedged ($k)'] / res['ex-ante daily sd, mean ($k)'] if res['ex-ante daily sd, mean ($k)'] else np.nan
+    monthly = {}
+    for m in _test_m:
+        mm = _tm & (_month == m); km = keep & mm; fm = f & mm; dm = _tdays & (_pb_month == m); s_ = bk['sd'][dm]; s_ = s_[np.isfinite(s_)]
+        monthly[m] = {'cover saved': float((d_0 - d_v)[km].mean()) if km.any() else np.nan, 'hedged markout': float(np.nanmean((px + _hed_rec)[fm & np.isfinite(_hed_rec)])) if fm.any() else np.nan,
+                      'sd': float(s_.mean()) if len(s_) else np.nan}
+    return res, monthly
+
+
+_tg_rows, _tg_monthly = [], {}
+r0, m0 = tg_score('production (vanilla)', _opt_van, is_vanilla=True); _tg_rows.append(r0); _tg_monthly['production (vanilla)'] = m0
+for nm, o in BT_TG_OPTO.items():
+    r_, mm_ = tg_score(nm, o); _tg_rows.append(r_); _tg_monthly[nm] = mm_
+bt_tg = pd.DataFrame(_tg_rows).set_index('policy')
+_pass_rows = {}
+for nm, mm_ in _tg_monthly.items():
+    n_ok = 0
+    for m in _test_m:
+        a, b = mm_[m], m0[m]
+        c1 = np.isfinite(a['cover saved']) and a['cover saved'] >= TG_COVER_BP
+        c2 = (np.isfinite(a['sd']) and np.isfinite(b['sd']) and a['sd'] <= TG_SD_RATIO * b['sd']) or (np.isfinite(a['hedged markout']) and np.isfinite(b['hedged markout']) and a['hedged markout'] >= b['hedged markout'] + TG_MARKOUT_BP)
+        n_ok += int(c1 and c2)
+    _pass_rows[nm] = n_ok
+bt_tg['months passing'] = pd.Series(_pass_rows); bt_tg['passes'] = (bt_tg['months passing'] >= min(TG_MONTHS, len(_test_m))) & (bt_tg.index != 'production (vanilla)')
+bt_tg['ex-ante sd vs production'] = bt_tg['ex-ante daily sd, mean ($k)'] / r0['ex-ante daily sd, mean ($k)'] - 1.0
+bt_tg['hedged markout vs production (bp)'] = bt_tg['hedged markout per fill (bp)'] - r0['hedged markout per fill (bp)']
+_show_tg = ['win rate', 'vanilla wins kept', 'new wins', 'bp saved on kept cover wins', 'crossing on new wins (bp)', 'markout per fill, exit of record (bp)', 'hedged markout per fill (bp)', 'hedged markout vs production (bp)',
+            '$ per month, exit of record ($k)', '$ per month, hedged ($k)', 'ex-ante daily sd, mean ($k)', 'ex-ante sd vs production', 'gross DV01, mean ($k/bp)', 'hedged $ per $ of ex-ante sd', 'months passing', 'passes']
+print(f'TILTS ON THE MANUAL CHARGE at production\'s win rate, test months {_test_m[0]}..{_test_m[-1]}, exit of record = {EX_RECORD} ({GZ_LABEL} betas, {SIGMA_LABEL} Sigma):')
+display(bt_tg[_show_tg].round(4))
+_best_tg = bt_tg[bt_tg['passes']].sort_values('hedged $ per $ of ex-ante sd', ascending=False)
+BT_TG_VERDICT = f'{int(bt_tg["passes"].sum())} of {len(bt_tg) - 1} tilt settings pass the bar' + (f'; best by hedged $ per $ of risk: {_best_tg.index[0]}' if len(_best_tg) else '')
+print('VERDICT (lab_rfq_tilts):', BT_TG_VERDICT)
+# where a tilt moves the charge: by call bucket and by tenor, the mean charge minus manual for the m = 1 additive settings
+_cb_ = BT['call_bucket'].astype(str).to_numpy() if 'call_bucket' in BT else np.full(len(BT), 'NA')
+_mv_rows = []
+for tilt in TG_TILTS:
+    for m in _test_m:
+        r_, c_ = tg_charge(tilt, 'additive', 1.0, m); d_ = (-c_ - _liq[r_] - _rsk[r_]) - _man[r_]
+        for cell in np.unique(_cb_[r_]):
+            s_ = _cb_[r_] == cell; _mv_rows.append({'tilt': tilt, 'call bucket': cell, 'month': m, 'charge - manual (bp)': float(d_[s_].mean()), 'requests': int(s_.sum())})
+bt_tg_move = pd.DataFrame(_mv_rows).groupby(['tilt', 'call bucket'])['charge - manual (bp)'].mean().unstack('tilt')
+print('Where the additive m = 1 tilts move the charge against the traders (mean charge minus manual, bp, by call bucket):'); display(bt_tg_move.round(2))
+
+fig, ax = plt.subplots(1, 3, figsize=(22, 6))
+_cols_t = dict(zip(TG_TILTS, ['#4C72B0', '#55A868', '#C44E52', '#8172B3', '#937860']))
+for nm, r_ in bt_tg.drop(index='production (vanilla)').iterrows():
+    tilt, setting = nm.split(' | '); mk = 'o' if setting.startswith('additive') else 's'
+    ax[0].scatter(r_['ex-ante daily sd, mean ($k)'], r_['bp saved on kept cover wins'], marker=mk, color=_cols_t[tilt], s=40, label=f'{tilt}' if setting == 'additive 1' else None)
+    ax[1].scatter(r_['ex-ante daily sd, mean ($k)'], r_['hedged markout per fill (bp)'], marker=mk, color=_cols_t[tilt], s=40, label=f'{tilt}' if setting == 'additive 1' else None)
+for a_, yv_, lab in [(ax[0], r0['bp saved on kept cover wins'], 'cover saved on kept cover wins (bp)'), (ax[1], r0['hedged markout per fill (bp)'], 'hedged markout per fill, exit of record (bp)')]:
+    a_.scatter(r0['ex-ante daily sd, mean ($k)'], yv_, marker='*', s=220, color='#000000', zorder=4, label='production'); a_.axvline(TG_SD_RATIO * r0['ex-ante daily sd, mean ($k)'], color='#999999', ls='--', lw=0.8)
+    a_.set_xlabel(r'book ex-ante daily sd, mean (\$k)'); a_.set_ylabel(lab); a_.legend(fontsize=7)
+ax[0].set_title('Equal win rate: cover against book risk (circles additive, squares multiplicative; dashed = 0.9 x production)', fontsize=9); ax[1].set_title('Equal win rate: hedged markout against book risk', fontsize=10)
+_hr = bt_tg['hedged $ per $ of ex-ante sd']; ax[2].barh(_hr.index, _hr.to_numpy(float), color=['#000000' if i == 'production (vanilla)' else ('#55A868' if p else '#999999') for i, p in zip(_hr.index, bt_tg['passes'])])
+ax[2].set_title(r'Hedged \$ per \$ of ex-ante risk (green = passes the bar)', fontsize=10); ax[2].tick_params(axis='y', labelsize=7)
+savefig('14g_tilts')
+record('lab_rfq_tilts', table=flat_records(bt_tg), verdict=BT_TG_VERDICT, moves=flat_records(bt_tg_move.reset_index()), seconds=time.perf_counter() - _ts_t0)
+print(f'[22] {time.perf_counter() - _ts_t0:.0f}s')
 
 # %% [markdown]
 # ## 15. Registry and runtimes

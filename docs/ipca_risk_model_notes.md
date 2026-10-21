@@ -1,4 +1,4 @@
-# IPCA as the desk's risk model: lab v4.7 (Sections 14d, 14e and 14f)
+# IPCA as the desk's risk model: lab v4.8 (Sections 14d to 14g)
 
 Companion to `muni_ipca_factor_lab.py` / `.ipynb`. The notebook in the repo is the v4 lab reconstructed from
 `muni_ipca_factor_lab_v4.html` (markdown cells re-derived from the rendered html, code cells verbatim) with two new
@@ -81,6 +81,25 @@ anchors and the own-print lookup (cached stage `lab_rfq_exits_own10`) to dominat
 What only the real run will show: which comparable-bond exit validates best and with what MAE against the own print
 (if none reaches 50% coverage, the bucket is the record by construction); whether any variant survives the exit of
 record and the guard; and the hedge contribution under the exit of record, which no longer carries the S-side bid-offer.
+
+## 14g: the manual charge kept and tilted (added in v4.8)
+
+14c and 14e [17] replaced the manual charge and lost the traders' call-bucket information; the risk-aware charge of 14b and
+14e [16] kept it but could only add to it. 14g keeps every request's manual charge, tilts it with a model quantity, and
+removes the level effect of the tilt with a constant width set by bisection so that each month's win rate on winnable
+requests equals production's (in-sample level, as the 14c calibration was). What remains is pure re-allocation at the same
+number of wins.
+
+| Cell | What it builds | Pre-registered bar | Objects it leaves |
+|---|---|---|---|
+| 14g [21] | five tilts: systematic vol and idiosyncratic vol ([13] betas, [14] Sigma); the signed factor covariance of the fill with production's own start-of-day book (two-sided: cheaper on a fill that offsets the book's factor exposure); the trailing 40-day correlation of the bond's residual with its 20 beta-space peers' median residual (the dependence tier the Section 12 copula models); 1 / (0.25 + years to call) on callable bonds. Four settings each: additive at 0.5, 1 and 2 times sd(manual) / sd(g), and multiplicative manual x exp(0.5 z). Requoted through the production optimizer, then levelled (cached stage `lab_rfq_tilts`) | none; a construction | `TG_TILTS`, `BT_TG_OPTO` (optimal yields with the width folded in), `bt_tg_level` |
+| 14g [22] | each setting at production's win rate on the test months: vanilla wins kept, cover saved on kept cover wins, crossing on new wins, markout per fill under the exit of record (raw and hedged by the MMD move at tenor), ex-ante daily sd of the policy's own book, gross DV01, factor exposures, hedged dollars per dollar of ex-ante sd; where each tilt moves the charge against the traders by call bucket | cover saved on kept cover wins >= -0.5 bp and either ex-ante sd <= 0.9 x production's or hedged markout per fill >= production's + 1 bp, in >= 4 of the 5 test months | `bt_tg`, `bt_tg_move`, registry `lab_rfq_tilts` |
+
+The headline metric is hedged dollars per dollar of ex-ante risk under the exit of record, which a DV01-per-fill tilt cannot
+game; DV01 is a reported column. On the synthetic smoke run all twenty settings level to production's win rate within
+0.15 points, none passes the bar, and the time-to-call tilt moves the charge up on the 3-to-12-month call buckets and down
+on bullets, which is the direction the 14e regression said the traders already price. Runtime on the synthetic scale:
+[21] 2 s for 100 requotes, [22] 2 s; at the lab's scale expect about 3 minutes for [21], cached after the first run.
 
 ## Definitions worth having in one place
 
