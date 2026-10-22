@@ -1,4 +1,4 @@
-# muni_ipca_factor_lab.py: lab v4.9. Cells 1 to 15 reconstructed from the v4 run (muni_ipca_factor_lab_v4.html; markdown re-derived from the rendered cells, code verbatim);
+# muni_ipca_factor_lab.py: lab v4.9.1. Cells 1 to 15 reconstructed from the v4 run (muni_ipca_factor_lab_v4.html; markdown re-derived from the rendered cells, code verbatim);
 # Sections 14d to 14g and 17 are new; Section 16 is lifted from the lab machine's run (muni_ipca_factor_lab (1).html) and needs its pipeline functions. Percent format; regenerate the .ipynb with the converter in docs/ipca_risk_model_notes.md.
 
 # %% [markdown]
@@ -6962,18 +6962,27 @@ for key, nm in _est_names.items():
             if r.sum() < 50:
                 continue
             e = pred[r] - tgt[r]; sl = np.polyfit(pred[r], tgt[r], 1)[0] if np.std(pred[r]) > 0 else np.nan
-            _val_rows.append({'estimator': nm, 'target': tgt_nm, 'month': m_, 'requests': int(r.sum()), 'coverage of winnable': float(np.isfinite(pred[_winable]).mean()),
+            _val_rows.append({'estimator': nm, 'target': tgt_nm, 'month': m_, 'requests': int(r.sum()), 'level coverage of winnable': float(np.isfinite(pred[_winable]).mean()),
+                              'markout coverage of winnable': float((np.isfinite(pred) & np.isfinite(BT_ANCHOR))[_winable].mean()),
+                              'level coverage, anchored winnable': float(np.isfinite(pred[_val_base]).mean()),
                               'bias (bp)': float(e.mean()), 'MAE (bp)': float(np.abs(e).mean()), 'slope': float(sl), 'corr': float(np.corrcoef(pred[r], tgt[r])[0, 1])})
 bt_exit_val = pd.DataFrame(_val_rows).set_index(['target', 'estimator', 'month'])
 _pooled = bt_exit_val.xs('own P print', level='target').xs('ALL', level='month')
 print(f'Validation at h = {BT_H_RECORD} against the realised own P print within {EX_H_OWN} business days (winnable requests with an anchor; MAE and bias in bp of the deviation from the anchor):')
 display(_pooled.round(3))
 print('... by month, MAE against the own P print:'); display(bt_exit_val.xs('own P print', level='target')['MAE (bp)'].unstack('month').round(2))
-_cands = [k for k in [f'bucket P h={BT_H_RECORD}', f'IPCA peers P h={BT_H_RECORD}', f'factor / MMD h={BT_H_RECORD}'] if _est_names[k] in _pooled.index and _pooled.loc[_est_names[k], 'coverage of winnable'] >= EX_MIN_COVER]
+# v4.9.1: the coverage rule is on the markout, which needs the anchor as well as the level. The anchor is common to every estimator, so the rule compares the
+# estimators on the level's coverage of the anchored winnable requests, and the markout coverage (the sample every delta of 14f and 14g is scored on) is
+# reported with the pick rather than hidden behind the level's coverage of all winnable requests.
+_anchor_cov = float(np.isfinite(BT_ANCHOR[_winable]).mean())
+_cands = [k for k in [f'bucket P h={BT_H_RECORD}', f'IPCA peers P h={BT_H_RECORD}', f'factor / MMD h={BT_H_RECORD}'] if _est_names[k] in _pooled.index and _pooled.loc[_est_names[k], 'level coverage, anchored winnable'] >= EX_MIN_COVER]
 EX_RECORD_KEY = min(_cands, key=lambda k: _pooled.loc[_est_names[k], 'MAE (bp)']) if _cands else f'bucket P h={BT_H_RECORD}'
 EX_GUARD_KEY = f'bucket P h={BT_H_RECORD}'
-print(f'EXIT OF RECORD (lab_exit_of_record): {_est_names[EX_RECORD_KEY]} (lowest pooled MAE among comparable-bond mark-to-P estimators with coverage >= {EX_MIN_COVER:.0%}); '
+EX_MARKOUT_COV = float(_pooled.loc[_est_names[EX_RECORD_KEY], 'markout coverage of winnable']) if _est_names[EX_RECORD_KEY] in _pooled.index else float((np.isfinite(BT_EXIT_LVL[EX_RECORD_KEY]) & np.isfinite(BT_ANCHOR))[_winable].mean())
+print(f'EXIT OF RECORD (lab_exit_of_record): {_est_names[EX_RECORD_KEY]} (lowest pooled MAE among comparable-bond mark-to-P estimators whose level covers >= {EX_MIN_COVER:.0%} of the anchored winnable requests); '
       f'circularity guard: {_est_names[EX_GUARD_KEY]}')
+print(f'... anchors exist on {_anchor_cov:.1%} of winnable requests, so the markout of record exists on {EX_MARKOUT_COV:.1%} of them: every delta in 14f, 14g and 17 is scored on that sample'
+      + (' (below the 50% the rule asks of the level; the leaderboard\'s P&L sample share carries it)' if EX_MARKOUT_COV < EX_MIN_COVER else ''))
 
 # ---- markouts per estimator in the Section 14 convention: M = 100 (y_trade - exit level), positive = the bond richened after the trade
 BT_M_EXIT = {'lab other side (14)': _M}
@@ -6998,7 +7007,7 @@ ax[1].scatter(BT_EXIT_LVL[EX_RECORD_KEY][_sm], _own_devP[_sm], s=3, alpha=0.3, c
 ax[1].set_xlim(-80, 80); ax[1].set_ylim(-150, 150); ax[1].set_xlabel(f'{EX_RECORD}: predicted deviation (bp)'); ax[1].set_ylabel('realised own P print deviation (bp)'); ax[1].set_title('Exit of record against the realised own print', fontsize=10)
 _cv = _cov_tab['coverage of winnable requests']; ax[2].barh(_cv.index, _cv.to_numpy(), color='#55A868'); ax[2].set_xlim(0, 1); ax[2].set_title('Coverage of winnable requests by exit', fontsize=10); ax[2].tick_params(axis='y', labelsize=8)
 savefig('14f_exit_validation')
-record('lab_exit_of_record', validation=flat_records(bt_exit_val.reset_index()), exit_of_record=EX_RECORD, guard=EX_GUARD, coverage=flat_records(_cov_tab), buckets=int(len(_bk_names)),
+record('lab_exit_of_record', markout_coverage_winnable=EX_MARKOUT_COV, validation=flat_records(bt_exit_val.reset_index()), exit_of_record=EX_RECORD, guard=EX_GUARD, coverage=flat_records(_cov_tab), buckets=int(len(_bk_names)),
        anchor_coverage_winnable=float(np.isfinite(BT_ANCHOR[_winable]).mean()), seconds=time.perf_counter() - _ef_t0)
 print(f'[19] {time.perf_counter() - _ef_t0:.0f}s')
 
@@ -7253,11 +7262,13 @@ def tg_score(name: str, opto_final: np.ndarray, is_vanilla: bool = False) -> tup
     pv = np.where(win & _tm, px + _MREC, 0.0); pv[_tm & _winable & ~np.isfinite(_MREC)] = np.nan
     hv = np.where(win & _tm, px + _hed_rec, 0.0); hv[_tm & _winable & ~np.isfinite(_hed_rec)] = np.nan
     bk = bt_book_g(win, BT_EXPO_GZ, BT_V_C, BT_SIGMA_C); sdv = bk['sd'][_tdays]; sdv = sdv[np.isfinite(sdv)]
-    f = win & _tm & np.isfinite(_MREC)
+    f = win & _tm & np.isfinite(_MREC); f_g = win & _tm & np.isfinite(_MGUARD); f_o = win & _tm & np.isfinite(_M); f_hg = f_g & np.isfinite(_mmd5)
     res = {'policy': name, 'win rate': float(win[_tm].sum() / _tm.sum()), 'vanilla wins kept': float((win & _wv0 & _tm).sum() / max(int((_wv0 & _tm).sum()), 1)), 'new wins': int((win & ~_wv0 & _tm).sum()),
            'bp left on kept cover wins': float(d_v[keep].mean()) if keep.any() else np.nan, 'bp saved on kept cover wins': float((d_0 - d_v)[keep].mean()) if keep.any() else np.nan,
            'crossing on new wins (bp)': float(-d_v[newl].mean()) if newl.any() else np.nan, 'markout per fill, exit of record (bp)': float(np.nanmean((px + _MREC)[f])),
            'hedged markout per fill (bp)': float(np.nanmean((px + _hed_rec)[f & np.isfinite(_hed_rec)])), '$ per month, exit of record ($k)': float(np.nansum(pv[_tm] * _pb_u[_tm]) / len(_test_m) / 1e3),
+           'markout per fill, guard (bp)': float(np.nanmean((px + _MGUARD)[f_g])) if f_g.any() else np.nan, 'hedged markout per fill, guard (bp)': float(np.nanmean((px + _MGUARD + _mmd5)[f_hg])) if f_hg.any() else np.nan,
+           'markout per fill, lab other side (bp)': float(np.nanmean((px + _M)[f_o])) if f_o.any() else np.nan,
            '$ per month, hedged ($k)': float(np.nansum(hv[_tm] * _pb_u[_tm]) / len(_test_m) / 1e3), 'ex-ante daily sd, mean ($k)': float(sdv.mean() / 1e3) if len(sdv) else np.nan,
            'gross DV01, mean ($k/bp)': float(np.nanmean(bk['dv01'][_tdays]) / 1e3), **{f'|factor {k + 1}| ($k)': float(np.abs(bk['E'][_tdays][:, _nT + k]).mean() / 1e3) for k in range(3)}}
     res['hedged $ per $ of ex-ante sd'] = res['$ per month, hedged ($k)'] / res['ex-ante daily sd, mean ($k)'] if res['ex-ante daily sd, mean ($k)'] else np.nan
@@ -7286,12 +7297,17 @@ for nm, mm_ in _tg_monthly.items():
 bt_tg['months passing'] = pd.Series(_pass_rows); bt_tg['passes'] = (bt_tg['months passing'] >= min(TG_MONTHS, len(_test_m))) & (bt_tg.index != 'production (vanilla)')
 bt_tg['ex-ante sd vs production'] = bt_tg['ex-ante daily sd, mean ($k)'] / r0['ex-ante daily sd, mean ($k)'] - 1.0
 bt_tg['hedged markout vs production (bp)'] = bt_tg['hedged markout per fill (bp)'] - r0['hedged markout per fill (bp)']
+for _c_ in ('markout per fill, guard (bp)', 'hedged markout per fill, guard (bp)', 'markout per fill, lab other side (bp)'):   # v4.9.1: the same result under the guard and the lab's other-side exit
+    bt_tg[_c_.replace('per fill', 'vs production')] = bt_tg[_c_] - r0[_c_]
+bt_tg['guard agrees'] = np.sign(bt_tg['hedged markout vs production, guard (bp)']).eq(np.sign(bt_tg['hedged markout vs production (bp)'])) & (bt_tg.index != 'production (vanilla)')
 _show_tg = ['win rate', 'vanilla wins kept', 'new wins', 'bp saved on kept cover wins', 'crossing on new wins (bp)', 'markout per fill, exit of record (bp)', 'hedged markout per fill (bp)', 'hedged markout vs production (bp)',
+            'hedged markout vs production, guard (bp)', 'markout vs production, lab other side (bp)', 'guard agrees',
             '$ per month, exit of record ($k)', '$ per month, hedged ($k)', 'ex-ante daily sd, mean ($k)', 'ex-ante sd vs production', 'gross DV01, mean ($k/bp)', 'hedged $ per $ of ex-ante sd', 'months passing', 'passes']
 print(f'TILTS ON THE MANUAL CHARGE at production\'s win rate, test months {_test_m[0]}..{_test_m[-1]}, exit of record = {EX_RECORD} ({GZ_LABEL} betas, {SIGMA_LABEL} Sigma):')
 display(bt_tg[_show_tg].round(4))
 _best_tg = bt_tg[bt_tg['passes']].sort_values('hedged $ per $ of ex-ante sd', ascending=False)
-BT_TG_VERDICT = f'{int(bt_tg["passes"].sum())} of {len(bt_tg) - 1} tilt settings pass the bar' + (f'; best by hedged $ per $ of risk: {_best_tg.index[0]}' if len(_best_tg) else '')
+BT_TG_VERDICT = (f'{int(bt_tg["passes"].sum())} of {len(bt_tg) - 1} tilt settings pass the bar' + (f'; best by hedged $ per $ of risk: {_best_tg.index[0]}' if len(_best_tg) else '')
+                 + (f'; the guard exit agrees on the sign of the hedged markout for {int((bt_tg["guard agrees"] & bt_tg["passes"]).sum())} of the passing settings' if bt_tg['passes'].any() else ''))
 print('VERDICT (lab_rfq_tilts):', BT_TG_VERDICT)
 # where a tilt moves the charge: by call bucket and by tenor, the mean charge minus manual for the m = 1 additive settings
 _cb_ = BT['call_bucket'].astype(str).to_numpy() if 'call_bucket' in BT else np.full(len(BT), 'NA')

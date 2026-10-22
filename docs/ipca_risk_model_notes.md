@@ -1,4 +1,4 @@
-# IPCA as the desk's risk model: lab v4.9 (Sections 14d to 14g, 16 and 17)
+# IPCA as the desk's risk model: lab v4.9.1 (Sections 14d to 14g, 16 and 17)
 
 Companion to `muni_ipca_factor_lab.py` / `.ipynb`. The notebook in the repo is the v4 lab reconstructed from
 `muni_ipca_factor_lab_v4.html` (markdown cells re-derived from the rendered html, code cells verbatim) with the new
@@ -214,9 +214,24 @@ reallocation passes. None of those numbers mean anything for the desk; they only
   estimator tracks the realised sale (MAE and slope), and whether the realised round trip falls with the bp left on the
   table. The re-score at the realised horizon runs `ex_peer_levels` once more at the new h over every request; at h = 10
   expect about twice the 14f [19] peer-level time.
-- Three fixes still owed from the real run of 14f, 14g and 16: the 14f coverage rule tests the peer level's coverage
-  (98 percent) rather than the markout's (44 percent, anchors on 43 percent of requests); the 14g table carries no guard
-  or other-side columns; the 16d link should be retired in favour of the Section 17 match.
+- One item still owed from the real run of 16: the 16d link (60-second window, exact par, 59 links) should be retired
+  in favour of the Section 17 match. The 14g tilts are not yet re-scored at the realised horizon.
+
+## v4.9.1: two fixes from the real run of 14f and 14g
+
+- **14f coverage rule.** The pick of the exit of record required coverage of at least 50 percent of winnable requests
+  and tested the level's coverage (98 percent on the real run after widening to the bucket) although the markout also
+  needs the anchor, which exists on 43 percent of requests. An unconditional 50 percent rule on the markout would reject
+  every candidate, the fallback included, since the anchor is common to all of them. The rule now compares the estimators
+  on the level's coverage of the *anchored* winnable requests, and the markout coverage of the record exit is printed
+  with the pick and recorded (`markout_coverage_winnable` in `lab_exit_of_record`), with a note that every delta in 14f,
+  14g and 17 is scored on that sample. The validation table carries three columns: level coverage of winnable, level
+  coverage of anchored winnable, markout coverage of winnable. On the real run this changes the printed numbers and
+  not the pick.
+- **14g guard and other-side columns.** `bt_tg` now carries the markout per fill under the circularity guard (bucket
+  mark-to-P, raw and hedged) and under the lab's other-side exit of Section 14, their differences to production, and a
+  `guard agrees` flag (same sign of the hedged markout vs production under the record exit and under the guard). The
+  verdict line says for how many passing settings the guard agrees. The bar is unchanged.
 
 ## Assumptions made without the data
 
