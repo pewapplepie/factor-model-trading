@@ -1,5 +1,5 @@
-# muni_ipca_factor_lab.py: lab v4.8. Cells 1 to 15 reconstructed from the v4 run (muni_ipca_factor_lab_v4.html; markdown re-derived from the rendered cells, code verbatim);
-# Sections 14d to 14g are new. Percent format; regenerate the .ipynb with the converter in docs/ipca_risk_model_notes.md.
+# muni_ipca_factor_lab.py: lab v4.9. Cells 1 to 15 reconstructed from the v4 run (muni_ipca_factor_lab_v4.html; markdown re-derived from the rendered cells, code verbatim);
+# Sections 14d to 14g and 17 are new; Section 16 is lifted from the lab machine's run (muni_ipca_factor_lab (1).html) and needs its pipeline functions. Percent format; regenerate the .ipynb with the converter in docs/ipca_risk_model_notes.md.
 
 # %% [markdown]
 # # Muni IPCA factor lab: the factor model from data to factor premia
@@ -23,6 +23,8 @@
 # | 12 | Residual dependence after the factors: a factor-structured vine copula (global, peer, bond), tail dependence and the conditional PIT |
 # | 13 | RFQ P&L: the state-space, level and relative-value signals on the desk's requests; selection, a quote skew, a holding rule (`docs/rfq_*.md`) |
 # | 14 | RFQ backtest: the production optimizer replayed on every bid request, then variants against it (`docs/rfq_backtest_framework.html`) |
+# | 16 | Live WFTrade: the AM60 inventory book replayed from the desk's fills; its realised P&L (execution edge, inventory, carry) beside the modeled vanilla P&L |
+# | 17 | Realised round trips from WFTrade matched to the won requests; every exit estimator validated against the realised sale; the realised and the policy scorecards |
 # | 15 | Registry and runtimes |
 #
 # **Spec.** The record spec `ipca_v3_k3_xmmd` (K = 3, excess-over-MMD target, monthly refit). Change `spec_version`
@@ -7317,6 +7319,504 @@ ax[2].set_title(r'Hedged \$ per \$ of ex-ante risk (green = passes the bar)', fo
 savefig('14g_tilts')
 record('lab_rfq_tilts', table=flat_records(bt_tg), verdict=BT_TG_VERDICT, moves=flat_records(bt_tg_move.reset_index()), seconds=time.perf_counter() - _ts_t0)
 print(f'[22] {time.perf_counter() - _ts_t0:.0f}s')
+
+# %% [markdown]
+# ## 16. Live WFTrade: the AM60 inventory book and its realised P&L
+#
+# **Source.** Pipeline source `wftrade`: every `muni.WFTrade` lifecycle event of the AM60 inventory, partitioned by record month. `mdp.load_wftrade` resolves each `trade_number` to its final state across all partitions, because an amendment or cancellation can be recorded in a later month than the trade it changes:
+#
+# - final state = last event by `sequence_no`, `log_timestamp`, `date_setter`;
+# - removed: cancellations (status, state, action, a real `cancel_timestamp` — the null is a 1970 sentinel — or `cancelled_by_id`), lifecycles superseded by an active amendment (`prev_trade_no`), non-terminal states (accepted: `CONFIRMED`, `SUBALLOCATED`), rows without positive amount, price and cash or a yield in [-5, 50];
+# - `ALLOC_BLOCK` parents are **kept**: they are inventory trades of this book and their suballocations are not in WFTrade. Excluding them left 7–10% of sales without inventory; including them leaves under 0.5% from June.
+#
+# The table records trades from 2026-04-03, including executions back to 2025-11-12. Those early executions warm the book up.
+#
+# **Book.** Per CUSIP, an average-cost position replayed in execution order. A buy adds par at its price; a sale closes par against the average cost and realises closed par / 100 × (sale price − average price). A sale larger than the long position has no observed cost basis and books nothing. These are not short sales: only 32% are followed by a buy in the same CUSIP, a median 32 days later. Months where more than 1% of sold par is uncovered are warm-up months; the headline uses the complete-book months.
+#
+# **P&L of record: daily mark-to-market** against the evaluated clean price (`ICEEval`, pipeline panel):
+#
+# | Component | Definition |
+# |---|---|
+# | execution edge | par / 100 × (mark − price) on buys, (price − mark) on sales, at the trade date's mark |
+# | inventory | overnight position × change in the mark |
+# | carry | overnight position × coupon × days / 360 (30/360 accrual) |
+#
+# Execution edge + inventory equals realised (average cost) + unrealised at the end of the window. The section checks this identity. Trade cash is not the P&L of record: cash − price is accrued interest, and coupons paid while a bond is held are not in WFTrade, so a cash difference understates carry.
+#
+# **What this validates.** The desk's actual inventory economics. It does not validate hypothetical quoting variants: `ecn_link_id` is blank, so no execution joins a request, and Section 14's policy results remain modeled markout P&L.
+
+# %%
+# 16a. AM60 fills from the pipeline (lifecycle-resolved) and the average-cost inventory book.
+WFTRADE_INVENTORY = PIPE.wftrade_inventory
+WFTRADE_END = CFG.end_date
+WFTRADE_FILLS, WFTRADE_AUDIT = mdp.load_wftrade(PIPE, exec_end=WFTRADE_END)
+WFTRADE_BOOK = mdp.build_inventory_book(WFTRADE_FILLS, uncovered='skip')
+WFTRADE_BOOK['month'] = WFTRADE_BOOK['exec_date_ny'].dt.to_period('M').astype(str)
+print(f'{WFTRADE_INVENTORY}: executions {WFTRADE_AUDIT["first execution"]} .. {WFTRADE_AUDIT["last execution"]} UTC; lifecycle audit:')
+display(WFTRADE_AUDIT.to_frame('value'))
+display(WFTRADE_FILLS.groupby(['side', 'trade_type', 'trade_subtype'], dropna=False).agg(fills=('trade_number', 'size'), par=('amount', 'sum')))
+
+_ws = WFTRADE_BOOK[WFTRADE_BOOK['side'].eq('ASK')].groupby('month').agg(sold_par=('amount', 'sum'), uncovered_par=('uncovered_par', 'sum'))
+_ws['uncovered share'] = _ws['uncovered_par'] / _ws['sold_par']
+# complete-book months: from the first month after which every month sells <= 1% of its par without inventory
+_ok_after = _ws['uncovered share'].le(0.01).astype(int)[::-1].cummin()[::-1].astype(bool)
+WFTRADE_COMPLETE_MONTHS = _ok_after.index[_ok_after].tolist()
+print(f'Sales without inventory in the book by month; complete-book months: {WFTRADE_COMPLETE_MONTHS[0]}..{WFTRADE_COMPLETE_MONTHS[-1]}')
+display(_ws.round(4))
+assert WFTRADE_BOOK['pos_after'].ge(-1e-6).all()
+
+# %%
+# 16b. Daily mark-to-market P&L of the book: execution edge, inventory and carry, against the evaluated clean price.
+def _d30360(a: pd.Series, b: pd.Series) -> np.ndarray:
+    d1 = a.dt.day.clip(upper=30).to_numpy()
+    d2 = b.dt.day.to_numpy()
+    d2 = np.where((d2 == 31) & (d1 == 30), 30, d2)
+    return 360 * (b.dt.year - a.dt.year).to_numpy() + 30 * (b.dt.month - a.dt.month).to_numpy() + (d2 - d1)
+
+
+_wb = WFTRADE_BOOK
+_mk = mdp.load_panel(PIPE, columns=['date', 'cusip', 'price', 'cpn'], end=WFTRADE_END, cusips=_wb['cusip'].unique(), categorical=False)
+_mk = (_mk.dropna(subset=['price']).assign(cusip=lambda d: d['cusip'].astype(str), date=lambda d: to_ns(d['date']))
+          .sort_values(['cusip', 'date']).drop_duplicates(['cusip', 'date'], keep='last'))
+_first = _wb.groupby('cusip')['exec_date_ny'].min().rename('first_trade').reset_index().assign(first_trade=lambda d: to_ns(d['first_trade']))
+_mk = _mk.merge(_first, on='cusip')
+_mk = _mk[_mk['date'] >= _mk['first_trade']].drop(columns='first_trade')
+
+# end-of-day position at each mark date, then the overnight leg between consecutive marks of the same bond
+_ev = _wb.groupby(['cusip', 'exec_date_ny'], sort=False).tail(1)[['cusip', 'exec_date_ny', 'pos_after']].assign(date=lambda d: to_ns(d['exec_date_ny']))
+_mk = pd.merge_asof(_mk.sort_values('date'), _ev[['cusip', 'date', 'pos_after']].sort_values('date'), on='date', by='cusip', direction='backward')
+_mk = _mk.sort_values(['cusip', 'date']).reset_index(drop=True)
+_g = _mk.groupby('cusip', sort=False)
+_mk['pos_prev'] = _g['pos_after'].shift().fillna(0.0)
+_mk['inventory'] = (_mk['pos_prev'] / 100.0 * (_mk['price'] - _g['price'].shift())).fillna(0.0)
+_mk['carry'] = _mk['pos_prev'] / 100.0 * _mk['cpn'].fillna(0.0) * _d30360(_g['date'].shift().fillna(_mk['date']), _mk['date']) / 360.0
+
+# each trade's reference mark: the bond's first mark on or after the trade date (its par is valued from there), else its last mark
+_tr = _wb.assign(date=to_ns(_wb['exec_date_ny']), eff_par=np.where(_wb['side'].eq('ASK'), _wb['amount'] - _wb['uncovered_par'], _wb['amount']),
+                 sgn=np.where(_wb['side'].eq('BID'), 1.0, -1.0))[['trade_number', 'cusip', 'side', 'date', 'price', 'amount', 'eff_par', 'sgn', 'month']]
+_tr = _tr.sort_values('date').reset_index(drop=True)
+_mref = _mk[['cusip', 'date', 'price']].rename(columns={'date': 'mark_date', 'price': 'mark'}).sort_values('mark_date')
+_fw = pd.merge_asof(_tr, _mref, left_on='date', right_on='mark_date', by='cusip', direction='forward')
+_bw = pd.merge_asof(_tr, _mref, left_on='date', right_on='mark_date', by='cusip', direction='backward')
+_tr['mark'] = _fw['mark'].fillna(_bw['mark']).to_numpy()
+_tr['mark_date'] = _fw['mark_date'].fillna(_bw['mark_date']).to_numpy()
+_tr['edge'] = _tr['sgn'] * _tr['eff_par'] / 100.0 * (_tr['mark'] - _tr['price'])
+WFTRADE_EDGE = _tr
+
+_e = _tr.dropna(subset=['mark']).groupby(['mark_date', 'side'])['edge'].sum().unstack(fill_value=0.0)
+WFTRADE_DAILY = pd.DataFrame({'edge, buys': _e.get('BID'), 'edge, sales': _e.get('ASK')}).join(
+    _mk.groupby('date')[['inventory', 'carry']].sum(), how='outer').fillna(0.0)
+WFTRADE_DAILY['marked long par'] = _mk.groupby('date')['pos_after'].sum().reindex(WFTRADE_DAILY.index).fillna(0.0)
+WFTRADE_DAILY['total'] = WFTRADE_DAILY[['edge, buys', 'edge, sales', 'inventory', 'carry']].sum(axis=1)
+WFTRADE_DAILY.index.name = 'date'
+
+# identity on bonds with marks: execution edge + inventory = realised (average cost) + unrealised at the last mark
+_marked = set(_mk['cusip'])
+_end = mdp.book_snapshot(_wb, WFTRADE_END)
+_end = _end[_end['cusip'].isin(_marked)]
+_last = _mk.groupby('cusip').tail(1).set_index('cusip')['price']
+_unreal = float((_end['position'] / 100.0 * (_last.reindex(_end['cusip']).to_numpy() - _end['avg_price'])).sum())
+_real = float(_wb.loc[_wb['cusip'].isin(_marked), 'price_pnl'].sum())
+_mtm = float(_tr['edge'].sum() + _mk['inventory'].sum())
+WFTRADE_IDENTITY = pd.Series({'execution edge + inventory': _mtm, 'realised, average cost': _real, 'unrealised at the last mark': _unreal,
+                              'difference': _mtm - _real - _unreal, 'bonds without any mark': _wb['cusip'].nunique() - len(_marked),
+                              'their traded par': float(_wb.loc[~_wb['cusip'].isin(_marked), 'amount'].sum()),
+                              'trades marked on the trade date (par share)': float(_tr.loc[_tr['mark_date'].eq(_tr['date']), 'amount'].sum() / _tr['amount'].sum())})
+print('Mark-to-market identity (dollars):'); display(WFTRADE_IDENTITY.to_frame('value'))
+assert abs(WFTRADE_IDENTITY['difference']) < 1.0 + 1e-6 * abs(_real + _unreal)
+
+# %%
+# 16c. The desk's realised economics: monthly P&L by component, the headline on complete-book months, per-trade edge.
+_d = WFTRADE_DAILY.copy()
+_d['month'] = _d.index.to_period('M').astype(str)
+_comp = ['edge, buys', 'edge, sales', 'inventory', 'carry', 'total']
+_wbm = WFTRADE_BOOK.groupby(['month', 'side'])['amount'].sum().unstack(fill_value=0.0)
+WFTRADE_MONTHLY = _d.groupby('month')[_comp].sum().join(_d.groupby('month')['marked long par'].mean().rename('mean long par'))
+WFTRADE_MONTHLY = WFTRADE_MONTHLY.join(_wbm.rename(columns={'BID': 'bought par', 'ASK': 'sold par'})).join(
+    WFTRADE_BOOK.groupby('month')['price_pnl'].sum().rename('realised, average cost'))
+WFTRADE_MONTHLY['uncovered sold share'] = (WFTRADE_BOOK[WFTRADE_BOOK['side'].eq('ASK')].groupby('month')['uncovered_par'].sum()
+                                           / WFTRADE_MONTHLY['sold par']).reindex(WFTRADE_MONTHLY.index)
+WFTRADE_MONTHLY['complete book'] = WFTRADE_MONTHLY.index.isin(WFTRADE_COMPLETE_MONTHS)
+print('Monthly mark-to-market P&L of the AM60 book ($; edge at the trade date\'s evaluated mark, inventory and carry on overnight positions):')
+display(WFTRADE_MONTHLY.round(0).astype({'complete book': bool}))
+
+_h = _d[_d['month'].isin(WFTRADE_COMPLETE_MONTHS)]
+_n_m = len(WFTRADE_COMPLETE_MONTHS)
+_traded = WFTRADE_BOOK.loc[WFTRADE_BOOK['month'].isin(WFTRADE_COMPLETE_MONTHS), 'amount'].sum()
+WFTRADE_SUMMARY = pd.Series({
+    'months': f'{WFTRADE_COMPLETE_MONTHS[0]}..{WFTRADE_COMPLETE_MONTHS[-1]} ({_n_m}, last partial)' if WFTRADE_END[8:] != '31' else f'{_n_m}',
+    'total P&L ($)': _h['total'].sum(), 'total P&L per month ($)': _h['total'].sum() / _n_m,
+    'execution edge ($)': _h['edge, buys'].sum() + _h['edge, sales'].sum(), 'inventory ($)': _h['inventory'].sum(), 'carry ($)': _h['carry'].sum(),
+    'execution edge per 100 par traded (points)': 100.0 * (_h['edge, buys'].sum() + _h['edge, sales'].sum()) / _traded,
+    'mean long inventory par ($)': _h['marked long par'].mean(),
+    'inventory P&L per 100 par held per month (points)': 100.0 * _h['inventory'].sum() / _h['marked long par'].mean() / _n_m,
+    'daily total: mean ($)': _h['total'].mean(), 'daily total: sd ($)': _h['total'].std(), 'daily total: NW t': nw_t(_h['total'].to_numpy()),
+    'daily total: share of days > 0': float(_h['total'].gt(0).mean()), 'worst day ($)': _h['total'].min(),
+    'annualised Sharpe of daily total': float(np.sqrt(252) * _h['total'].mean() / _h['total'].std()),
+    'daily inventory: NW t': nw_t(_h['inventory'].to_numpy()), 'daily edge: NW t': nw_t((_h['edge, buys'] + _h['edge, sales']).to_numpy()),
+}, name='value')
+print('HEADLINE, complete-book months:'); display(WFTRADE_SUMMARY.to_frame())
+
+_te = WFTRADE_EDGE.dropna(subset=['mark']).assign(points=lambda d: d['sgn'] * (d['mark'] - d['price']))
+_q = lambda s: s.quantile([.1, .25, .5, .75, .9])
+print('Per-trade edge against the evaluated mark (points per 100, positive = favourable to the desk):')
+display(_te.groupby('side')['points'].apply(_q).unstack().join(_te.groupby('side').apply(lambda g: np.average(g['points'], weights=g['amount']), include_groups=False).rename('par-weighted mean')))
+
+fig, ax = plt.subplots(1, 2, figsize=(20, 5))
+for c_, col in [('edge, buys', '#4C72B0'), ('edge, sales', '#C44E52'), ('inventory', '#937860'), ('carry', '#55A868'), ('total', '#000000')]:
+    ax[0].plot(_d.index, _d[c_].cumsum() / 1e3, color=col, lw=1.6 if c_ == 'total' else 1.0, label=c_)
+for m in WFTRADE_COMPLETE_MONTHS[:1]:
+    ax[0].axvline(pd.Timestamp(m), color='k', ls=':', lw=0.8)
+ax[0].axhline(0, color='k', lw=0.5); ax[0].legend(fontsize=8); ax[0].set_title('Cumulative mark-to-market P&L by component ($k; dotted = start of complete-book months)', fontsize=10)
+ax[1].plot(_d.index, _d['marked long par'] / 1e6, color='#4C72B0'); ax[1].set_title('Marked long inventory ($mm par)', fontsize=10)
+savefig('16_am60_book_pnl')
+
+# %%
+# 16d. RFQ-to-WFTrade linkage gate: request-level validation needs a direct key; timing coincidences are diagnostic only.
+_wft_key = WFTRADE_FILLS['ecn_link_id'].astype('string').str.strip() if 'ecn_link_id' in WFTRADE_FILLS else pd.Series(pd.NA, index=WFTRADE_FILLS.index, dtype='string')
+_wft_nonblank = _wft_key.notna() & _wft_key.ne('')
+_wb_bid = WFTRADE_FILLS.loc[WFTRADE_FILLS['side'].eq('BID'), ['trade_number', 'cusip', 'amount', 'execution_timestamp']].copy()
+_wb_bid['ts'] = pd.to_datetime(_wb_bid['execution_timestamp']).dt.tz_localize('UTC')
+_wb_bid['match_date'] = _wb_bid['ts'].dt.tz_convert('America/New_York').dt.date
+_wb_bid['match_amount'] = _wb_bid['amount'].round(0); _wb_bid['cusip'] = _wb_bid['cusip'].astype(str)
+_rq = BT[['cusip', 'quantity', 'rfq_received_time', 'won_logged']].copy().reset_index(names='bt_row')
+_rq['rfq_ts'] = pd.to_datetime(_rq['rfq_received_time'], utc=True, errors='coerce')
+_rq['match_date'] = _rq['rfq_ts'].dt.tz_convert('America/New_York').dt.date
+_rq['match_amount'] = pd.to_numeric(_rq['quantity'], errors='coerce').round(0); _rq['cusip'] = _rq['cusip'].astype(str)
+_cand = _rq.merge(_wb_bid, on=['cusip', 'match_date', 'match_amount'], how='inner')
+_cand['abs_gap'] = (_cand['ts'] - _cand['rfq_ts']).dt.total_seconds().abs()
+_cand = _cand[_cand.groupby('trade_number')['abs_gap'].rank(method='first').eq(1) & _cand.groupby('bt_row')['abs_gap'].rank(method='first').eq(1)]
+WFTRADE_RFQ_TIMING_LINKS = _cand[_cand['abs_gap'].le(60)]
+WFTRADE_RFQ_LINK_PASS = bool(_wft_nonblank.sum() >= 100)
+WFTRADE_RFQ_LINK_AUDIT = pd.Series({
+    'fills with a nonblank direct ECN link': int(_wft_nonblank.sum()),
+    'mutual-nearest CUSIP/par/date links within 60 seconds': len(WFTRADE_RFQ_TIMING_LINKS),
+    'timing-link logged-win agreement': float(WFTRADE_RFQ_TIMING_LINKS['won_logged'].mean()) if len(WFTRADE_RFQ_TIMING_LINKS) else np.nan,
+    'request-level execution validation passes': WFTRADE_RFQ_LINK_PASS,
+}, name='value')
+display(WFTRADE_RFQ_LINK_AUDIT.to_frame())
+
+# %%
+# 16e. The desk's realised P&L beside the backtest's modeled vanilla P&L, by month (levels only: no request-level join).
+_wv = _PPG['vanilla | full | k=0']
+_mod = pd.DataFrame({'month': _month, 'usd': _wv['usd_raw'], 'win': _wv['win']}).groupby('month').agg(
+    modeled_usd=('usd', lambda v: v.sum(min_count=1)), modeled_wins=('win', 'sum'))
+WFTRADE_MODELED_OBSERVED_MONTHLY = _mod.join(WFTRADE_MONTHLY[['total', 'edge, buys', 'edge, sales', 'inventory', 'carry', 'bought par', 'complete book']], how='inner')
+WFTRADE_MODELED_OBSERVED_MONTHLY['bought par / modeled wins'] = WFTRADE_MODELED_OBSERVED_MONTHLY['bought par'] / WFTRADE_MODELED_OBSERVED_MONTHLY['modeled_wins']
+_cmp = WFTRADE_MODELED_OBSERVED_MONTHLY[WFTRADE_MODELED_OBSERVED_MONTHLY['complete book']]
+_cr = lambda a, b: float(np.corrcoef(a, b)[0, 1]) if len(a) >= 3 else np.nan
+WFTRADE_VALIDATION_STATUS = {
+    'pnl_of_record': 'daily mark-to-market of the average-cost AM60 book against the evaluated clean price',
+    'complete_book_months': WFTRADE_COMPLETE_MONTHS,
+    'request_level_execution_validation': 'enabled' if WFTRADE_RFQ_LINK_PASS else 'disabled: no direct RFQ key on WFTrade',
+    'hypothetical_policy_pnl': 'modeled markout only; WFTrade cannot identify counterfactual fills',
+    'overlap_months': int(len(_cmp)),
+    'corr(modeled, realised total)': _cr(_cmp['modeled_usd'], _cmp['total']),
+    'corr(modeled, realised execution edge)': _cr(_cmp['modeled_usd'], _cmp['edge, buys'] + _cmp['edge, sales']),
+    'sign agreement (modeled, realised total)': float((np.sign(_cmp['modeled_usd']) == np.sign(_cmp['total'])).mean()) if len(_cmp) else np.nan,
+}
+print('Monthly: modeled vanilla P&L (backtest, all winnable requests) vs the realised book; complete-book months carry the comparison:')
+display(WFTRADE_MODELED_OBSERVED_MONTHLY.round(2))
+display(pd.Series(WFTRADE_VALIDATION_STATUS, name='value').to_frame())
+
+record('lab_wftrade_validation', source='pipeline wftrade (muni.WFTrade)', inventory=WFTRADE_INVENTORY, window_end=WFTRADE_END,
+       lifecycle_audit={k: (str(v) if isinstance(v, pd.Timestamp) else (v.item() if hasattr(v, 'item') else v)) for k, v in WFTRADE_AUDIT.items()},
+       identity={k: float(v) for k, v in WFTRADE_IDENTITY.items()},
+       summary={k: (v if isinstance(v, str) else float(v)) for k, v in WFTRADE_SUMMARY.items()},
+       monthly=flat_records(WFTRADE_MONTHLY.astype({'complete book': int})), rfq_link_audit={k: (v.item() if hasattr(v, 'item') else v) for k, v in WFTRADE_RFQ_LINK_AUDIT.items()},
+       modeled_vs_realised_monthly=flat_records(WFTRADE_MODELED_OBSERVED_MONTHLY.astype({'complete book': int})), status=WFTRADE_VALIDATION_STATUS)
+(ARTIFACTS / 'results_registry.json').write_text(json.dumps(REGISTRY, indent=2, default=str), encoding='utf-8')
+print('registry updated:', ARTIFACTS / 'results_registry.json')
+
+# %% [markdown]
+# ## 17. Realised round trips: the desk's own exits from WFTrade as the validation target, and the scorecards
+#
+# **Why.** Section 16 showed that WFTrade carries the desk's real exits: every AM60 sale, with its price, yield and time. Up to now every exit in the
+# backtest has been imputed, first from the bond's next other-side print (Section 14), then from comparable bonds' prints at a fixed five-day horizon
+# (14f). For production's own fills the imputation is no longer necessary. This section pairs each AM60 buy with the sales that close it, ties the buys
+# that came through the ECN to their requests, and uses the realised sale as the target against which every exit estimator is judged. The fixed-horizon
+# exit stays, but only for counterfactual fills, and its horizon is reset from the holding times the desk actually realises.
+#
+# **No ECN key is needed.** A won request and its WFTrade buy are the same trade on the same CUSIP, the same New York date, with the same par. The
+# 16d match found 59 links only because it also required the booking timestamp to sit within 60 seconds of the RFQ clock and exact par; here the match
+# is same day, exact par first, then the nearest par within 25 percent, one to one.
+#
+# **Round trips.** Within each CUSIP, buy lots are consumed by later sales first-in first-out, in execution order (the Section 16 book is average-cost;
+# FIFO is used here so that a lot keeps its own entry price and date). For a buy lot: the sold par, the par-weighted sale price, yield and date, the
+# par-weighted holding time in business days, and the remainder still held at the window end. In price points per 100 par the round trip splits exactly
+# into buy edge (mark at entry minus price), inventory (mark at exit minus mark at entry) and sale edge (price minus mark at exit); carry is added from
+# the coupon over the holding.
+#
+# **Beside P&L.** The scorecards carry the logged facts that need no exit at all: win rate, bp left on the table on wins with a cover, the distance to
+# the winning print on lost requests, and the crossing on new wins; for production's fills the realised round trip is reported by cover bucket, so that
+# "did we win by too much" is answered on real exits.
+#
+# | Cell | Content |
+# |---|---|
+# | [23] | FIFO round trips and holding times from WFTrade; the same-day CUSIP / par match to won requests; the realised holding-time distribution and the record horizon |
+# | [24] | every exit estimator validated against the realised sale (at five days and at the realised holding time); production's realised scorecard by month and by cover bucket; the Section 14 variants re-scored at the realised horizon; the policy scorecard |
+
+# %%
+CELL_T('17. Realised round trips from WFTrade, the request match, the realised holding time [23]')
+PRE_REGISTERED.update({
+    'lab_wftrade_roundtrips': ('fixed 2026-10-22 before scoring: AM60 fills from the Section 16 book (lifecycle-resolved, uncovered sales excluded from the paired par); within each CUSIP, '
+                               'buy lots consumed by later sales first-in first-out in execution order; per buy lot the sold par, the par-weighted sale price, yield and date, the '
+                               'par-weighted holding time in business days and the unsold remainder; round trip in points per 100 = sale price - buy price + coupon x holding / 360, '
+                               'split exactly into buy edge, inventory and sale edge against the evaluated mark (Section 16 marks); in yield bp = 100 (buy yield - sale yield) where '
+                               'both are logged; request match: won requests (algo_won) to AM60 BID fills on the same CUSIP and New York date, exact par first, then the nearest par '
+                               'within 25 percent, one to one; the realised holding-time distribution is par-weighted; the record horizon for counterfactual exits = the par-weighted '
+                               'median holding time of matched fills, rounded to the nearest of 1, 3, 5, 10, 20, 40, 60 business days'),
+})
+_rt_t0 = time.perf_counter()
+RT_PAR_TOL, RT_H_GRID = 0.25, (1, 3, 5, 10, 20, 40, 60)
+HAS_WFTRADE = all(k in globals() for k in ('WFTRADE_BOOK', 'WFTRADE_EDGE')) and len(WFTRADE_BOOK) > 0
+if not HAS_WFTRADE:
+    print('WFTrade objects not found (Section 16 did not run): Section 17 is skipped')
+    WF_LOTS, WF_MATCH, RT_HOLD_TAB = pd.DataFrame(), pd.DataFrame(), pd.DataFrame(); EX_H_REALISED = BT_H_RECORD
+else:
+    # ---- fills in execution order, with the mark at the trade from Section 16
+    _wf = WFTRADE_BOOK.copy()
+    for c_ in ('trade_number', 'cusip', 'side', 'amount', 'price', 'exec_date_ny'):
+        assert c_ in _wf.columns, f'WFTRADE_BOOK lacks {c_}'
+    _wf['cusip'] = _wf['cusip'].astype(str); _wf['date'] = to_ns(_wf['exec_date_ny']).dt.normalize()
+    _wf['yield'] = pd.to_numeric(_wf['yield'], errors='coerce') if 'yield' in _wf else np.nan
+    _wf['uncovered_par'] = pd.to_numeric(_wf['uncovered_par'], errors='coerce').fillna(0.0) if 'uncovered_par' in _wf else 0.0
+    _wf['par_eff'] = np.where(_wf['side'].eq('ASK'), _wf['amount'] - _wf['uncovered_par'], _wf['amount'])
+    _wf = _wf.merge(WFTRADE_EDGE[['trade_number', 'mark', 'mark_date']], on='trade_number', how='left')
+    _wf['ts'] = to_ns(_wf['execution_timestamp']) if 'execution_timestamp' in _wf else _wf['date']
+    _wf = _wf.sort_values(['cusip', 'ts', 'trade_number'], kind='stable').reset_index(drop=True)
+    _cpn_map = (_mk.groupby('cusip')['cpn'].first() if '_mk' in globals() and 'cpn' in _mk.columns else pd.Series(dtype=float))
+
+
+    def wf_fifo_pairs(f: pd.DataFrame) -> pd.DataFrame:
+        """(buy trade, sale trade, par) consumption pairs, first-in first-out within each CUSIP in execution order."""
+        rows = []
+        side = f['side'].to_numpy(); par = f['par_eff'].to_numpy(float); tn = f['trade_number'].to_numpy(); cus = f['cusip'].to_numpy()
+        start = np.r_[0, np.flatnonzero(cus[1:] != cus[:-1]) + 1, len(f)]
+        for a, b in zip(start[:-1], start[1:]):
+            q = []   # open lots: [trade_number, remaining par]
+            for i in range(a, b):
+                if side[i] == 'BID':
+                    if par[i] > 0:
+                        q.append([tn[i], par[i]])
+                else:
+                    rem = par[i]
+                    while rem > 1e-9 and q:
+                        take = min(rem, q[0][1]); rows.append((q[0][0], tn[i], take)); q[0][1] -= take; rem -= take
+                        if q[0][1] <= 1e-9:
+                            q.pop(0)
+        return pd.DataFrame(rows, columns=['buy_trade', 'sale_trade', 'par'])
+
+
+    WF_PAIRS = wf_fifo_pairs(_wf)
+    _buys = _wf[_wf['side'].eq('BID')].set_index('trade_number'); _sales = _wf[_wf['side'].eq('ASK')].set_index('trade_number')
+    _pp = WF_PAIRS.join(_sales[['date', 'price', 'yield', 'mark', 'ts']].rename(columns={'date': 'sale_date', 'price': 'sale_price', 'yield': 'sale_yield', 'mark': 'sale_mark', 'ts': 'sale_ts'}), on='sale_trade')
+    _pp = _pp.join(_buys[['date']].rename(columns={'date': 'buy_date'}), on='buy_trade')
+    _pp['hold_bdays'] = np.busday_count(_pp['buy_date'].to_numpy('datetime64[D]'), _pp['sale_date'].to_numpy('datetime64[D]'))
+    _w = _pp['par']
+    _agg = _pp.assign(wp=_w * _pp['sale_price'], wy=_w * _pp['sale_yield'], wm=_w * _pp['sale_mark'], wh=_w * _pp['hold_bdays'],
+                      wy_n=_w * np.isfinite(_pp['sale_yield']), wm_n=_w * np.isfinite(_pp['sale_mark'])).groupby('buy_trade').agg(
+        sold_par=('par', 'sum'), wp=('wp', 'sum'), wy=('wy', 'sum'), wm=('wm', 'sum'), wh=('wh', 'sum'), wy_n=('wy_n', 'sum'), wm_n=('wm_n', 'sum'), last_sale=('sale_date', 'max'))
+    WF_LOTS = _buys[['cusip', 'date', 'ts', 'amount', 'par_eff', 'price', 'yield', 'mark', 'mark_date', 'month']].rename(columns={'date': 'buy_date', 'price': 'buy_price', 'yield': 'buy_yield', 'mark': 'buy_mark'}).join(_agg, how='left')
+    WF_LOTS['sold_par'] = WF_LOTS['sold_par'].fillna(0.0)
+    WF_LOTS['exit_price'] = WF_LOTS['wp'] / WF_LOTS['sold_par'].where(WF_LOTS['sold_par'] > 0)
+    WF_LOTS['exit_yield'] = (WF_LOTS['wy'] / WF_LOTS['wy_n'].where(WF_LOTS['wy_n'] > 0))
+    WF_LOTS['exit_mark'] = (WF_LOTS['wm'] / WF_LOTS['wm_n'].where(WF_LOTS['wm_n'] > 0))
+    WF_LOTS['hold_bdays'] = WF_LOTS['wh'] / WF_LOTS['sold_par'].where(WF_LOTS['sold_par'] > 0)
+    WF_LOTS['remaining_par'] = (WF_LOTS['par_eff'] - WF_LOTS['sold_par']).clip(lower=0.0)
+    WF_LOTS['cpn'] = WF_LOTS['cusip'].map(_cpn_map).astype(float) if len(_cpn_map) else np.nan
+    WF_LOTS['carry_pts'] = (WF_LOTS['cpn'].fillna(0.0) * WF_LOTS['hold_bdays'] * 7.0 / 5.0 / 360.0)
+    WF_LOTS['buy_edge_pts'] = WF_LOTS['buy_mark'] - WF_LOTS['buy_price']
+    WF_LOTS['inventory_pts'] = WF_LOTS['exit_mark'] - WF_LOTS['buy_mark']
+    WF_LOTS['sale_edge_pts'] = WF_LOTS['exit_price'] - WF_LOTS['exit_mark']
+    WF_LOTS['roundtrip_pts'] = WF_LOTS['exit_price'] - WF_LOTS['buy_price'] + WF_LOTS['carry_pts']
+    WF_LOTS['roundtrip_bp'] = 100.0 * (WF_LOTS['buy_yield'] - WF_LOTS['exit_yield'])
+    WF_LOTS['roundtrip_usd'] = WF_LOTS['sold_par'] / 100.0 * WF_LOTS['roundtrip_pts']
+    WF_LOTS = WF_LOTS.drop(columns=['wp', 'wy', 'wm', 'wh', 'wy_n', 'wm_n']).reset_index().rename(columns={'trade_number': 'buy_trade'})
+    _closed = WF_LOTS['sold_par'] > 0
+    print(f'AM60 buy lots: {len(WF_LOTS):,} | closed in part or full by {WFTRADE_END}: {_closed.mean():.1%} of lots, {WF_LOTS["sold_par"].sum() / WF_LOTS["par_eff"].sum():.1%} of par | '
+          f'lots with a logged yield on both legs: {(np.isfinite(WF_LOTS["roundtrip_bp"])).mean():.1%}')
+    _id_chk = (WF_LOTS['buy_edge_pts'] + WF_LOTS['inventory_pts'] + WF_LOTS['sale_edge_pts'] - (WF_LOTS['exit_price'] - WF_LOTS['buy_price'])).abs().max()
+    print(f'identity buy edge + inventory + sale edge = sale price - buy price: max |difference| {_id_chk:.2e} points')
+
+    # ---- the request match: won requests to AM60 BID fills on the same CUSIP and New York date
+    _rq = BT.loc[BT['won_logged'], ['cusip', 'date', 'quantity', 'finalquoteyield', 'group', 'manual']].copy().reset_index(names='bt_row')
+    _rq['cusip'] = _rq['cusip'].astype(str); _rq['date'] = to_ns(_rq['date']).dt.normalize(); _rq['par'] = pd.to_numeric(_rq['quantity'], errors='coerce')
+    _bl = WF_LOTS[['buy_trade', 'cusip', 'buy_date', 'amount']].rename(columns={'buy_date': 'date', 'amount': 'par'})
+    _bl['date'] = to_ns(_bl['date']).dt.normalize()
+    _rq['k'] = _rq.groupby(['cusip', 'date', 'par']).cumcount(); _bl['k'] = _bl.groupby(['cusip', 'date', 'par']).cumcount()
+    _m1 = _rq.merge(_bl, on=['cusip', 'date', 'par', 'k'], how='inner').assign(match='exact par')
+    _rq2 = _rq[~_rq['bt_row'].isin(_m1['bt_row'])].drop(columns='k'); _bl2 = _bl[~_bl['buy_trade'].isin(_m1['buy_trade'])].drop(columns='k')
+    _c2 = _rq2.merge(_bl2.rename(columns={'par': 'par_wf'}), on=['cusip', 'date'], how='inner')
+    _c2['gap'] = (_c2['par_wf'] / _c2['par'] - 1.0).abs(); _c2 = _c2[_c2['gap'] <= RT_PAR_TOL]
+    _c2 = _c2[_c2.groupby('bt_row')['gap'].rank(method='first').eq(1) & _c2.groupby('buy_trade')['gap'].rank(method='first').eq(1)].assign(match='nearest par')
+    WF_MATCH = pd.concat([_m1[['bt_row', 'buy_trade', 'match']], _c2[['bt_row', 'buy_trade', 'match']]], ignore_index=True)
+    WF_MATCH = WF_MATCH.merge(WF_LOTS, on='buy_trade', how='left')
+    _cust_bid = int((_wf['side'].eq('BID') & _wf['trade_type'].astype(str).eq('CUSTOMER')).sum()) if 'trade_type' in _wf else int(_wf['side'].eq('BID').sum())
+    print(f'request match: {len(WF_MATCH):,} of {len(_rq):,} won requests matched to an AM60 buy ({len(_m1):,} exact par, {len(_c2):,} nearest par); '
+          f'{len(WF_MATCH) / max(_cust_bid, 1):.1%} of the {_cust_bid:,} customer BID fills; by month:')
+    _mm = _rq.assign(month=_rq['date'].dt.to_period('M').astype(str)).groupby('month').size().rename('won requests').to_frame()
+    _mm['matched'] = WF_MATCH.merge(_rq[['bt_row', 'date']], on='bt_row').assign(month=lambda d: d['date'].dt.to_period('M').astype(str)).groupby('month').size()
+    _mm['share'] = _mm['matched'] / _mm['won requests']; display(_mm.round(3))
+    _yc = WF_MATCH.merge(_rq[['bt_row', 'finalquoteyield']], on='bt_row'); _yc = _yc[np.isfinite(_yc['buy_yield'])]
+    if len(_yc):
+        _dy = 100.0 * (_yc['buy_yield'] - _yc['finalquoteyield'])
+        print(f'consistency of matched pairs: WFTrade buy yield - logged final quote yield: median {_dy.median():+.2f} bp, |d| <= 1 bp on {(_dy.abs() <= 1).mean():.1%}')
+
+    # ---- realised holding time and the record horizon
+    _cl = WF_MATCH[WF_MATCH['sold_par'] > 0].copy()
+    _cl = _cl.merge(BT[['tenor_bucket', 'call_bucket', 'qty_bucket']].reset_index(names='bt_row'), on='bt_row', how='left') if 'qty_bucket' in BT else _cl
+    _hold_rows = [{'segment': 'all matched fills', 'closed lots': len(_cl), 'par-weighted median (bdays)': float(np.interp(0.5, np.cumsum(_cl.sort_values('hold_bdays')['sold_par']) / _cl['sold_par'].sum(), _cl.sort_values('hold_bdays')['hold_bdays'])) if len(_cl) else np.nan,
+                   'median (bdays)': float(_cl['hold_bdays'].median()) if len(_cl) else np.nan, 'p25': float(_cl['hold_bdays'].quantile(0.25)) if len(_cl) else np.nan, 'p75': float(_cl['hold_bdays'].quantile(0.75)) if len(_cl) else np.nan,
+                   'share closed within 5 bdays': float((_cl['hold_bdays'] <= 5).mean()) if len(_cl) else np.nan}]
+    for dim in [c for c in ('call_bucket', 'tenor_bucket', 'qty_bucket') if c in _cl]:
+        for cell, g in _cl.groupby(_cl[dim].astype(str)):
+            if len(g) >= 30:
+                _hold_rows.append({'segment': f'{dim} = {cell}', 'closed lots': len(g), 'par-weighted median (bdays)': float(np.interp(0.5, np.cumsum(g.sort_values('hold_bdays')['sold_par']) / g['sold_par'].sum(), g.sort_values('hold_bdays')['hold_bdays'])),
+                                   'median (bdays)': float(g['hold_bdays'].median()), 'p25': float(g['hold_bdays'].quantile(0.25)), 'p75': float(g['hold_bdays'].quantile(0.75)), 'share closed within 5 bdays': float((g['hold_bdays'] <= 5).mean())})
+    RT_HOLD_TAB = pd.DataFrame(_hold_rows).set_index('segment')
+    _med_h = RT_HOLD_TAB.loc['all matched fills', 'par-weighted median (bdays)'] if len(_cl) else np.nan
+    EX_H_REALISED = int(min(RT_H_GRID, key=lambda h: abs(h - _med_h))) if np.isfinite(_med_h) else BT_H_RECORD
+    print(f'Realised holding time of matched fills (business days from buy to par-weighted sale): the record horizon for counterfactual exits becomes h = {EX_H_REALISED} '
+          f'(par-weighted median {_med_h:.1f} days; Section 14 assumed {BT_H_RECORD}):')
+    display(RT_HOLD_TAB.round(2))
+    fig, ax = plt.subplots(1, 3, figsize=(22, 5))
+    if len(_cl):
+        ax[0].hist(np.clip(_cl['hold_bdays'], 0, 120), bins=60, weights=_cl['sold_par'] / 1e6, color='#4C72B0'); ax[0].axvline(BT_H_RECORD, color='k', ls='--', lw=0.8, label=f'Section 14 horizon ({BT_H_RECORD})')
+        ax[0].axvline(_med_h, color='#C44E52', lw=1.0, label=f'par-weighted median ({_med_h:.0f})'); ax[0].legend(fontsize=8); ax[0].set_xlabel('holding time (business days, clipped at 120)'); ax[0].set_ylabel('sold par ($mm)')
+        ax[0].set_title('Realised holding time of production\'s fills', fontsize=10)
+        ax[1].scatter(_cl['buy_edge_pts'], _cl['sale_edge_pts'], s=3, alpha=0.3, color='#55A868'); ax[1].axhline(0, color='k', lw=0.5); ax[1].axvline(0, color='k', lw=0.5)
+        ax[1].set_xlabel('buy edge vs mark (points)'); ax[1].set_ylabel('sale edge vs mark (points)'); ax[1].set_xlim(-3, 3); ax[1].set_ylim(-3, 3); ax[1].set_title('Entry edge against exit edge, matched lots', fontsize=10)
+        _bym = _cl.assign(month=_cl['buy_date'].dt.to_period('M').astype(str)).groupby('month')[['buy_edge_pts', 'inventory_pts', 'sale_edge_pts', 'carry_pts']].mean()
+        _bot = np.zeros(len(_bym))
+        for c_, col in zip(_bym.columns, ['#4C72B0', '#937860', '#C44E52', '#55A868']):
+            v_ = _bym[c_].to_numpy(float); ax[2].bar(_bym.index, v_, bottom=np.where(v_ >= 0, np.maximum(_bot, 0), np.minimum(_bot, 0)), color=col, label=c_); _bot = _bot + v_
+        ax[2].plot(_bym.index, _bym.sum(axis=1), 'ko-', label='round trip'); ax[2].axhline(0, color='k', lw=0.5); ax[2].legend(fontsize=8); ax[2].set_title('Realised round trip per matched lot by buy month (points per 100)', fontsize=10)
+    savefig('17_roundtrips')
+    record('lab_wftrade_roundtrips', lots=int(len(WF_LOTS)), closed_share=float(_closed.mean()), matched=int(len(WF_MATCH)), won_requests=int(len(_rq)), match_by_month=flat_records(_mm),
+           holding=flat_records(RT_HOLD_TAB), record_horizon=EX_H_REALISED, seconds=time.perf_counter() - _rt_t0)
+print(f'[23] {time.perf_counter() - _rt_t0:.0f}s')
+
+# %%
+CELL_T('17. Exits validated against the realised sale; the realised and the policy scorecards [24]')
+PRE_REGISTERED.update({
+    'lab_wftrade_validation': ('fixed 2026-10-22 before scoring: target = the realised round trip of production\'s matched fills in yield bp, 100 (buy yield - par-weighted sale yield); '
+                               'every exit estimator of 14f (the lab other side, bucket and IPCA peers mark-to-P and mark-to-D at h = 5, factor / MMD, own P and own D within 10 days) '
+                               'compared at h = 5 and, for the bucket estimators, at the horizon nearest the lot\'s realised holding time from the grid 1, 3, 5, 10, 20, 40, 60: bias, MAE, '
+                               'correlation, slope, pooled and by holding-time bucket; the estimator of record for counterfactual fills becomes the one with the lowest MAE against the '
+                               'realised sale at the realised horizon with coverage >= 50 percent of matched fills; scorecards: production by month (win rate, cover left on wins with '
+                               'a cover, distance to the winning print on lost requests, realised round trip, holding time, buy and sale edge against the mark, the modeled markout on '
+                               'the same fills); realised round trip by cover bucket (0-1, 1-3, 3-10, > 10 bp left on the table; won without a cover; manual); policies: win rate, cover '
+                               'left, crossing on new wins, wins kept, delta under the exit of record and under the guard, ex-ante risk; the Section 14 variants re-scored with the estimator of record against '
+                               'realised sales at the record horizon of [23] (same bar: weekly NW t >= 3, >= 4 months positive, above the width frontier); the 14g tilts stay at h = 5'),
+})
+_rv_t0 = time.perf_counter()
+if not HAS_WFTRADE or len(WF_MATCH) == 0:
+    print('no matched fills: validation and the realised scorecard are skipped')
+    bt_exit_val_real, bt_real_month, bt_real_cover, bt_policy_card, bt_rh = (pd.DataFrame() for _ in range(5)); EX_RECORD_REALISED, EX_RECORD_H = EX_RECORD, f'{EX_RECORD} h={BT_H_RECORD}'
+else:
+    _ml = WF_MATCH[(WF_MATCH['sold_par'] > 0) & np.isfinite(WF_MATCH['roundtrip_bp'])].copy(); _ml['bt_row'] = _ml['bt_row'].astype(int)
+    _rows_ = _ml['bt_row'].to_numpy(); _target = _ml['roundtrip_bp'].to_numpy(float); _hold = _ml['hold_bdays'].to_numpy(float)
+    _hb = pd.cut(pd.Series(_hold), [-1, 5, 20, 60, np.inf], labels=['<= 5 days', '6-20', '21-60', '> 60']).astype(str).to_numpy()
+    # bucket exits at every horizon of the grid, for the matched rows
+    _bk_h = {}
+    for side in ('P', 'D'):
+        for h in RT_H_GRID:
+            lvl, _ = ex_bucket_levels(_tape, _rq_bk[_rows_], _rq_di[_rows_], h, side)
+            _bk_h[(side, h)] = 100.0 * (_y_tr[_rows_] - BT_ANCHOR[_rows_]) - lvl
+    _hn = np.array([min(RT_H_GRID, key=lambda g: abs(g - x)) for x in _hold])
+    _ests = {nm: M[_rows_] for nm, M in BT_M_EXIT.items() if nm in ('lab other side (14)', 'bucket, mark-to-P', 'IPCA peers, mark-to-P', 'factor / MMD', 'bucket, mark-to-D', 'IPCA peers, mark-to-D', 'own P within 10d', 'own D within 10d')}
+    for side in ('P', 'D'):
+        _ests[f'bucket, mark-to-{side} at realised horizon'] = np.array([_bk_h[(side, h)][i] for i, h in enumerate(_hn)])
+    _val_rows = []
+    for nm, pred in _ests.items():
+        for seg in ['ALL'] + sorted(set(_hb)):
+            r = np.isfinite(pred) & np.isfinite(_target) & ((_hb == seg) if seg != 'ALL' else True)
+            if r.sum() < 30:
+                continue
+            e = pred[r] - _target[r]
+            _val_rows.append({'estimator': nm, 'holding': seg, 'fills': int(r.sum()), 'coverage of matched': float(np.isfinite(pred).mean()), 'bias (bp)': float(e.mean()), 'MAE (bp)': float(np.abs(e).mean()),
+                              'corr': float(np.corrcoef(pred[r], _target[r])[0, 1]) if np.std(pred[r]) > 0 else np.nan, 'slope': float(np.polyfit(pred[r], _target[r], 1)[0]) if np.std(pred[r]) > 0 else np.nan})
+    bt_exit_val_real = pd.DataFrame(_val_rows).set_index(['estimator', 'holding'])
+    _pooled_r = bt_exit_val_real.xs('ALL', level='holding') if 'ALL' in bt_exit_val_real.index.get_level_values('holding') else pd.DataFrame()
+    print(f'Every exit estimator against the realised round trip of production\'s matched fills ({len(_ml):,} closed lots with both yields; target mean {np.nanmean(_target):+.1f} bp, sd {np.nanstd(_target):.1f}):')
+    display(_pooled_r.round(3))
+    _HOLD_ORDER = ['<= 5 days', '6-20', '21-60', '> 60', 'ALL']
+    _mae_tab = bt_exit_val_real['MAE (bp)'].unstack('holding'); _mae_tab = _mae_tab[[c for c in _HOLD_ORDER if c in _mae_tab.columns]]
+    print('... MAE by realised holding-time bucket:'); display(_mae_tab.round(2))
+    _cands_r = [n for n in _pooled_r.index if n not in ('own P within 10d', 'own D within 10d', 'lab other side (14)') and _pooled_r.loc[n, 'coverage of matched'] >= 0.5]
+    EX_RECORD_REALISED = min(_cands_r, key=lambda n: _pooled_r.loc[n, 'MAE (bp)']) if _cands_r else EX_RECORD
+    print(f'ESTIMATOR OF RECORD against realised sales (lab_wftrade_validation): {EX_RECORD_REALISED} (14f chose {EX_RECORD} against the next own P print)')
+
+    # ---- production's realised scorecard by month: logged facts beside the realised round trip
+    _ov0 = bt_outcomes(BT, BT['y_vanilla'])
+    _bt_m = pd.DataFrame({'month': _month, 'won': _wv0, 'winnable': _winable, 'group': _grp, 'd_bp': _ov0['d_bp'].to_numpy(float), 'manual': BT['manual'].to_numpy(bool)})
+    _sc = _bt_m.groupby('month').apply(lambda g: pd.Series({'requests': len(g), 'win rate': g['won'].mean(), 'cover left on won-with-cover, mean (bp)': g.loc[g['group'].eq('won, cover'), 'd_bp'].mean(),
+                                                            'cover left, median (bp)': g.loc[g['group'].eq('won, cover'), 'd_bp'].median(), 'short of the winning print on lost, median (bp)': -g.loc[g['group'].eq('lost, printed'), 'd_bp'].median()}), include_groups=False)
+    _mlm = _ml.assign(month=_ml['buy_date'].dt.to_period('M').astype(str), rec=_ests[EX_RECORD][np.arange(len(_ml))] if EX_RECORD in _ests else np.nan, other=_ests['lab other side (14)'])
+    _rs = _mlm.groupby('month').agg(**{'matched closed lots': ('bt_row', 'size'), 'realised round trip, mean (bp)': ('roundtrip_bp', 'mean'), 'realised round trip, median (bp)': ('roundtrip_bp', 'median'),
+                                       'realised round trip (points)': ('roundtrip_pts', 'mean'), 'holding, median (bdays)': ('hold_bdays', 'median'), 'buy edge vs mark (points)': ('buy_edge_pts', 'mean'),
+                                       'sale edge vs mark (points)': ('sale_edge_pts', 'mean'), 'inventory (points)': ('inventory_pts', 'mean'), 'modeled, exit of record (bp)': ('rec', 'mean'), 'modeled, lab other side (bp)': ('other', 'mean')})
+    bt_real_month = _sc.join(_rs, how='left')
+    print('PRODUCTION SCORECARD by month: logged win rate, cover and print distance (no exit needed) beside the realised round trip of the matched fills and the modeled markouts on the same fills:')
+    display(bt_real_month.round(3))
+    # ---- did we win by too much? realised round trip by cover bucket
+    _mc = _ml.merge(_bt_m.reset_index(names='bt_row')[['bt_row', 'group', 'd_bp', 'manual']], on='bt_row', how='left')
+    _mc['cover bucket'] = np.where(_mc['group'].eq('won, no cover'), 'won, no cover', pd.cut(_mc['d_bp'], [-np.inf, 1, 3, 10, np.inf], labels=['0-1 bp', '1-3 bp', '3-10 bp', '> 10 bp']).astype(str))
+    _mc.loc[_mc['manual'], 'cover bucket'] = 'manual request'
+    bt_real_cover = _mc.groupby('cover bucket').agg(**{'lots': ('bt_row', 'size'), 'realised round trip (bp)': ('roundtrip_bp', 'mean'), 'realised round trip (points)': ('roundtrip_pts', 'mean'),
+                                                      'buy edge vs mark (points)': ('buy_edge_pts', 'mean'), 'sale edge vs mark (points)': ('sale_edge_pts', 'mean'), 'holding, median (bdays)': ('hold_bdays', 'median'),
+                                                      'NW t of the mean round trip': ('roundtrip_bp', lambda s: nw_t(s.to_numpy()))})
+    print('Realised round trip by how much we won by (bp left on the table against the cover): the adverse-selection question on real exits:'); display(bt_real_cover.round(3))
+
+    # ---- the Section 14 variants re-scored at the realised horizon, with the estimator of record against realised sales (the bucket fills in where the peers are thin, as in 14f)
+    _h_real, _side_real = int(EX_H_REALISED), ('D' if 'mark-to-D' in EX_RECORD_REALISED else 'P')
+    _lvl_real, _ = ex_bucket_levels(_tape, _rq_bk, _rq_di, _h_real, _side_real)
+    if 'IPCA peers' in EX_RECORD_REALISED:
+        _lvl_pr, _ = ex_peer_levels(ex_bond_daily(_tape, _side_real), _peers_rq, _rq_di, _h_real); _lvl_real = np.where(np.isfinite(_lvl_pr), _lvl_pr, _lvl_real)
+    _M_real = 100.0 * (_y_tr - BT_ANCHOR) - _lvl_real; EX_RECORD_H = f'{EX_RECORD_REALISED} h={_h_real}'
+    _rh_rows = []
+    for nm, v_ in BT_VARIANTS.items():
+        r_, _ = bt_score_f(nm, v_['y'], _M_real, {}, v_['family'])
+        _rh_rows.append({'policy': nm, 'months': r_['months'], 'delta at realised horizon (bp)': r_['delta per request (bp)'], 'NW t at realised horizon': r_['NW t (weekly)'],
+                         'months > 0 at realised horizon': r_['months > 0'], 'above width frontier at realised horizon (bp)': r_['above width frontier (bp)']})
+    bt_rh = pd.DataFrame(_rh_rows).set_index('policy')
+    bt_rh['passes at realised horizon'] = ((bt_rh['NW t at realised horizon'] >= BT_BAR_T) & (bt_rh['months > 0 at realised horizon'] >= np.minimum(BT_BAR_MONTHS, bt_rh['months']))
+                                          & (bt_rh['above width frontier at realised horizon (bp)'] >= 0) & (bt_rh.index != 'vanilla (production replay)'))
+    bt_rh = bt_rh.drop(columns='months')
+    print(f'Section 14 variants re-scored at the realised horizon: {EX_RECORD_H} (14f scored at {EX_RECORD}, h = {BT_H_RECORD}); markout coverage of winnable requests {np.isfinite(_M_real[_winable]).mean():.1%}:')
+    display(bt_rh.round(4))
+    print(f'VERDICT (lab_wftrade_validation): {int(bt_rh["passes at realised horizon"].sum())} of {len(bt_rh) - 1} variants pass at the realised horizon'
+          + (f': {bt_rh.index[bt_rh["passes at realised horizon"]].tolist()}' if bt_rh['passes at realised horizon'].any() else ''))
+
+    # ---- the policy scorecard: win rate, cover, crossing, wins kept, delta under the record and the guard, risk
+    _pc_rows = []
+    for nm in bt_board_f.index:
+        r_ = bt_board_f.loc[nm]; r0 = bt_board.loc[nm] if nm in bt_board.index else None
+        _pc_rows.append({'policy': nm, 'kind': 'variant (Section 14)', 'win rate': r_['win rate'], 'cover left on won-with-cover (bp)': (r0['bp left on table (won, cover)'] if r0 is not None else np.nan),
+                         'crossing on new wins (bp)': (r0['crossing on new wins (bp)'] if r0 is not None else np.nan), 'new wins': r_['new wins'], 'wins given up': r_['wins given up'],
+                         'delta, exit of record (bp)': r_['delta per request (bp)'], 'NW t': r_['NW t (weekly)'], f'delta, guard (bp)': r_[f'delta | {EX_GUARD} (bp)'], 'passes': bool(r_['passes, with the guard'])})
+    for nm in bt_tg.index:
+        r_ = bt_tg.loc[nm]
+        _pc_rows.append({'policy': nm, 'kind': 'tilt at equal win rate (14g)', 'win rate': r_['win rate'], 'cover left on won-with-cover (bp)': bt_board.loc['vanilla (production replay)', 'bp left on table (won, cover)'] - r_['bp saved on kept cover wins'],
+                         'crossing on new wins (bp)': r_['crossing on new wins (bp)'], 'wins kept': r_['vanilla wins kept'], 'new wins': r_['new wins'], 'hedged markout vs production (bp)': r_['hedged markout vs production (bp)'],
+                         'ex-ante sd vs production': r_['ex-ante sd vs production'], 'passes': bool(r_['passes'])})
+    bt_policy_card = pd.DataFrame(_pc_rows).set_index('policy').join(bt_rh[['delta at realised horizon (bp)', 'NW t at realised horizon', 'passes at realised horizon']], how='left')
+    print('POLICY SCORECARD: the logged facts (win rate, cover, crossing) beside the modeled deltas; a policy that wins more must also show where it crossed the print:'); display(bt_policy_card.round(4))
+
+    fig, ax = plt.subplots(1, 3, figsize=(22, 5.5))
+    _sm = np.isfinite(_ests[EX_RECORD_REALISED]) & np.isfinite(_target)
+    ax[0].scatter(_ests[EX_RECORD_REALISED][_sm], _target[_sm], s=3, alpha=0.3, color='#4C72B0'); ax[0].plot([-100, 100], [-100, 100], 'k--', lw=0.8); ax[0].set_xlim(-120, 120); ax[0].set_ylim(-200, 200)
+    ax[0].set_xlabel(f'{EX_RECORD_REALISED}: modeled markout (bp)'); ax[0].set_ylabel('realised round trip (bp)'); ax[0].set_title('Modeled exit against the desk\'s realised sale, matched fills', fontsize=10)
+    _mae_h = _mae_tab.drop(columns='ALL', errors='ignore')
+    for nm, row in _mae_h.iterrows():
+        ax[1].plot(row.index, row.to_numpy(float), 'o-', lw=1.0, label=nm)
+    ax[1].legend(fontsize=6); ax[1].set_title('MAE against the realised sale by holding-time bucket (bp)', fontsize=10)
+    _bc = bt_real_cover['realised round trip (bp)']; ax[2].bar(_bc.index, _bc.to_numpy(float), color='#937860'); ax[2].axhline(0, color='k', lw=0.5); ax[2].set_title('Realised round trip by cover bucket (bp)', fontsize=10); ax[2].tick_params(axis='x', labelsize=8)
+    savefig('17_realised_validation')
+    record('lab_wftrade_validation', validation=flat_records(bt_exit_val_real.reset_index()), estimator_of_record_realised=EX_RECORD_REALISED, scorecard_month=flat_records(bt_real_month),
+           cover_buckets=flat_records(bt_real_cover), exit_of_record_realised_horizon=EX_RECORD_H, rescore_realised_horizon=flat_records(bt_rh.reset_index()), policy_card=flat_records(bt_policy_card), seconds=time.perf_counter() - _rv_t0)
+print(f'[24] {time.perf_counter() - _rv_t0:.0f}s')
 
 # %% [markdown]
 # ## 15. Registry and runtimes

@@ -1,9 +1,11 @@
-# IPCA as the desk's risk model: lab v4.8 (Sections 14d to 14g)
+# IPCA as the desk's risk model: lab v4.9 (Sections 14d to 14g, 16 and 17)
 
 Companion to `muni_ipca_factor_lab.py` / `.ipynb`. The notebook in the repo is the v4 lab reconstructed from
-`muni_ipca_factor_lab_v4.html` (markdown cells re-derived from the rendered html, code cells verbatim) with two new
-sections appended between 14c and 15. Nothing in cells 1 to 14c is changed, so every existing cache on the lab machine
-is reused; the new cells read the objects those cells leave behind.
+`muni_ipca_factor_lab_v4.html` (markdown cells re-derived from the rendered html, code cells verbatim) with the new
+sections 14d to 14g, 16 and 17 inserted between 14c and 15. Nothing in cells 1 to 14c is changed, so every existing cache
+on the lab machine is reused; the new cells read the objects those cells leave behind. Section 16 is the lab machine's own
+cells (from `muni_ipca_factor_lab (1).html`, code verbatim); it sits before Section 15 here, not after it as in that run,
+because Section 15 closes the cell log and writes the registry, and Section 17 records into both.
 
 Regenerate the `.ipynb` from the `.py` with the percent-format converter (no jupytext metadata in the repo):
 
@@ -101,6 +103,44 @@ game; DV01 is a reported column. On the synthetic smoke run all twenty settings 
 on bullets, which is the direction the 14e regression said the traders already price. Runtime on the synthetic scale:
 [21] 2 s for 100 requotes, [22] 2 s; at the lab's scale expect about 3 minutes for [21], cached after the first run.
 
+## 16: the AM60 inventory book from WFTrade (lifted from the lab machine's run)
+
+The five cells 16a to 16e call pipeline functions that are not in this repository: `mdp.load_wftrade`,
+`mdp.build_inventory_book`, `mdp.book_snapshot`, `PIPE.wftrade_inventory`, and `CFG.end_date`. On a machine without
+them the cells fail at the first line, and Section 17 then skips itself (its `HAS_WFTRADE` guard). The objects Section 17
+reads from them: `WFTRADE_BOOK` (`trade_number`, `cusip`, `side` in {BID, ASK}, `amount`, `price`, `yield`,
+`execution_timestamp`, `exec_date_ny`, `uncovered_par`), `WFTRADE_EDGE` (`trade_number`, `mark`, `mark_date`: the
+evaluated clean price at the trade), `_mk` (`cusip`, `cpn`) for the carry, and `WFTRADE_END`.
+
+Three things the lab machine's run of 16 showed that 17 is built around: the ECN link column is blank, so request-level
+validation cannot come from a key; 16d's timing match (booking within 60 seconds of the RFQ clock, exact par) found 59
+links; and the desk's realised P&L on complete-book months was execution edge plus carry minus a large inventory
+component, with the per-trade edge against the mark positive on buys and negative on sales.
+
+## 17: realised round trips as the validation target (added in v4.9)
+
+Section 14 imputed every exit from the bond's next other-side print, 14f from comparable bonds' prints at a fixed
+five-day horizon. For production's own fills neither is needed: WFTrade carries the sale. Section 17 pairs the buys with
+the sales that close them, ties the buys to their requests without an ECN key, and uses the realised sale as the target
+against which every exit estimator is judged. The fixed-horizon exit stays for counterfactual fills only, at the horizon
+the desk realises. Beside P&L, every scorecard carries the logged facts that need no exit at all: the win rate, the bp
+left on the table on wins with a cover, the distance to the winning print on lost requests, and the crossing on new wins.
+
+| Cell | What it builds | Pre-registered bar | Objects it leaves |
+|---|---|---|---|
+| 17 [23] | FIFO round trips per CUSIP from `WFTRADE_BOOK` in execution order (an uncovered sale's par is excluded from the paired par); per buy lot the sold par, the par-weighted sale price, yield and date, the par-weighted holding time in business days, the unsold remainder; the round trip in points per 100 split exactly into buy edge, inventory and sale edge against the evaluated mark, plus carry; in yield bp as 100 (buy yield - sale yield); the request match: `algo_won` requests to AM60 BID fills on the same CUSIP and New York date, exact par first then the nearest par within 25 percent, one to one, with the yield consistency of the pairs reported; the par-weighted holding-time distribution overall and by call, tenor and size bucket; the record horizon = the par-weighted median holding of matched fills rounded to the nearest of 1, 3, 5, 10, 20, 40, 60 business days | none; a construction. The decomposition identity is asserted to 1e-6 points | `WF_PAIRS`, `WF_LOTS`, `WF_MATCH`, `RT_HOLD_TAB`, `EX_H_REALISED`, `HAS_WFTRADE`, `RT_PAR_TOL`, `RT_H_GRID`, registry `lab_wftrade_roundtrips`, figure `17_roundtrips` |
+| 17 [24] | every 14f estimator (lab other side, bucket and IPCA peers mark-to-P and mark-to-D at h = 5, factor / MMD, own P and own D within 10 days) and the bucket estimators at the horizon nearest each lot's realised holding, against the realised round trip of the matched closed lots: bias, MAE, correlation, slope, pooled and by holding bucket (at least 30 lots per segment); production's scorecard by month: win rate, cover left on won-with-cover (mean and median), short of the winning print on lost (median), matched closed lots, realised round trip (bp and points), holding, buy and sale edge against the mark, inventory, and the modeled markouts on the same fills; the realised round trip by cover bucket (0-1, 1-3, 3-10, > 10 bp; won without a cover; manual) with the NW t of its mean; the Section 14 variants re-scored with the estimator of record against realised sales at the record horizon; the policy scorecard joining the 14f deltas and passes, the Section 14 cover and crossing, the 14g wins kept, hedged markout and risk, and the realised-horizon delta and pass | the estimator of record for counterfactual fills becomes the one with the lowest MAE against the realised sale among the comparable-bond estimators with coverage >= 50 percent of matched fills; a variant passes at the realised horizon on the Section 14 bar (weekly NW t >= 3, >= 4 months positive, above the width frontier) | `bt_exit_val_real`, `EX_RECORD_REALISED`, `EX_RECORD_H`, `bt_rh`, `bt_real_month`, `bt_real_cover`, `bt_policy_card`, registry `lab_wftrade_validation`, figure `17_realised_validation` |
+
+Two readings the section is built to give. First, the adverse-selection question on real exits: if the realised round
+trip falls with the bp left on the table (the 0-1 bp bucket earning more than the > 10 bp bucket), winning by too much
+is costing money on the desk's own sales, not only on an imputed print. Second, whether the modeled markouts on
+production's fills (14f: +5.6 bp under IPCA peers mark-to-P, +18.2 under the lab's other side) agree with what the desk
+realised on the same fills; the by-month table puts them side by side, and the validation table says which estimator
+to believe for the counterfactual policies.
+
+The 14g tilts are not re-scored at the realised horizon (their hedged markout uses the MMD move at tenor over h = 5);
+that is one `bt_tg`-style pass away if the realised horizon turns out far from 5 days.
+
 ## Definitions worth having in one place
 
 - **Full book**: the 14b exposure `e_i = u_i [1_tenor, beta_i]`, nothing hedged. **Hedged book**: the tenor block is
@@ -116,20 +156,38 @@ on bullets, which is the direction the 14e regression said the traders already p
 - **Reallocation**: `charge_i = mean manual of the test month + lambda (g_i - mean g of the month)`, `lambda = m x
   sd(manual) / sd(g)` over the earlier months, `m` in {0.5, 1, 2}. The month's level is in-sample by construction and
   is said so in the cell; the question is allocation, not level.
+- **Round trip of a buy lot** (17): in points per 100, `sale price - buy price + coupon x holding days / 360`, with
+  `sale price - buy price = (mark_buy - buy price) + (mark_sale - mark_buy) + (sale price - mark_sale)`, the buy edge,
+  the inventory and the sale edge; all par-weighted over the sales that close the lot. In yield bp,
+  `100 (buy yield - sale yield)`, the same sign convention as the Section 14 markout (positive = the bond richened).
+- **Request match** (17): a won request and its WFTrade buy are the same trade on the same CUSIP and New York date with
+  the same par; exact par is paired by order of appearance, then the nearest par within `RT_PAR_TOL` = 25 percent by
+  mutual rank. No timestamp window and no ECN key.
 
 ## The synthetic smoke test
 
 No real data was available here. A harness under the session scratch directory
-(`lab46/smoke/harness.py`, not committed) fabricates 600 bonds over 190 business days, a model panel with the 20
+(`lab49/smoke/harness.py`, not committed) fabricates 600 bonds over 190 business days, a model panel with the 20
 instruments, six Gamma versions, a factor path, residuals of record, a ten-tenor MMD curve, a 60k-print tape and a
 7,000-request `BT` with the column names and dtypes the lab uses, then executes the lab's own Section 14 cells
-(61, 66, 67, 70, 71, 73, 74 of the v4 html, verbatim) and the six new cells on top. Cells 62 to 65 reach the pipeline,
+([1], [6], [7], 14b [9] and [10], 14c [11] and [12], verbatim from the repo notebook) and the new cells 14d to 14g on
+top; for Section 17 it fabricates the Section 16 objects (1,052 AM60 buys of which 252 are the won requests at their
+logged price and yield, 666 sales at 2 to 40 business days, marks from the synthetic evaluated price) and runs [23] and
+[24]. Cells 62 to 65 reach the pipeline,
 the pricing service and the tape, so their pure function definitions are executed from source and their frame-building
 lines are replicated on the synthetic data; the vanilla outcome check (`BT_VANILLA_PASS`) holds on the synthetic frame.
 
-Result of the last run: every new cell runs to the end, every figure and registry section is produced, and the
-registry stays JSON-serialisable. Runtimes on the synthetic scale: [13] 1 s, [14] 1 s, [15] 1 s, [16] 11 s (24
-sequential replays), [17] 1 s, [18] 1 s. The lab's own cells 66 to 74 ran in 25 s on the same data.
+Result of the last run (v4.9): every new cell runs to the end, every figure and registry section is produced, and the
+registry stays JSON-serialisable. Runtimes on the synthetic scale: [13] 2 s, [14] 1 s, [15] 2 s, [16] 16 s (24
+sequential replays), [17] 2 s, [18] 1 s, [19] 7 s, [20] 4 s, [21] 2 s, [22] 2 s, [23] 1 s, [24] 12 s (of which the
+re-score at the realised horizon is most). The lab's own cells [1] to 14c [12] ran in 33 s on the same data.
+
+On Section 17 the synthetic run checks the mechanics only: the decomposition identity holds to 0 points; all 252 won
+requests match an AM60 buy (222 exact par, 30 nearest par) with the buy yield equal to the logged final quote yield on
+100 percent of pairs, which is how the harness built them; 62 percent of lots close inside the window; the par-weighted
+median holding is 12 business days, so the record horizon moves from 5 to 10; against the realised sale the IPCA peers
+mark-to-P estimator has the lowest MAE among the covered comparable-bond estimators and is kept as the estimator of
+record; 0 of 17 variants pass at the realised horizon, as none passed at h = 5.
 
 On the synthetic world the bars come out as expected for noise: the request-fields `Gamma' z` correlates 0.89 / 0.95 /
 0.95 with the beta of record (fails the 0.9 bar on factor 1 by design of the synthetic instruments), the EWMA
@@ -150,6 +208,15 @@ reallocation passes. None of those numbers mean anything for the desk; they only
   any reallocation keeps 80 percent of wins.
 - The replay runtime of [16] at 1.55M requests: 24 replays against the 10 of 14b [10]; if 14b [10] took around 100 s,
   expect 4 to 5 minutes, cached after the first run.
+- Section 17 on the real book: the share of won requests that find their AM60 buy on the same day (16d found 59 with a
+  60-second window and exact par; the same-day match should find most of them, and the yield-consistency line says
+  whether the pairs are the same trade); the par-weighted median holding, which resets the record horizon; which
+  estimator tracks the realised sale (MAE and slope), and whether the realised round trip falls with the bp left on the
+  table. The re-score at the realised horizon runs `ex_peer_levels` once more at the new h over every request; at h = 10
+  expect about twice the 14f [19] peer-level time.
+- Three fixes still owed from the real run of 14f, 14g and 16: the 14f coverage rule tests the peer level's coverage
+  (98 percent) rather than the markout's (44 percent, anchors on 43 percent of requests); the 14g table carries no guard
+  or other-side columns; the 16d link should be retired in favour of the Section 17 match.
 
 ## Assumptions made without the data
 
