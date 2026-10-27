@@ -96,7 +96,7 @@ assert hasattr(mdp, 'add_benchmark_curve_move'), f'stale muni_data_pipeline at {
 class RunConfig:
     spec_version: str = 'ipca_v3_k3_xmmd'   # record spec; relabel when experimenting
     start_date: str = '2026-01-01'
-    end_date: str = '2026-09-30'
+    end_date: str = '2026-10-23'
     train_start: str = '2026-01-02'
     first_oos_date: str = '2026-04-01'
     refit_days: int = 7
@@ -4234,12 +4234,12 @@ PRE_REGISTERED.update({
                                 'StrategyOutput side B, optimalyield > 0, trade date on or after the switch to the call-structure pfill keys (pfills_20260326); '
                                 'production optimizer rebuilt from StrategyOutput signalyield, pfillKey and charges: quantile_bp = (quantiles x stdev + mean) x 100, '
                                 'utility = (quantile_bp + width_level + charges_level) x probabilities, charges_level = -(manual + liquidity + risk), width_level = 0, first argmax; '
-                                'pfill file by trade date: <= 2026-06-02 the 0326 file, <= 08-04 the 0602 file, <= 09-10 the 0804 file, else the 0910 file; '
+                                'pfill file by trade date: <= 2026-06-02 the 0326 file, <= 08-04 the 0602 file, <= 09-10 the 0804 file, <= 10-08 the 0910 file, else the 1008 file; '
                                 'gate: |replayed - logged optimalQuantileBp| <= 0.25 bp and |replayed - logged pfill| <= 0.01 on >= 95% of requests in every month; '
                                 'variants are compared at the optimal-yield stage, final quote = variant optimal yield + the logged finalquoteyield - optimalyield'),
 })
 BT_PFILL_DIR = ROOT / 'prod_pfills'
-BT_PFILL_SCHEDULE = [('20260326', '2026-06-02'), ('20260602', '2026-08-04'), ('20260804', '2026-09-10'), ('20260910', None)]   # (file, last trade date it serves, inclusive)
+BT_PFILL_SCHEDULE = [('20260326', '2026-06-02'), ('20260602', '2026-08-04'), ('20260804', '2026-09-10'), ('20260910', '2026-10-08'), ('20261008', None)]   # (file, last trade date it serves, inclusive)
 BT_WIDTH = 0.0
 BT_TOL_BP, BT_TOL_PF, BT_GATE = 0.25, 0.01, 0.95
 BT_MAX_CELLS = 20_000_000          # distinct charge levels x curve points per argmax block
