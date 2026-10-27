@@ -1,4 +1,4 @@
-# IPCA as the desk's risk model: lab v4.9.1 (Sections 14d to 14g, 16 and 17)
+# IPCA as the desk's risk model: lab v4.9.2 (Sections 14d to 14g, 16, 17 and the 15a handoff)
 
 Companion to `muni_ipca_factor_lab.py` / `.ipynb`. The notebook in the repo is the v4 lab reconstructed from
 `muni_ipca_factor_lab_v4.html` (markdown cells re-derived from the rendered html, code cells verbatim) with the new
@@ -140,6 +140,16 @@ to believe for the counterfactual policies.
 
 The 14g tilts are not re-scored at the realised horizon (their hedged markout uses the MMD move at tenor over h = 5);
 that is one `bt_tg`-style pass away if the realised horizon turns out far from 5 days.
+
+## 15a: the handoff to the variant notebook (added in v4.9.2)
+
+One cell before Section 15 writes everything `muni_rfq_factor_variants.py` reads to `artifacts_ipca_lab/handoff_rfq_variants/`:
+`requests.parquet` (the request frame: logged quote, charges, outcome, thresholds, exits, signals, buckets),
+`arrays.npz` (`BT_BETA_GZ`, `BT_EXPO_GZ`, `BT_V_C`, `BT_VOL_C`, every `BT_M_EXIT` markout, `_mmd5`, the 14g tilt inputs,
+`_pb_u`), `objects.pkl` (`BT_CURVES`, `BT_SIGMA_C`, the run metadata: months, test months, horizons, exits of record,
+labels, stage keys) and `holding.parquet` (the realised par-weighted median holding by tenor x call bucket from
+`WF_MATCH`). Every object is taken with `globals().get`, so a lab run that stops before 17 still writes a handoff without
+the holding table. See `docs/rfq_variants_notes.md` for what the variant notebook does with it.
 
 ## Definitions worth having in one place
 

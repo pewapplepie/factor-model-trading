@@ -1,4 +1,4 @@
-# muni_ipca_factor_lab.py: lab v4.9.1. Cells 1 to 15 reconstructed from the v4 run (muni_ipca_factor_lab_v4.html; markdown re-derived from the rendered cells, code verbatim);
+# muni_ipca_factor_lab.py: lab v4.9.2. Cells 1 to 15 reconstructed from the v4 run (muni_ipca_factor_lab_v4.html; markdown re-derived from the rendered cells, code verbatim);
 # Sections 14d to 14g and 17 are new; Section 16 is lifted from the lab machine's run (muni_ipca_factor_lab (1).html) and needs its pipeline functions. Percent format; regenerate the .ipynb with the converter in docs/ipca_risk_model_notes.md.
 
 # %% [markdown]
@@ -25,6 +25,7 @@
 # | 14 | RFQ backtest: the production optimizer replayed on every bid request, then variants against it (`docs/rfq_backtest_framework.html`) |
 # | 16 | Live WFTrade: the AM60 inventory book replayed from the desk's fills; its realised P&L (execution edge, inventory, carry) beside the modeled vanilla P&L |
 # | 17 | Realised round trips from WFTrade matched to the won requests; every exit estimator validated against the realised sale; the realised and the policy scorecards |
+# | 15a | Handoff to `muni_rfq_factor_variants.py`: the request frame, curves, risk model, exits and signals written to `artifacts_ipca_lab/handoff_rfq_variants/` |
 # | 15 | Registry and runtimes |
 #
 # **Spec.** The record spec `ipca_v3_k3_xmmd` (K = 3, excess-over-MMD target, monthly refit). Change `spec_version`
@@ -7833,6 +7834,64 @@ else:
     record('lab_wftrade_validation', validation=flat_records(bt_exit_val_real.reset_index()), estimator_of_record_realised=EX_RECORD_REALISED, scorecard_month=flat_records(bt_real_month),
            cover_buckets=flat_records(bt_real_cover), exit_of_record_realised_horizon=EX_RECORD_H, rescore_realised_horizon=flat_records(bt_rh.reset_index()), policy_card=flat_records(bt_policy_card), seconds=time.perf_counter() - _rv_t0)
 print(f'[24] {time.perf_counter() - _rv_t0:.0f}s')
+
+# %% [markdown]
+# ## 15a. Handoff to the variant notebook
+#
+# Writes what `muni_rfq_factor_variants.py` needs to quote every factor-derived variant through the production optimizer without this kernel:
+# the request frame with its logged fields, thresholds, exits and signals; the production fill curves; the betas, exposures, idiosyncratic variances
+# and the picked covariance on the requests; every exit estimator's markout; the realised holding time by bucket from Section 17. Objects are taken as
+# they exist in this kernel; anything missing is left out and the variant notebook says so. Written to `artifacts_ipca_lab/handoff_rfq_variants/`.
+
+# %%
+CELL_T('15a. Handoff to the variant notebook [1]')
+_ho_t0 = time.perf_counter(); _G = globals()
+HANDOFF_DIR = ARTIFACTS / 'handoff_rfq_variants'; HANDOFF_DIR.mkdir(parents=True, exist_ok=True)
+_ho_sig = list(BT_SIGNALS) + ['risk']
+_ho_cols = [c for c in ['date', 'month', 'week', 'cusip', 'quantity', 'pfill_file', 'pfill_key', 'signalyield', 'adj_yield', 'charges_level', 'manualcharges', 'liquiditycharge',
+                        'riskcharge', 'manual', 'optimalQuantileBp', 'bt_opt_bp', 'pfill', 'optimalyield', 'finalquoteyield', 'y_vanilla', 'won_logged', 'won_cover', 'cover_y',
+                        'msrb_yield', 'group', 'threshold_y', 'winnable', 'y_trade', 'usd_per_bp', 'dv01', 'print_type', 'e_street', 'on_model_grid', 'call_bucket',
+                        'tenor_bucket', 'qty_bucket', 'coupon_bucket', 'final_comp_rating']
+           + [f'a_{k}' for k in _ho_sig] + [f'age_{k}' for k in _ho_sig]
+           + [c for h in (1, 3, 5) for c in (f'M_{h}_X', f'tx_{h}_X', f'yx_{h}_X', f'mkt_{h}', f'M_{h}_Xm')] if c in BT.columns]
+_ho_bt = BT[_ho_cols].copy()
+for c in _ho_bt.columns:
+    if _ho_bt[c].dtype == object or str(_ho_bt[c].dtype) == 'category':
+        _ho_bt[c] = _ho_bt[c].astype(str)
+_ho_bt.to_parquet(HANDOFF_DIR / 'requests.parquet')
+_ho_arrays = {}
+for nm in ['BT_BETA_GZ', 'BT_EXPO_GZ', 'BT_V_C', '_mmd5', '_tg_call', '_tg_peer', '_tg_fac_book', '_pb_u', 'BT_BETA']:
+    if nm in _G and _G[nm] is not None:
+        _ho_arrays[nm.lstrip('_')] = np.asarray(_G[nm], float)
+for k_, v_ in (_G.get('BT_VOL_C') or {}).items():
+    _ho_arrays[f'VOL_{k_}'] = np.asarray(v_, float)
+for k_, v_ in (_G.get('BT_M_EXIT') or {}).items():
+    _ho_arrays[f'MEXIT_{k_}'] = np.asarray(v_, float)
+np.savez(HANDOFF_DIR / 'arrays.npz', **_ho_arrays)
+_ho_meta = {'spec': CFG.spec_version, 'run_at': pd.Timestamp.now('UTC').isoformat(), 'window': (str(CFG.start_date), str(CFG.end_date)), 'months': list(BT_MONTHS),
+            'test_months': list(_G.get('_test_m', [])), 'risk_m0': _G.get('_risk_m0'), 'h_record': int(BT_H_RECORD), 'hold': int(_G.get('BT_HOLD', BT_H_RECORD)), 'eps_bp': float(BT_EPS_BP),
+            'groups': list(BT_GROUPS), 'winnable_groups': list(BT_WINNABLE), 'bar_t': float(BT_BAR_T), 'bar_months': int(BT_BAR_MONTHS), 'nT': _G.get('_nT'), 'D': _G.get('_D'),
+            'pb_days': [str(d.date()) for d in _pb_days], 'exit_record': _G.get('EX_RECORD'), 'exit_guard': _G.get('EX_GUARD'), 'h_realised': _G.get('EX_H_REALISED'),
+            'signals': dict(BT_SIGNALS), 'gz_label': _G.get('GZ_LABEL'), 'sigma_label': _G.get('SIGMA_LABEL'), 'hedge_cost_bp': float(_G.get('GZ_HEDGE_COST_BP', 1.0)),
+            'vanilla_pass': bool(_G.get('BT_VANILLA_PASS', True)), 'stage_keys': {k: v for k, v in STAGE_KEYS.items()}}
+pd.to_pickle({'meta': _ho_meta, 'curves': BT_CURVES, 'sigma': {int(k): np.asarray(v, float) for k, v in (_G.get('BT_SIGMA_C') or {}).items()}}, HANDOFF_DIR / 'objects.pkl')
+
+
+def _ho_wmedian(v: np.ndarray, w: np.ndarray) -> float:
+    o = np.argsort(v); cw = np.cumsum(w[o]); return float(v[o][np.searchsorted(cw, 0.5 * cw[-1])]) if len(v) and cw[-1] > 0 else np.nan
+
+
+_ho_hold = None
+if 'WF_MATCH' in _G and len(_G['WF_MATCH']) and 'hold_bdays' in _G['WF_MATCH']:
+    _wm = WF_MATCH[(WF_MATCH['sold_par'] > 0) & np.isfinite(WF_MATCH['hold_bdays'])]; _wb = BT.iloc[_wm['bt_row'].astype(int).to_numpy()]
+    _hf = pd.DataFrame({'tenor_bucket': _wb['tenor_bucket'].astype(str).to_numpy() if 'tenor_bucket' in BT else 'NA', 'call_bucket': _wb['call_bucket'].astype(str).to_numpy() if 'call_bucket' in BT else 'NA',
+                        'hold': _wm['hold_bdays'].to_numpy(float), 'par': _wm['sold_par'].to_numpy(float)})
+    _ho_hold = _hf.groupby(['tenor_bucket', 'call_bucket']).apply(lambda g: pd.Series({'lots': len(g), 'hold_bdays': _ho_wmedian(g['hold'].to_numpy(), g['par'].to_numpy())}), include_groups=False).reset_index()
+    _ho_hold.loc[len(_ho_hold)] = ['ALL', 'ALL', len(_hf), _ho_wmedian(_hf['hold'].to_numpy(), _hf['par'].to_numpy())]
+    _ho_hold.to_parquet(HANDOFF_DIR / 'holding.parquet')
+print(f'handoff written to {HANDOFF_DIR}: {len(_ho_bt):,} requests x {len(_ho_cols)} columns, {len(_ho_arrays)} arrays, {len(_ho_meta["pb_days"])} days, '
+      f'{len(_G.get("BT_SIGMA_C") or {})} covariance days, {len(BT_CURVES)} pfill files, holding table {"yes" if _ho_hold is not None else "no"} | {time.perf_counter() - _ho_t0:.0f}s')
+record('lab_handoff', path=str(HANDOFF_DIR), requests=int(len(_ho_bt)), columns=_ho_cols, arrays=sorted(_ho_arrays), holding=_ho_hold is not None, seconds=time.perf_counter() - _ho_t0)
 
 # %% [markdown]
 # ## 15. Registry and runtimes
