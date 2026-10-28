@@ -1,9 +1,9 @@
-# muni_rfq_factor_variants.py: variants v1.2.1. Every factor-derived quoting variant through the production optimizer, replayed on the desk's requests and read
+# muni_rfq_factor_variants.py: variants v1.3. Every factor-derived quoting variant through the production optimizer, replayed on the desk's requests and read
 # against production on the same four facts (win rate, cover, crossing, P&L under the sceptical exits), in four pairs. Reads the handoff written by
 # Section 15a of muni_ipca_factor_lab.py; needs no model code and no pipeline. Percent format; regenerate the .ipynb with the converter in docs/rfq_variants_notes.md.
 
 # %% [markdown]
-# # RFQ factor variants: the production optimizer as the judge (v1.2)
+# # RFQ factor variants: the production optimizer as the judge (v1.3)
 #
 # **Why a separate notebook.** The lab builds the factor model and tests its pieces on their own terms (fit, calibration, information coefficients).
 # None of that decides whether a piece helps the desk quote. The only test that does is the production optimizer replayed on every request with the
@@ -48,7 +48,9 @@
 # | [7c] | v1.2: the factor premium (lab 8b) as the value of a win, as stated and with a calibrated slope |
 # | [7d] | v1.2: the quantile grid (lab 10) as a distribution of the bond's move: a width charge, a location value, a downside penalty along x |
 # | [7e] | v1.2: call structure (lab 9): the curve refit by group, kappa per group, the tilt on the call-aware residual sd, the group's common move as value |
-# | [8] | the matrix: pairs A, B, C against production, against the frontier at equal win rate, and levelled; readings; Pareto sets |
+# | [7f] | v1.3: the stacks, the curve and the width charge in one requote |
+# | [8] | the matrix: pairs A, B, C against production, against the frontier at equal win rate, and levelled; readings; Pareto sets; cached per variant |
+# | [8b] | v1.3: month by month, the candidates against the frontier; tables and figure |
 # | [9] | registry and runtimes |
 
 # %%
@@ -89,23 +91,32 @@ pd.set_option('display.width', 250); pd.set_option('display.max_columns', 60)
 
 @dataclass(frozen=True)
 class VariantConfig:
-    spec_version: str = 'rfq_variants_v1_2_1'
+    spec_version: str = 'rfq_variants_v1_3'
     seed: int = 7
     sigmas: tuple[str, ...] = ('idiosyncratic',)              # v1: systematic and total worsened the fill-curve likelihood; the conditional scale covers 18 percent
-    stretch_exponents: tuple[float, ...] = (0.25, 0.5, 1.0)
-    logit_kappas: tuple[float, ...] = (0.25, 0.5, 1.0, 1.5)
+    stretch_exponents: tuple[float, ...] = (0.5, 1.0)             # v1.3: 0.25 retired (flat in two runs)
+    logit_kappas: tuple[float, ...] = (0.5, 1.0, 1.5)              # v1.3: 0.25 retired
+    curve_walk_forward: bool = False                           # v1.3: the walk-forward parameter picks converged to 1 / 1.5 and quoted the same thing
+    curve_refits: bool = False                                 # v1.3: the tercile and state refits did nothing in two runs
     n0_grid: tuple[float, ...] = (0.0, 1e1, 1e2, 1e3, 1e4, 1e5, float('inf'))
-    k_grid: tuple[int, ...] = (1, 2, 3, 5)                    # concentration term: median extra charge in bp
-    book_k_grid: tuple[int, ...] = (1, 2)                     # the hedged book term, kept as the 14e reference
+    k_grid: tuple[int, ...] = (1,)                            # v1.3: the concentration term is a risk tool; k=1 is the dollar pick in four of six months, the rest retired
+    book_k_grid: tuple[int, ...] = ()                         # v1.3: the hedged book term retired (lost on every axis twice)
+    value_quote: bool = False                                  # v1.3: b(x) is kept as the adverse-selection table, no longer quoted (closed as a quote input)
+    premium_on: bool = False                                   # v1.3: the factor premium added nothing pooled in pairs A and C
     signal_k: tuple[float, ...] = (1.0, 2.0, 3.0)
     signals_on: bool = False
     hedge_cost_bp: float = 1.0
     qg_models: tuple[str, ...] = ('grid', 'ls')             # v1.2, lab 10: the lookup grid by beta cluster x activity; the location-scale model on XS + TS
     qg_targets: tuple[str, ...] = ('residual',)              # the next-day residual (the band the desk cannot hedge); 'total' is in the handoff too
     qg_k_grid: tuple[int, ...] = (1, 2)                       # the width charge: k bp at the median calibrated half-width
-    qg_lambda_grid: tuple[float, ...] = (1.0, 2.0)            # the downside penalty: weight on the expected shortfall of the net P&L of a win
+    qg_lambda_grid: tuple[float, ...] = (1.0,)                # v1.3: lambda 2 and the walk-forward pick retired; lambda 1 kept as the one x-dependent form
+    qg_forms: tuple[str, ...] = ('width', 'downside')         # v1.3: the location value retired (middling); 'location' re-enables it
+    qg_extend: bool = True                                     # v1.3: the width charge extended to every request by a walk-forward model of the calibrated width on request features
+    stack_k: tuple[int, ...] = (2,)                           # v1.3: the width charge k stacked on the curves in [7f]
+    monthly_top: int = 6                                       # v1.3: candidates per pair in the monthly comparison [8b], beyond the fixed references
     call_kappa_grid: tuple[float, ...] = (0.25, 0.5, 1.0, 1.5)   # v1.2, lab 9: the logit tilt strength picked per call-structure group; the last value is the winner's
-    call_idv: tuple[str, ...] = ('v0', 'v5')                  # trailing residual sd under the record model and the call-aware variant V5
+    call_idv: tuple[str, ...] = ('v0',)                       # v1.3: V5 was indistinguishable from V0 on the same window
+    call_forms: tuple[str, ...] = ('trailing',)               # v1.3: the refit, the kappa by group and the common move retired; 'refit', 'kappa', 'common' re-enable them
     min_fit_rows: int = 50                                    # the fewest earlier-month rows a walk-forward slope or pick is estimated on
     frontier_widths: tuple[float, ...] = tuple(sorted(set([w / 2.0 for w in range(-20, 21)] + [float(w) for w in range(-25, 26)])))   # -10 .. +10 by 0.5, then by 1 to +-25 (v1.2.1: the grid ran out at +10 when the manual charge was 13 bp)
     period_split: tuple[str, ...] = ()                        # v1.2.1: the months of the first period; empty = split at the largest month-to-month jump in the median manual charge
@@ -166,6 +177,13 @@ PRE_REGISTERED: dict[str, str] = {
                                 '(7) the frontier plot shows one curve per month; (8) b(x) is the move from the quoted mid (markout minus the logged concession), the realised source '
                                 'centred on the earlier months\' median round trip. Not changed: the P&L sample share (markout coverage is what it is and is reported), the risk axis\'s '
                                 'dependence on the lab\'s covariance calibration (labelled), and the fact that on this data the results confirm rather than test'),
+    'variants_v13_design': ('fixed 2026-10-28 after the v1.2.1 run, before any v1.3 run. Pruned: stretch 0.25, logit 0.25, the walk-forward curve picks, the tercile and state '
+                            'refits, concentration k > 1 and the hedged book term, b(x) as a quote (its table stays), the factor premium, the quantile location value and lambda 2, '
+                            'the call refit, kappa by group, the common move and the V5 sd. Added: the width charge extended to every request by a walk-forward least-squares '
+                            'model of log calibrated width on key group, size and tenor bucket, manual class and log idiosyncratic vol, the observed width kept where it exists; the '
+                            'stacks of logit 1.5, the trailing-sd tilt and stretch 1 with the width charge (covered and extended) at k in stack_k; the month-by-month scorecard of '
+                            'the top candidates against the frontier. Scoring cached per variant on its quotes. Candidates for November: logit 1.5 with the manual charge, the '
+                            'width charge k = 2 with the manual charge, and their stack; the reading is the v1.2.1 one'),
 }
 
 
@@ -217,11 +235,19 @@ def _jsonable(x):
     return x
 
 
+def _code_fp(code) -> str:
+    """Stable fingerprint of a code object: bytecode, names and constants, nested code objects recursively; no memory addresses."""
+    consts = [(_code_fp(c) if hasattr(c, 'co_code') else repr(c)) for c in code.co_consts]
+    return hashlib.sha1((code.co_code.hex() + repr(code.co_names) + repr(code.co_varnames) + repr(consts)).encode()).hexdigest()
+
+
 def _stage_source(obj) -> str:
+    """The source of a stage function for the cache key; when the source is not on disk (an exec'd cell, a lambda in a harness) the bytecode
+    fingerprint, so the key is the same across runs (v1.3: the repr fallback carried a memory address and defeated every cache)."""
     try:
         return inspect.getsource(obj)
     except (OSError, TypeError):
-        return repr(obj)
+        return _code_fp(obj.__code__) if hasattr(obj, '__code__') else repr(obj)
 
 
 def _fingerprint(payload) -> str:
@@ -927,6 +953,8 @@ def _curve_family() -> dict:
                 ev = np.flatnonzero(np.isfinite(ref)); p_hat[ev] = p_at(ev, _xlog[ev], **{k: v[ev] for k, v in kw.items()})
                 finish(nm, form, sname, p_hat, yM, y0, kw, t0); fixed[(form, par)] = nm
             # the walk-forward parameter: per test month, the grid value with the highest cumulative LL gain on the earlier months
+            if not CFG.curve_walk_forward:
+                continue
             t0 = time.perf_counter(); nm = f'{form} walk-forward | {sname}'; yM, y0, p_hat = np.full(N, np.nan), np.full(N, np.nan), np.full(N, np.nan); picks = {}
             kw_wf = {'ratio' if form == 'stretch' else 'shift': np.full(N, np.nan)}
             for i, m in enumerate(BT_MONTHS[1:]):
@@ -936,7 +964,7 @@ def _curve_family() -> dict:
                 prm = src['kw']['ratio' if form == 'stretch' else 'shift']; kw_wf['ratio' if form == 'stretch' else 'shift'][te] = prm[te]
                 tev = np.flatnonzero(te & np.isfinite(ref)); p_hat[tev] = p_at(tev, _xlog[tev], **{k: v[tev] for k, v in src['kw'].items()})
             finish(nm, form, sname, p_hat, yM, y0, kw_wf, t0); out[nm]['picks'] = picks
-        for with_state, label in ((False, 'tercile refit'), (True, 'state refit')):
+        for with_state, label in (((False, 'tercile refit'), (True, 'state refit')) if CFG.curve_refits else ()):
             t0 = time.perf_counter(); nm = f'{label} | {sname}'; yM, y0, p_hat = np.full(N, np.nan), np.full(N, np.nan), np.full(N, np.nan); n0_rows = []
             for i, m in enumerate(BT_MONTHS[1:], start=1):
                 train = (_month < m) & np.isfinite(_X) & np.isfinite(_xlog); te = _month == m
@@ -1030,10 +1058,11 @@ for k_, v_ in _gf.items():
 CHARGE_PICKS = {}
 for kind, fam in (('own real', 'concentration, real book'), ('own replayed', 'concentration, replayed book')):
     sets = {f'{kind} | k={k}': (VARIANTS[f'{kind} | k={k}']['yM'], VARIANTS[f'{kind} | k={k}']['y0']) for k in CFG.k_grid if f'{kind} | k={k}' in VARIANTS}
-    if sets:
+    if len(sets) > 1:
         yM, y0, rows = wf_pick(sets, list(sets)); VARIANTS[f'{kind} | walk-forward k'] = {'family': fam, 'setting': 'walk-forward k', 'yM': yM, 'y0': y0}
         t_ = pd.DataFrame(rows).set_index('test month'); t_.columns = [c.replace(f'train hedged $k/week {kind} | ', '$k/wk ') for c in t_.columns]; t_['picked'] = t_['picked'].str.replace(f'{kind} | ', ''); CHARGE_PICKS[kind] = t_
-print('Walk-forward k (mean weekly hedged $ of the manual-kept quote on the earlier test months; the first test month takes k = 1):'); display(pd.concat(CHARGE_PICKS, names=['family']).round(3))
+if CHARGE_PICKS:
+    print('Walk-forward k (mean weekly hedged $ of the manual-kept quote on the earlier test months; the first test month takes k = 1):'); display(pd.concat(CHARGE_PICKS, names=['family']).round(3))
 record('variants_charges', s_median=S_MED, picks={k: flat_records(v) for k, v in CHARGE_PICKS.items()}, seconds=time.perf_counter() - _g_t0)
 print(f'[6] {time.perf_counter() - _g_t0:.0f}s')
 
@@ -1091,24 +1120,27 @@ def _value_family() -> dict:
     logit_wf = next((k for k in VARIANTS if k.startswith('logit walk-forward')), None)
     for sname, target, have in srcs:
         for combo in (False, True):
-            if combo and logit_wf is None:
+            if combo and (logit_wf is None or not CFG.value_quote):
                 continue
             t0 = time.perf_counter(); nm = f'b(x) {sname}' + (f' + {logit_wf}' if combo else ''); yM, y0 = np.full(N, np.nan), np.full(N, np.nan)
             for m in TEST_M:
                 edges, bvals, tab = _bx_tables(target, have, m, centre=(sname == 'realised'))
                 if not combo:
                     tabs.append(tab.assign(source=sname))
+                if not CFG.value_quote:
+                    continue
                 vadd = _vadd_for(edges, bvals); te = np.flatnonzero((_month == m) & _winable)
                 kw = {} if not combo else {'shift': VARIANTS[logit_wf]['kw']['shift'][te]}
                 yM[te] = requote_curve(te, _ch[te], vadd=vadd, **kw); y0[te] = requote_curve(te, _c_base[te], vadd=vadd, **kw)
-            out[nm] = {'family': 'value b(x)' + (' + curve' if combo else ''), 'setting': nm, 'yM': bt_final(yM), 'y0': bt_final(y0)}
+            if CFG.value_quote:
+                out[nm] = {'family': 'value b(x)' + (' + curve' if combo else ''), 'setting': nm, 'yM': bt_final(yM), 'y0': bt_final(y0)}
             print(f'  {nm}: {time.perf_counter() - t0:.0f}s')
     return {'variants': out, 'tables': pd.concat(tabs, ignore_index=True) if tabs else pd.DataFrame()}
 
 
 _kgrp_of_key = lambda k: (k.split('_')[0] if k.startswith('cpn3') else '_'.join(k.split('_')[:2]))  # noqa: E731
 _vf = cached('var_value', _value_family, deps=[frame_fingerprint(BT, ['charges_level', 'threshold_y', 'optimalQuantileBp']), TEST_M, float(np.nansum(_M_REC[_won_rec])), float(np.nansum(_real_bp[_won_real])), [k for k in VARIANTS if k.startswith('logit walk-forward')]],
-             code=[requote_curve, _argmax_dedup, _bx_tables, _vadd_for, bt_optimize], cfg=('x_bins', 'quant_step'))
+             code=[requote_curve, _argmax_dedup, _bx_tables, _vadd_for, bt_optimize], cfg=('x_bins', 'quant_step', 'value_quote'))
 for k_, v_ in _vf['variants'].items():
     VARIANTS[k_] = v_
 BX_TAB = _vf['tables']
@@ -1188,8 +1220,8 @@ def _premium_family() -> dict:
     return {'variants': out, 'slopes': pd.DataFrame(rows)}
 
 
-if _prem is None:
-    print('premium family skipped: no premium_dy_bp in the models handoff')
+if _prem is None or not CFG.premium_on:
+    print('premium family skipped: ' + ('no premium_dy_bp in the models handoff' if _prem is None else 'off (CFG.premium_on): closed on the v1.2 run, nothing pooled in pairs A and C'))
     PREM_SLOPES = pd.DataFrame()
 else:
     _pf = cached('var_premium', _premium_family, deps=[frame_fingerprint(BT, ['charges_level', 'threshold_y']), TEST_M, float(np.nansum(_prem)), float(np.nansum(_carry)) if _carry is not None else 0.0, float(np.nansum(_M_REC[_w_van_all & np.isfinite(_M_REC)]))],
@@ -1244,8 +1276,23 @@ def requote_downside(rows: np.ndarray, charges: np.ndarray, Mh: np.ndarray, lam:
     return bt_opto(_m_sig[rows], out)
 
 
+def _width_design(rows: np.ndarray) -> np.ndarray:
+    """Design for the width model: intercept, key-group, size-bucket and tenor-bucket dummies, the manual class and log idiosyncratic vol (median-filled)."""
+    cols = [np.ones(len(rows))]
+    for lev, vals in _WIDTH_CATS:
+        for lv in lev[1:]:
+            cols.append((vals[rows] == lv).astype(float))
+    cols.append(_man_modal[rows].astype(float)); lv_ = _WIDTH_LOGVOL[rows]; cols.append(np.where(np.isfinite(lv_), lv_, _WIDTH_LOGVOL_MED))
+    return np.column_stack(cols)
+
+
+_WIDTH_CATS = [(sorted(set(_kgrp)), np.asarray(_kgrp, dtype=object))] + [(sorted(set(BT[c].astype(str))), BT[c].astype(str).to_numpy(dtype=object)) for c in ('qty_bucket', 'tenor_bucket') if c in BT]
+_WIDTH_LOGVOL = np.log(np.where(SIGMAS['idiosyncratic'] > 0, SIGMAS['idiosyncratic'], np.nan)) if 'idiosyncratic' in SIGMAS else np.full(N, np.nan)
+_WIDTH_LOGVOL_MED = float(np.nanmedian(_WIDTH_LOGVOL)) if np.isfinite(_WIDTH_LOGVOL).any() else 0.0
+
+
 def _qg_family() -> dict:
-    out, rows = {}, []
+    out, rows, ext_rows = {}, [], []
     for target in CFG.qg_targets:
         for model in CFG.qg_models:
             Q = _qg_stack(target, model)
@@ -1260,23 +1307,39 @@ def _qg_family() -> dict:
                 te = _month == m; s_loc[te], r_sc[te] = s_, r_; Mh[te] = s_ * med[te][:, None] + r_ * (Mq[te] - med[te][:, None]); W[te] = r_ * width[te]
                 rows.append({'target': target, 'model': model, 'test month': m, 'location slope': s_, 'scale ratio': r_})
             lab_ = f'{target} | {model}'; w_med = float(np.nanmedian(W[(_month == TEST_M[0]) & _tmw]))
-            for k in CFG.qg_k_grid:
+            for k in (CFG.qg_k_grid if 'width' in CFG.qg_forms else ()):
                 t0 = time.perf_counter(); nm = f'quantile width k={k} | {lab_}'; g_ = k / w_med if w_med > 0 else 0.0
                 out[nm] = requote_const(-g_ * W, nm, 'quantile grid, width charge'); print(f'  {nm}: gamma {g_:.3f} per bp of width | {time.perf_counter() - t0:.0f}s')
-            t0 = time.perf_counter(); nm = f'quantile location | {lab_}'; out[nm] = requote_const(s_loc * med, nm, 'quantile grid, location value'); print(f'  {nm}: {time.perf_counter() - t0:.0f}s')
-            for lam in CFG.qg_lambda_grid:
+            if CFG.qg_extend and 'width' in CFG.qg_forms:
+                # v1.3: the calibrated width on every request: walk-forward least squares of log W on the request's key group, size and tenor buckets, manual class and
+                # log idiosyncratic vol over the covered rows of the earlier months; the observed W where it exists, the model's elsewhere
+                t0 = time.perf_counter(); W_ext = W.copy(); rows_x = []
+                for m in TEST_M:
+                    tr = (_month < m) & np.isfinite(W) & (W > 0); te = _month == m
+                    if tr.sum() < CFG.min_fit_rows:
+                        continue
+                    Xa, Xb = _width_design(np.flatnonzero(tr)), _width_design(np.flatnonzero(te)); beta = np.linalg.lstsq(Xa, np.log(W[tr]), rcond=None)[0]
+                    pred = np.exp(Xb @ beta); need = te & ~(np.isfinite(W) & (W > 0)); W_ext[need] = pred[need[te]]
+                    r2 = 1.0 - float(np.var(np.log(W[tr]) - Xa @ beta) / max(np.var(np.log(W[tr])), 1e-12)); rows_x.append({'target': target, 'model': model, 'test month': m, 'width model R2': r2, 'covered share': float(np.isfinite(W[te & _winable]).mean())})
+                ext_rows.extend(rows_x); w_med_x = float(np.nanmedian(W_ext[(_month == TEST_M[0]) & _tmw]))
+                for k in CFG.qg_k_grid:
+                    nm = f'quantile width k={k} | {lab_} | extended'; g_ = k / w_med_x if w_med_x > 0 else 0.0
+                    out[nm] = requote_const(-g_ * W_ext, nm, 'quantile grid, width charge extended'); print(f'  {nm}: gamma {g_:.3f} per bp of width, coverage {np.isfinite(W_ext[_tmw]).mean():.1%} | {time.perf_counter() - t0:.0f}s')
+            if 'location' in CFG.qg_forms:
+                t0 = time.perf_counter(); nm = f'quantile location | {lab_}'; out[nm] = requote_const(s_loc * med, nm, 'quantile grid, location value'); print(f'  {nm}: {time.perf_counter() - t0:.0f}s')
+            for lam in (CFG.qg_lambda_grid if 'downside' in CFG.qg_forms else ()):
                 t0 = time.perf_counter(); nm = f'quantile downside lambda={lam:g} | {lab_}'; yM, y0 = np.full(N, np.nan), np.full(N, np.nan)
                 yM[_tm_rows] = requote_downside(_tm_rows, _ch[_tm_rows], Mh[_tm_rows], lam); y0[_tm_rows] = requote_downside(_tm_rows, _c_base[_tm_rows], Mh[_tm_rows], lam)
                 out[nm] = {'family': 'quantile grid, downside penalty', 'setting': nm, 'yM': bt_final(yM), 'y0': bt_final(y0)}; print(f'  {nm}: {time.perf_counter() - t0:.0f}s')
-    return {'variants': out, 'calibration': pd.DataFrame(rows)}
+    return {'variants': out, 'calibration': pd.DataFrame(rows), 'extension': pd.DataFrame(ext_rows)}
 
 
 if MODELS is None or all(_qg_stack(t_, m_) is None for t_ in CFG.qg_targets for m_ in CFG.qg_models):
-    print('quantile-grid family skipped: no conditional quantiles in the models handoff'); QG_CAL = pd.DataFrame()
+    print('quantile-grid family skipped: no conditional quantiles in the models handoff'); QG_CAL = pd.DataFrame(); QG_EXT = pd.DataFrame()
 else:
     _qgf = cached('var_quantile_grid', _qg_family, deps=[frame_fingerprint(BT, ['charges_level', 'threshold_y']), TEST_M, {f'{t_}|{m_}': float(np.nansum(_qg_stack(t_, m_))) for t_ in CFG.qg_targets for m_ in CFG.qg_models if _qg_stack(t_, m_) is not None},
                                                            float(np.nansum(_M_REC[_w_van_all & np.isfinite(_M_REC)]))],
-                  code=[requote, requote_const, requote_downside, wf_slope, bt_optimize], cfg=('qg_models', 'qg_targets', 'qg_k_grid', 'qg_lambda_grid'))
+                  code=[requote, requote_const, requote_downside, wf_slope, bt_optimize, _width_design], cfg=('qg_models', 'qg_targets', 'qg_k_grid', 'qg_lambda_grid', 'qg_forms', 'qg_extend', 'min_fit_rows'))
     for k_, v_ in _qgf['variants'].items():
         VARIANTS[k_] = v_
     QG_CAL = _qgf['calibration']
@@ -1284,6 +1347,9 @@ else:
         sets = {k: (VARIANTS[k]['yM'], VARIANTS[k]['y0']) for k in VARIANTS if k.startswith('quantile downside') and k.endswith(lab_)}
         if len(sets) > 1:
             yM, y0, rows_ = wf_pick(sets, list(sets)); VARIANTS[f'quantile downside walk-forward | {lab_}'] = {'family': 'quantile grid, downside penalty', 'setting': 'walk-forward lambda', 'yM': yM, 'y0': y0}
+    QG_EXT = _qgf.get('extension', pd.DataFrame())
+    if len(QG_EXT):
+        print('the width model (v1.3): in-sample R2 of log width on the request features and the covered share, by test month:'); display(QG_EXT.pivot_table(index='test month', columns=['target', 'model'], values=['width model R2', 'covered share']).round(3))
     print('calibration of the next-day distribution to the record horizon, by test month (location slope: markout per bp of model median; scale ratio: realised to model dispersion):')
     display(QG_CAL.pivot_table(index='test month', columns=['target', 'model'], values=['location slope', 'scale ratio']).round(3))
 record('variants_quantile_grid', settings=[k for k in VARIANTS if k.startswith('quantile')], calibration=flat_records(QG_CAL), seconds=time.perf_counter() - _qg_t0)
@@ -1328,7 +1394,7 @@ def _call_family() -> dict:
     codes = pd.Categorical(_CS).codes.astype(int); groups = list(pd.Categorical(_CS).categories)
     # (1) the refit by call group
     t0 = time.perf_counter(); nm = 'call refit'; yM, y0, n0_rows = np.full(N, np.nan), np.full(N, np.nan), []
-    for i, m in enumerate(BT_MONTHS[1:], start=1):
+    for i, m in (enumerate(BT_MONTHS[1:], start=1) if 'refit' in CFG.call_forms else ()):
         train = (_month < m) & np.isfinite(_X) & np.isfinite(_xlog); te = _month == m
         if train.sum() < 100 or m not in TEST_M:
             continue
@@ -1339,9 +1405,10 @@ def _call_family() -> dict:
             cv = _refit_by_codes(codes, n0, tr_prev); lls[n0] = float(np.sum(_ll(p_at(v_prev, _xlog[v_prev], curves=cv, curve_of=codes), _wlog[v_prev])))
         n0 = max(lls, key=lls.get); cv = _refit_by_codes(codes, n0, train); tw = np.flatnonzero(te & _winable)
         yM[tw] = requote_curve(tw, _ch[tw], curves=cv, curve_of=codes); y0[tw] = requote_curve(tw, _c_base[tw], curves=cv, curve_of=codes); n0_rows.append({'test month': m, 'n0': n0})
-    out[nm] = {'family': 'call structure, curve', 'setting': nm, 'yM': bt_final(yM), 'y0': bt_final(y0)}; info['n0'] = n0_rows; print(f'  {nm}: {time.perf_counter() - t0:.0f}s')
+    if 'refit' in CFG.call_forms:
+        out[nm] = {'family': 'call structure, curve', 'setting': nm, 'yM': bt_final(yM), 'y0': bt_final(y0)}; info['n0'] = n0_rows; print(f'  {nm}: {time.perf_counter() - t0:.0f}s')
     # (2) the logit tilt with kappa per call group, picked walk-forward by the group's log-likelihood on the earlier months
-    if _idio is not None:
+    if _idio is not None and 'kappa' in CFG.call_forms:
         t0 = time.perf_counter(); nm = 'logit kappa by call group'; z = _z_of(_idio); ev = np.isfinite(_xlog) & np.isfinite(_idio) & (_idio > 0) & (_month >= BT_MONTHS[1])
         ll0 = _ll(p_at(_all, _xlog), _wlog); gain = {}
         for kap in CFG.call_kappa_grid:
@@ -1366,7 +1433,7 @@ def _call_family() -> dict:
         out[nm] = {'family': 'call structure, vol', 'setting': nm, 'yM': bt_final(yM), 'y0': bt_final(y0), 'kw': {'shift': shift}}; print(f'  {nm}: coverage {np.isfinite(sig[_tmw]).mean():.1%} | {time.perf_counter() - t0:.0f}s')
     # (4) the group's last date-mean residual as a value term, slope calibrated within the group
     cc = mcol('cc_lag')
-    if cc is not None:
+    if cc is not None and 'common' in CFG.call_forms:
         t0 = time.perf_counter(); nm = 'call common move | calibrated slope'; b = np.full(N, np.nan); rows_ = []
         for m in TEST_M:
             te = _month == m
@@ -1382,7 +1449,7 @@ else:
     _csf = cached('var_call', _call_family, deps=[frame_fingerprint(BT, ['charges_level', 'threshold_y', 'optimalQuantileBp']), TEST_M, pd.Series(_CS).value_counts().to_dict(),
                                                  {t_: float(np.nansum(mcol(f'idv_trail_{t_}'))) for t_ in CFG.call_idv if mcol(f'idv_trail_{t_}') is not None}, float(np.nansum(mcol('cc_lag'))) if mcol('cc_lag') is not None else 0.0,
                                                  float(np.nansum(_idio)) if _idio is not None else 0.0],
-                  code=[requote_curve, _argmax_dedup, p_at, _ref_by_key, _refit_by_codes, _z_of, requote_const, wf_slope, bt_optimize], cfg=('n0_grid', 'call_kappa_grid', 'call_idv', 'quant_step'))
+                  code=[requote_curve, _argmax_dedup, p_at, _ref_by_key, _refit_by_codes, _z_of, requote_const, wf_slope, bt_optimize], cfg=('n0_grid', 'call_kappa_grid', 'call_idv', 'call_forms', 'quant_step'))
     for k_, v_ in _csf['variants'].items():
         VARIANTS[k_] = v_
     CALL_INFO = _csf['info']
@@ -1392,6 +1459,51 @@ else:
         print('slope of the record markout on the group\'s last date-mean residual (bp per bp, within group, earlier months):'); display(pd.DataFrame(CALL_INFO['cc_slope']).pivot(index='test month', columns='group', values='slope').round(3))
 record('variants_call', settings=[k for k in VARIANTS if k.startswith(('call', 'logit kappa by call')) or 'trailing idio' in k], info={k: (flat_records(pd.DataFrame(v)) if isinstance(v, list) else v) for k, v in CALL_INFO.items()},
        seconds=time.perf_counter() - _cs_t0)
+
+# %% [markdown]
+# ## 7f. Stacks: the curve and the width charge together (v1.3)
+#
+# The v1.2.1 run said the two winning families act on different things: the idiosyncratic-vol curve reprices the kept wins (cover), the quantile-grid
+# width charge reallocates wins away from dispersed bonds (P&L, dollars). The optimizer takes both at once, a per-request curve and a per-request
+# charge, so the stack is one requote: `argmax (x + c + b_i) p_i(x)` with `p_i` the tilted or stretched curve and `b_i` the width charge. Three
+# curves (logit 1.5 on the IPCA residual variance, the same tilt on the trailing residual sd, stretch 1) with the width charge at k in `stack_k`,
+# from the covered requests and from the extended model. The stacks are read like every other row; no pre-weighting.
+
+# %%
+CELL_T('7f. Stacks: the curve and the width charge together [7f]')
+_sk_t0 = time.perf_counter()
+
+
+def _stack_family() -> dict:
+    out = {}
+    curves = {f'logit {CFG.logit_kappas[-1]:g}': f'logit {CFG.logit_kappas[-1]:g} | idiosyncratic', 'trailing v0 tilt': f'logit {CFG.call_kappa_grid[-1]:g} | trailing idio v0', 'stretch 1': 'stretch 1 | idiosyncratic'}
+    charges = {}
+    for k in CFG.stack_k:
+        for mdl in CFG.qg_models:
+            charges[f'width k={k} ({mdl})'] = f'quantile width k={k} | residual | {mdl}'
+            if CFG.qg_extend:
+                charges[f'width k={k} ({mdl}, extended)'] = f'quantile width k={k} | residual | {mdl} | extended'
+    for cn, cv in curves.items():
+        if cv not in VARIANTS or not VARIANTS[cv].get('kw'):
+            print(f'  {cn}: curve {cv} not quoted, stack skipped'); continue
+        kws = {k: np.nan_to_num(v[_tm_rows], nan=(1.0 if k == 'ratio' else 0.0)) for k, v in VARIANTS[cv]['kw'].items()}
+        for bn, bv in charges.items():
+            if bv not in VARIANTS or VARIANTS[bv].get('b') is None:
+                continue
+            b = np.nan_to_num(VARIANTS[bv]['b'])[_tm_rows]; t0 = time.perf_counter(); nm = f'{cn} + {bn}'; yM, y0 = np.full(N, np.nan), np.full(N, np.nan)
+            yM[_tm_rows] = requote_curve(_tm_rows, _ch[_tm_rows] + b, **kws); y0[_tm_rows] = requote_curve(_tm_rows, _c_base[_tm_rows] + b, **kws)
+            out[nm] = {'family': 'stack: curve + width charge', 'setting': nm, 'yM': bt_final(yM), 'y0': bt_final(y0)}; print(f'  {nm}: {time.perf_counter() - t0:.0f}s')
+    return out
+
+
+_sk_src = {k: float(np.nansum(np.nan_to_num(v.get('b', np.zeros(1))))) for k, v in VARIANTS.items() if k.startswith('quantile width')}
+_sk_src.update({k: {kk: float(np.nansum(vv)) for kk, vv in v['kw'].items()} for k, v in VARIANTS.items() if v.get('kw')})
+_sf2 = cached('var_stacks', _stack_family, deps=[frame_fingerprint(BT, ['charges_level', 'threshold_y']), TEST_M, _sk_src], code=[requote_curve, _argmax_dedup, bt_optimize],
+              cfg=('stack_k', 'qg_models', 'qg_extend', 'logit_kappas', 'call_kappa_grid', 'quant_step')) if _sk_src else {}
+for k_, v_ in _sf2.items():
+    VARIANTS[k_] = v_
+print(f'{len(_sf2)} stacks quoted | {len(VARIANTS)} settings in all')
+record('variants_stacks', settings=list(_sf2), seconds=time.perf_counter() - _sk_t0)
 
 # %% [markdown]
 # ## 8. The matrix
@@ -1405,25 +1517,45 @@ record('variants_call', settings=[k for k in VARIANTS if k.startswith(('call', '
 # %%
 CELL_T('8. The matrix: pairs A, B, C against production, the frontier and levelled [8]')
 _x_t0 = time.perf_counter(); _rows_vm = []
-for nm, v_ in VARIANTS.items():
+
+
+def quote_fp(y: np.ndarray) -> str:
+    """Fingerprint of a quote vector on the test winnable rows (float32 bytes), the cache key of everything scored from it."""
+    return hashlib.sha1(np.nan_to_num(np.asarray(y, float)[_tm_rows], nan=-1e9).astype(np.float32).tobytes()).hexdigest()[:16]
+
+
+def _score_variant(nm: str, v_: dict) -> list[dict]:
+    """Every scorecard row of one variant: three comparators in pairs A, B, C, pooled and by period."""
+    rows_out = []
     for pair, yv, yb, reg, bk in (('A', v_['yM'], Y_PM, 'M', BK_BASE['M']), ('B', v_['y0'], Y_PM, 'M', BK_BASE['M']), ('C', v_['y0'], Y_P0, '0', BK_BASE['0'])):
         if not np.isfinite(yv).any():
             continue
         rows = np.flatnonzero(_tmw & np.isfinite(yv) & np.isfinite(yb))
-        _rows_vm.append(score_pair(nm, yv, yb, family=v_['family'], setting=v_['setting'], regime=reg, pair=pair, mode='vs production', bk_base=bk))
+        rows_out.append(score_pair(nm, yv, yb, family=v_['family'], setting=v_['setting'], regime=reg, pair=pair, mode='vs production', bk_base=bk))
         yf, wf_, mm_ = match_frontier(yv, reg, rows)
-        _rows_vm.append(score_pair(nm, yv, yf, family=v_['family'], setting=v_['setting'], regime=reg, pair=pair, mode='vs frontier at equal win rate', widths=wf_, mismatch=mm_))
+        rows_out.append(score_pair(nm, yv, yf, family=v_['family'], setting=v_['setting'], regime=reg, pair=pair, mode='vs frontier at equal win rate', widths=wf_, mismatch=mm_))
         yl, wd = level_to(yv, yb, rows)
-        _rows_vm.append(score_pair(nm, yl, yb, family=v_['family'], setting=v_['setting'], regime=reg, pair=pair, mode='levelled to production', widths={m: -w for m, w in wd.items()}, bk_base=bk))
+        rows_out.append(score_pair(nm, yl, yb, family=v_['family'], setting=v_['setting'], regime=reg, pair=pair, mode='levelled to production', widths={m: -w for m, w in wd.items()}, bk_base=bk))
         for per_, mons_ in PERIODS.items():
             if len(PERIODS) < 2:
                 continue
             if 'vs production' in CFG.period_modes:
-                _rows_vm.append(score_pair(nm, yv, yb, family=v_['family'], setting=v_['setting'], regime=reg, pair=pair, mode='vs production', months=mons_, period=per_))
+                rows_out.append(score_pair(nm, yv, yb, family=v_['family'], setting=v_['setting'], regime=reg, pair=pair, mode='vs production', months=mons_, period=per_))
             if 'vs frontier at equal win rate' in CFG.period_modes:
-                _rows_vm.append(score_pair(nm, yv, yf, family=v_['family'], setting=v_['setting'], regime=reg, pair=pair, mode='vs frontier at equal win rate', widths=wf_, mismatch=mm_, months=mons_, period=per_))
+                rows_out.append(score_pair(nm, yv, yf, family=v_['family'], setting=v_['setting'], regime=reg, pair=pair, mode='vs frontier at equal win rate', widths=wf_, mismatch=mm_, months=mons_, period=per_))
             if 'levelled to production' in CFG.period_modes:
-                _rows_vm.append(score_pair(nm, yl, yb, family=v_['family'], setting=v_['setting'], regime=reg, pair=pair, mode='levelled to production', widths={m: -w for m, w in wd.items()}, months=mons_, period=per_))
+                rows_out.append(score_pair(nm, yl, yb, family=v_['family'], setting=v_['setting'], regime=reg, pair=pair, mode='levelled to production', widths={m: -w for m, w in wd.items()}, months=mons_, period=per_))
+    return rows_out
+
+
+# v1.3: one cache entry per variant, keyed on its quotes, the comparators' quotes and the scorecard code, so a run that adds or changes a few
+# settings rescores only those (the matrix took 33 minutes for 47 settings in v1.2.1)
+_SCORE_DEPS = [STAGE_KEYS.get('var_front_x_M'), STAGE_KEYS.get('var_front_x_0'), quote_fp(Y_PM), quote_fp(Y_P0), _jsonable(BK_BASE), PERIODS, TEST_M,
+               float(np.nansum(_M_REC[_tmw])), float(np.nansum(_M_GUARD[_tmw])), float(np.nansum(_mmd5[_tmw])), float(np.nansum(_usd_trim[_tmw])), float(np.nansum(_cm_rec[_tmw]))]
+for nm, v_ in VARIANTS.items():
+    _rows_vm.extend(cached(f'score_{hashlib.sha1(nm.encode()).hexdigest()[:12]}', (lambda nm=nm, v_=v_: _score_variant(nm, v_)), deps=_SCORE_DEPS + [nm, v_['family'], quote_fp(v_['yM']), quote_fp(v_['y0'])],
+                           code=[score_pair, match_frontier, level_to, book_sd, cluster_t, frontier_quote, bt_win_fast, _score_variant],
+                           cfg=('period_modes', 'hedge_cost_bp', 'dv01_trim_q', 'level_range_bp', 'level_iters')))
 VM = pd.DataFrame(_rows_vm); VM['reading'] = [dominance(r) for _, r in VM.iterrows()]
 VM['pareto'] = False
 for (pair, mode, per_), idx in VM.groupby(['pair', 'mode', 'period']).indices.items():
@@ -1460,6 +1592,56 @@ savefig('v8_matrix')
 record('variants_matrix', table=flat_records(VM.set_index(['variant', 'pair', 'mode', 'period'])), verdicts=VERDICTS, periods=PERIODS, seconds=time.perf_counter() - _x_t0)
 VM.to_parquet(OUT / 'variant_matrix.parquet')
 print(f'matrix written: {OUT / "variant_matrix.parquet"} ({len(VM)} rows) | [8] {time.perf_counter() - _x_t0:.0f}s')
+
+# %% [markdown]
+# ## 8b. Month by month: the candidates against the frontier (v1.3)
+#
+# The pooled scorecard hides the month pattern, and the two manual-charge periods are themselves pooled. Here the top candidates of pairs A and C
+# at equal win rate (the first `monthly_top` by the smallest sceptical delta among the rows better on all four valuations, plus the fixed
+# references and every stack) are scored one month at a time against the frontier comparator of that month: win rate, wins kept, cover change,
+# the smallest sceptical delta, the record delta with its t, dollars and the book sd change. Tables by month; one figure with the smallest
+# sceptical delta and the cover change by month for both pairs.
+
+# %%
+CELL_T('8b. Month by month: the candidates against the frontier [8b]')
+_mo_t0 = time.perf_counter(); _mo_rows = []; _REFS = [f'logit {CFG.logit_kappas[-1]:g} | idiosyncratic', f'quantile width k={CFG.stack_k[0]} | residual | ls'] + [k for k in VARIANTS if VARIANTS[k]['family'].startswith('stack')]
+MONTHLY_CANDS = {}
+for pair, reg, yb in (('A', 'M', Y_PM), ('C', '0', Y_P0)):
+    t = VM[(VM['pair'] == pair) & (VM['mode'] == 'vs frontier at equal win rate') & (VM['period'] == 'all')].sort_values('min delta, sceptical (bp)', ascending=False)
+    top = t['variant'][t['reading'].str.contains('all four')].head(CFG.monthly_top).tolist()
+    cands = list(dict.fromkeys(top + [r for r in _REFS if r in VARIANTS])); MONTHLY_CANDS[pair] = cands
+    for nm in cands:
+        v_ = VARIANTS[nm]; yv = v_['yM'] if pair == 'A' else v_['y0']
+        if not np.isfinite(yv).any():
+            continue
+        rows = np.flatnonzero(_tmw & np.isfinite(yv) & np.isfinite(yb)); yf, wf_, mm_ = match_frontier(yv, reg, rows)
+        for m in TEST_M:
+            _mo_rows.append(score_pair(nm, yv, yf, family=v_['family'], setting=v_['setting'], regime=reg, pair=pair, mode='vs frontier at equal win rate', widths=wf_, mismatch=mm_, months=[m], period=m))
+VMM = pd.DataFrame(_mo_rows)
+if len(VMM):
+    VMM['reading'] = [dominance(r) for _, r in VMM.iterrows()]
+    _mcols = {'min delta, sceptical (bp)': 'min sceptical (bp)', 'cover change (bp)': 'cover change (bp)', 'wins kept': 'wins kept', 'delta | record (bp)': 'record (bp)', 'NW t | record': 'record t',
+              'delta $ per month, trimmed | record ($k)': '$k, trimmed', 'ex-ante sd vs base': 'book sd vs base', 'win rate': 'win rate'}
+    for pair in ('A', 'C'):
+        for col, lab in _mcols.items():
+            tp = VMM[VMM['pair'] == pair].pivot(index='period', columns='variant', values=col)
+            if col in ('min delta, sceptical (bp)', 'cover change (bp)', 'delta $ per month, trimmed | record ($k)'):
+                print(f'\nPAIR {pair} by month, {lab} against the frontier at equal win rate:'); display(tp.round(3))
+    fig, ax = plt.subplots(2, 2, figsize=(18, 9)); _cm = plt.get_cmap('tab10')
+    for j, pair in enumerate(('A', 'C')):
+        t = VMM[VMM['pair'] == pair]
+        for i, (nm, g) in enumerate(t.groupby('variant')):
+            g = g.sort_values('period'); lw = 2.2 if nm in _REFS[:2] else 1.2
+            ax[0, j].plot(g['period'], g['min delta, sceptical (bp)'], '-o', ms=3, lw=lw, color=_cm(i % 10), label=nm)
+            ax[1, j].plot(g['period'], g['cover change (bp)'], '-o', ms=3, lw=lw, color=_cm(i % 10), label=nm)
+        for a_ in (ax[0, j], ax[1, j]):
+            a_.axhline(0, color='k', lw=0.6); a_.tick_params(axis='x', labelsize=8)
+        ax[0, j].set_title(f'Pair {pair}: smallest sceptical delta by month, at equal win rate (bp per request)', fontsize=10); ax[1, j].set_title(f'Pair {pair}: cover change by month (bp, negative = less left on the table)', fontsize=10)
+        ax[0, j].legend(fontsize=7)
+    savefig('v8b_monthly')
+    VMM.to_parquet(OUT / 'variant_matrix_monthly.parquet')
+record('variants_monthly', candidates=MONTHLY_CANDS, table=flat_records(VMM.set_index(['variant', 'pair', 'period'])) if len(VMM) else [], seconds=time.perf_counter() - _mo_t0)
+print(f'[8b] {len(VMM)} variant-months | {time.perf_counter() - _mo_t0:.0f}s')
 
 # %% [markdown]
 # ## 9. Registry and runtimes

@@ -1,4 +1,4 @@
-# RFQ factor variants: the production optimizer as the judge (variants v1.2.1)
+# RFQ factor variants: the production optimizer as the judge (variants v1.3)
 
 Companion to `muni_rfq_factor_variants.py` / `.ipynb`. The notebook quotes every factor-derived variant through the
 production optimizer, replays it on the desk's requests and reads it against production on the same four facts (win
@@ -23,6 +23,46 @@ for i in range(1, len(parts), 2):
         cells.append(new_code_cell(body))
 nbformat.write(new_notebook(cells=cells, metadata={'kernelspec': {'name': 'python3', 'display_name': 'Python 3', 'language': 'python'}, 'language_info': {'name': 'python'}}), dst)
 ```
+
+## v1.3, the next design after the v1.2.1 run (2026-10-28)
+
+The v1.2.1 run (90 minutes, 47 settings) said: the idiosyncratic-vol curve wins pair C on cover; the quantile-grid width
+charge wins pair C on P&L and dollars and is the first variant to pass pair A, with the manual charge in; the two act on
+different things and had not been combined; the width charge reaches only the 28% of requests with conditional
+quantiles; everything else is flat or a clear loser. v1.3 does four things.
+
+**Pruned, by config, not deleted.** Every retired setting can be re-enabled by one field. Retired: stretch 0.25 and
+logit 0.25; the walk-forward curve picks (`curve_walk_forward`, they converged to 1 and 1.5 and quoted the same thing);
+the tercile and state refits (`curve_refits`); concentration k > 1 and the hedged book term (`k_grid`, `book_k_grid`);
+b(x) as a quote (`value_quote`; the adverse-selection table is still produced); the factor premium (`premium_on`); the
+quantile location value and lambda 2 (`qg_forms`, `qg_lambda_grid`); the call refit, kappa by group, the common move
+and the V5 sd (`call_forms`, `call_idv`). 47 settings become 18 before the stacks.
+
+**The width charge on every request [7d].** `qg_extend`: walk-forward least squares of log calibrated width on the
+request's key group, size bucket, tenor bucket, manual class and log idiosyncratic vol, over the covered rows of the
+earlier months; the observed width where it exists, the model's elsewhere. Quoted as `quantile width k | ... | extended`
+beside the covered version, with the width model's R2 and the covered share printed by month.
+
+**The stacks [7f].** One requote with both a per-request curve and a per-request charge:
+`argmax (x + c + b_i) p_i(x)`. Curves: logit 1.5 on the IPCA residual variance, the same tilt on the trailing residual
+sd, stretch 1. Charges: the width charge at `stack_k` from the covered requests and from the extended model, for each
+quantile model. Twelve stacks at the default config.
+
+**Month by month [8b].** The top `monthly_top` candidates of pairs A and C at equal win rate (rows better on all four
+valuations), the fixed references (logit 1.5, width k=2) and every stack, scored one month at a time against the
+frontier comparator of that month: tables of the smallest sceptical delta, cover change and dollars by month, and a
+figure with the smallest sceptical delta and the cover change by month for both pairs. `variant_matrix_monthly.parquet`.
+
+**Caching.** The matrix [8] is cached per variant: one entry keyed on the variant's quotes (a fingerprint of the
+test-row quote vector), the comparators' quotes, the frontier stage keys, the periods, the markout inputs and the
+scorecard code. A run that adds or changes a few settings rescores only those; v1.2.1 rescored all 47 (33 minutes).
+Also fixed: the cache key's fallback for a function without source on disk was `repr(fn)`, which carries a memory
+address, so an exec'd cell or a lambda never reused its cache; the fallback is now a bytecode fingerprint. The smoke
+test reuses all 38 stages on a second run.
+
+What the smoke test checks for v1.3: every path quotes, caches and scores on the synthetic handoff, 30 settings, the
+extended width covers 98% of requests, 160 variant-months in [8b], and a second run reuses every stage. The real run
+decides the stacks.
 
 ## v1.2.1, revisions from the review of the v1.1 run (2026-10-28)
 
