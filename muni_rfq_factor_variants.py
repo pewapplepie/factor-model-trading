@@ -1114,7 +1114,7 @@ for k_, v_ in _vf['variants'].items():
 BX_TAB = _vf['tables']
 if len(BX_TAB):
     _last = BX_TAB[BX_TAB['month'] == TEST_M[-1]]
-    print(f'b(x) on the wins before {TEST_M[-1]}: the expected move from the quoted mid to the exit by x-quintile and key group (bin 0 = the least aggressive fifth of production\'s concessions, {CFG.x_bins - 1} = the most aggressive; realised centred):')
+    print(f'b(x) on the wins before {TEST_M[-1]}: the expected move from the quoted mid to the exit by x-quintile and key group (bin 0 = the smallest fifth of production\'s concessions, the most aggressive bids; {CFG.x_bins - 1} = the largest concessions, the cheapest bids; realised centred):')
     display(_last.pivot_table(index=['source', 'group'], columns='x bin', values='b(x) (bp)').round(2))
     print('... wins behind each cell:'); display(_last.pivot_table(index=['source', 'group'], columns='x bin', values='wins').astype(int))
 record('variants_value', tables=flat_records(BX_TAB), settings=list(_vf['variants']), seconds=time.perf_counter() - _b_t0)
