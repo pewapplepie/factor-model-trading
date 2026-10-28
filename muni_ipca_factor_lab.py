@@ -7889,9 +7889,26 @@ if 'WF_MATCH' in _G and len(_G['WF_MATCH']) and 'hold_bdays' in _G['WF_MATCH']:
     _ho_hold = _hf.groupby(['tenor_bucket', 'call_bucket']).apply(lambda g: pd.Series({'lots': len(g), 'hold_bdays': _ho_wmedian(g['hold'].to_numpy(), g['par'].to_numpy())}), include_groups=False).reset_index()
     _ho_hold.loc[len(_ho_hold)] = ['ALL', 'ALL', len(_hf), _ho_wmedian(_hf['hold'].to_numpy(), _hf['par'].to_numpy())]
     _ho_hold.to_parquet(HANDOFF_DIR / 'holding.parquet')
+# v1.1: end-of-day positions by CUSIP (the real inventory for the concentration term) and the realised round trips per request row (the realised b(x))
+_ho_pos = None
+if 'WFTRADE_BOOK' in _G and len(_G['WFTRADE_BOOK']):
+    _wbk = _G['WFTRADE_BOOK']; _wbk = _wbk.assign(cusip=_wbk['cusip'].astype(str), date=to_ns(_wbk['exec_date_ny']).dt.normalize(), ts=to_ns(_wbk['execution_timestamp']) if 'execution_timestamp' in _wbk else to_ns(_wbk['exec_date_ny']))
+    _wbk = _wbk.sort_values(['cusip', 'ts'], kind='stable')
+    if 'pos_after' not in _wbk:
+        _wbk['pos_after'] = pd.Series(np.where(_wbk['side'].eq('BID'), 1.0, -1.0) * _wbk['amount'].to_numpy(float), index=_wbk.index).groupby(_wbk['cusip'].to_numpy()).cumsum()
+    _ho_pos = _wbk.groupby(['cusip', 'date'], sort=False).tail(1)[['cusip', 'date', 'pos_after']].rename(columns={'pos_after': 'pos_eod_par'}).reset_index(drop=True)
+    _ho_pos.to_parquet(HANDOFF_DIR / 'positions.parquet')
+_ho_real = None
+if 'WF_MATCH' in _G and len(_G['WF_MATCH']):
+    _rc = [c for c in ['bt_row', 'buy_trade', 'match', 'amount', 'sold_par', 'hold_bdays', 'roundtrip_bp', 'roundtrip_pts', 'roundtrip_usd', 'buy_yield', 'exit_yield', 'buy_edge_pts', 'inventory_pts', 'sale_edge_pts', 'last_sale'] if c in WF_MATCH.columns]
+    _ho_real = WF_MATCH[_rc].copy(); _ho_real['bt_row'] = _ho_real['bt_row'].astype(int)
+    for c in _ho_real.columns:
+        if _ho_real[c].dtype == object:
+            _ho_real[c] = _ho_real[c].astype(str)
+    _ho_real.to_parquet(HANDOFF_DIR / 'realised.parquet')
 print(f'handoff written to {HANDOFF_DIR}: {len(_ho_bt):,} requests x {len(_ho_cols)} columns, {len(_ho_arrays)} arrays, {len(_ho_meta["pb_days"])} days, '
-      f'{len(_G.get("BT_SIGMA_C") or {})} covariance days, {len(BT_CURVES)} pfill files, holding table {"yes" if _ho_hold is not None else "no"} | {time.perf_counter() - _ho_t0:.0f}s')
-record('lab_handoff', path=str(HANDOFF_DIR), requests=int(len(_ho_bt)), columns=_ho_cols, arrays=sorted(_ho_arrays), holding=_ho_hold is not None, seconds=time.perf_counter() - _ho_t0)
+      f'{len(_G.get("BT_SIGMA_C") or {})} covariance days, {len(BT_CURVES)} pfill files, holding table {"yes" if _ho_hold is not None else "no"}, positions {len(_ho_pos) if _ho_pos is not None else 0:,} cusip-days, realised {len(_ho_real) if _ho_real is not None else 0:,} matched lots | {time.perf_counter() - _ho_t0:.0f}s')
+record('lab_handoff', path=str(HANDOFF_DIR), requests=int(len(_ho_bt)), columns=_ho_cols, arrays=sorted(_ho_arrays), holding=_ho_hold is not None, positions=_ho_pos is not None, realised=_ho_real is not None, seconds=time.perf_counter() - _ho_t0)
 
 # %% [markdown]
 # ## 15. Registry and runtimes

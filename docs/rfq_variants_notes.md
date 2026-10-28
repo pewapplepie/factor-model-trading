@@ -1,4 +1,4 @@
-# RFQ factor variants: the production optimizer as the judge (variants v1)
+# RFQ factor variants: the production optimizer as the judge (variants v1.1)
 
 Companion to `muni_rfq_factor_variants.py` / `.ipynb`. The notebook quotes every factor-derived variant through the
 production optimizer, replays it on the desk's requests and reads it against production on the same four facts (win
@@ -24,14 +24,56 @@ for i in range(1, len(parts), 2):
 nbformat.write(new_notebook(cells=cells, metadata={'kernelspec': {'name': 'python3', 'display_name': 'Python 3', 'language': 'python'}, 'language_info': {'name': 'python'}}), dst)
 ```
 
+## v1.1, after the first real run (2026-10-27)
+
+The run of v1 on the 10-23 data (92 minutes, 60 settings) said four things: the manual charge's allocation is information and
+no factor term replaces it (every pair B row negative); on top of the manual charge nothing adds (pair A); the idiosyncratic-vol
+fill curve carries real information (the only sigma that improves the held-out log-likelihood; accepted in pair C under all three
+sceptical valuations), which the traders already price; and the own-CUSIP inventory term cut the book's risk by two thirds at
+production's win rate for 0.9 bp of cover with flat P&L, and failed a bar written for cover variants. Dollar-weighted and
+count-weighted deltas disagreed, and the curve family took 54 minutes.
+
+v1.1 changes the reading and the families accordingly. The desk's objective is: hold the win rate near production's, lower the
+cover, raise the P&L under the sceptical exits. There is no threshold anywhere.
+
+- **The comparator is production widened to the variant's win rate** through its own optimizer, month by month, on a 0.5 bp
+  width grid from -10 to +10 (the residual win-rate mismatch is a column). Each variant is also read against production as it is
+  and levelled to production (the v1 reading). The width grids of both regimes are cached (`var_front_x_M`, `var_front_x_0`,
+  float64 so the width-0 column reproduces production bit for bit; about 430 MB each at the lab's scale).
+- **Every cell is a change with its t**: win rate and its change, wins kept, new wins, wins given up, bp left on the table on
+  cover wins and its change, bp saved on kept cover wins, crossing, the delta under five valuations with weekly Newey-West t and
+  months positive, the smallest of the four sceptical deltas, dollars count-weighted, DV01-weighted and DV01-trimmed at the 99th
+  percentile with the top-1% share, the delta on requests at the month's modal manual charge and on request-specific ones, the
+  P&L sample share, the book's ex-ante sd against the comparator's, hedged dollars per dollar of sd. A sign-only **reading** says
+  which axes the variant is better on (cover, P&L under all four valuations, risk), and a **Pareto set** per pair and comparator
+  lists the variants nothing else beats on cover, sceptical P&L and risk at once. The v1 gates are retired.
+- **Fill curve [5]**: idiosyncratic vol only; stretch and logit with the parameter picked walk-forward by cumulative held-out
+  log-likelihood; the own-curve refit by vol tercile; and the state-conditioned refit by vol tercile x manual class (the month's
+  modal charge or a request-specific one) x the lagged common-move tercile of the day. The stretch ratio and the logit shift are
+  quantised to 0.01 so each distinct curve is built once per key and the argmax is solved once per distinct (parameter, charge).
+- **Concentration term [6]**: `gamma sigma_h^2 (Q_i + u_i / 2)` with `Q_i` the real inventory, the WFTrade start-of-day DV01 in
+  the CUSIP (cell 15a writes `positions.parquet`) plus the policy's incremental fills over production's in the last h days. The
+  replayed-book version and the hedged book term are kept as references. The half-spread, the full book term and the combined
+  curve-plus-charge are dropped (flat or dominated in v1).
+- **Value b(x) [7]**: `E[markout | won at x]` per key group (coupon bin x call group) and x-quintile of production's concessions,
+  walk-forward, empirical-Bayes shrinkage to the group mean, from the exit of record on production's wins and from the realised
+  WFTrade round trips on the matched fills (cell 15a writes `realised.parquet`); quoted as `argmax (x + c + b(x)) p(x)`, and
+  combined with the walk-forward logit curve. The b(x) tables of the last month are printed: the adverse-selection curve.
+- **Signals [7b]** off by default (`CFG.signals_on`).
+
+Objects added: `FRONT_X`, `FRONTIER` (win rate, cover and P&L by width and month), `POS_SOD`, `_real_bp`, `_man_modal`,
+`_mkt_state`, `_kgrp`, `BX_TAB`, `VM['reading']`, `VM['pareto']`, `VERDICTS` (readings per pair and comparator). Registry
+sections unchanged in name; `variants_value` added.
+
 ## How it connects to the lab
 
 1. Run the lab through Section 17 and the new **Section 15a, the handoff**, which writes
    `artifacts_ipca_lab/handoff_rfq_variants/`: `requests.parquet` (the request frame with the logged quote, charges,
    outcome, thresholds, exits and signals), `arrays.npz` (betas, exposures, idiosyncratic variances, the volatility
    measures, every 14f markout, the hedge term, the 14g tilt inputs), `objects.pkl` (the production fill curves, the
-   picked covariance by day, the run metadata) and `holding.parquet` (the realised par-weighted median holding time by
-   tenor x call bucket from Section 17). About 1 GB at the lab's scale.
+   picked covariance by day, the run metadata), `holding.parquet` (the realised par-weighted median holding time by
+   tenor x call bucket from Section 17), `positions.parquet` (end-of-day par by CUSIP from the WFTrade book) and
+   `realised.parquet` (the matched lots' realised round trips per request row). About 1 GB at the lab's scale.
 2. Run `muni_rfq_factor_variants.py` with `MUNI_LAB_ROOT` pointing at the lab's root (default the lab machine's path).
    Its outputs go to `artifacts_ipca_lab/variants/`: the cache, the figures, `variant_matrix.parquet` (every cell of
    the matrix) and `results_registry_variants.json`.
@@ -89,7 +131,14 @@ Objects: `VARIANTS` (name to quotes with and without the manual charge), `Y_PM`,
 - Every sequential replay builds the policy's own book from the first day with a covariance; days outside the test
   months quote production and only build the book, as in lab 14b.
 
-## The synthetic smoke test
+## The synthetic smoke test (v1.1)
+
+The harness runs Sections 17 and 15a from the repo and writes the handoff with positions and realised lots for its 7,000-request
+world; the runner executes the notebook in a fresh namespace. Last run: all cells, 25 settings in both regimes, 225 matrix rows
+(three comparators), both figures, every registry section, 19 seconds; the replay check exact. On the synthetic world the b(x)
+tables are empty (no key group has 50 wins) and the refits choose production's curve; the numbers mean nothing for the desk.
+
+## The synthetic smoke test (v1)
 
 The lab's harness (session scratch, not committed) now runs Sections 17 and 15a from the repo and writes the handoff
 for its 7,000-request world; a runner executes the variant notebook cell by cell in a fresh namespace on that handoff.
