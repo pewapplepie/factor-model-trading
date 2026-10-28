@@ -1,4 +1,4 @@
-# RFQ factor variants: the production optimizer as the judge (variants v1.1)
+# RFQ factor variants: the production optimizer as the judge (variants v1.2)
 
 Companion to `muni_rfq_factor_variants.py` / `.ipynb`. The notebook quotes every factor-derived variant through the
 production optimizer, replays it on the desk's requests and reads it against production on the same four facts (win
@@ -23,6 +23,30 @@ for i in range(1, len(parts), 2):
         cells.append(new_code_cell(body))
 nbformat.write(new_notebook(cells=cells, metadata={'kernelspec': {'name': 'python3', 'display_name': 'Python 3', 'language': 'python'}, 'language_info': {'name': 'python'}}), dst)
 ```
+
+## v1.2, the lab pieces never quoted through the optimizer (2026-10-28)
+
+The v1.1 run settled the families it carried: the idiosyncratic-vol curve wins pair C, the concentration term is a risk
+tool, b(x) from realised round trips is negative, pair B is closed. Three parts of the lab had never been quoted at all:
+the factor premium (8b), the conditional quantiles in beta space (10) and the call-structure work (9). v1.2 quotes them,
+each in the form its object suggests, on the same optimizer, the same replay and the same v1.1 scorecard. The lab writes
+them at the request level in `models.parquet` (15a [2], lab v4.9.3); cell 2b loads it and the three families skip
+themselves, saying so, when a column is absent.
+
+| Family (cell) | Term changed | Form in x | Settings |
+|---|---|---|---|
+| Factor premium [7c] | `c + b_i`, `b_i = -E[dy_i]` over the record horizon (a bid gains when yields fall) | constant | as stated (slope 1); slope calibrated walk-forward by OLS of the record markout on `b_i` over production's wins in the earlier months; stated plus carry: 3 |
+| Quantile grid [7d] | the markout distribution `M = -dy` from the model's quantiles, brought to the horizon by a walk-forward location slope and scale ratio on production's wins | width charge `c - gamma_k W_i` (constant); location value `c + s med_i` (constant); downside penalty `argmax p(x)[x + c + E M - lambda E(-(x + c + M))+]` (a function of x) | grid and location-scale models on the next-day residual; k in {1, 2}; lambda in {1, 2} plus walk-forward: 11 |
+| Call structure [7e] | the fill curve by call group; the tilt strength by group; the tilt on the call-aware residual sd; the group's common move as value | refit: a distribution per group; kappa by group: a function of x; trailing-sd tilt: a function of x; common move: constant | refit (n0 by the previous month's LL); kappa per group picked by the group's LL; logit 1.5 on `idv_trail_v5` and on `idv_trail_v0` (the control on the same window); common move with the slope calibrated within the group: 5 |
+
+No thresholds and no new constants: every scale is a walk-forward calibration on production's wins in the earlier months,
+and the short k and lambda grids are read by the same walk-forward Sharpe pick as the concentration term. The downside
+penalty is the one new optimizer path: it is solved row by row (no dedup, the term is request-specific along the grid)
+in chunks of 2,000 requests, so it is the slowest of the new settings. The matrix [8] and the registry [9] pick the new
+rows up unchanged; the matrix page in the review is regenerated from the same output.
+
+What the synthetic smoke test can and cannot say about v1.2: the synthetic `models.parquet` is noise with the right
+shapes and gaps, so the smoke run checks only that every path quotes, caches and scores. The real run decides.
 
 ## v1.1, after the first real run (2026-10-27)
 
