@@ -1,4 +1,4 @@
-# IPCA as the desk's risk model: lab v4.9.2 (Sections 14d to 14g, 16, 17 and the 15a handoff)
+# IPCA as the desk's risk model: lab v4.9.3 (Sections 14d to 14g, 16, 17 and the 15a handoff)
 
 Companion to `muni_ipca_factor_lab.py` / `.ipynb`. The notebook in the repo is the v4 lab reconstructed from
 `muni_ipca_factor_lab_v4.html` (markdown cells re-derived from the rendered html, code cells verbatim) with the new
@@ -150,6 +150,19 @@ One cell before Section 15 writes everything `muni_rfq_factor_variants.py` reads
 labels, stage keys) and `holding.parquet` (the realised par-weighted median holding by tenor x call bucket from
 `WF_MATCH`). Every object is taken with `globals().get`, so a lab run that stops before 17 still writes a handoff without
 the holding table. See `docs/rfq_variants_notes.md` for what the variant notebook does with it.
+
+A second cell, 15a [2] (v4.9.3), writes `models.parquet`: the lab's pieces that had never been quoted through the
+optimizer, evaluated at each request from the last close strictly before it. The factor premium of 8b
+(`premium_dy_bp = beta_i . lambda_bar x BT_HOLD`, the expected yield change over the record horizon under the last
+Gamma whose training ended before the request; positive = yields up), the request's modified duration and carry over the
+horizon in bp of yield; the conditional quantiles of 10 (`q_{residual|total}_{grid|ls}_{05..95}`: the lookup grid by
+beta cluster x activity and the location-scale model on XS + TS, trained on the `qf` rows whose target month precedes the
+request's month, predicted on the bond's last `qf` row before the request); the call structure of 9 (`call_structure`
+from the model panel, `idv_trail_{v0,v1,v5}` the trailing 20-observation sd of the residual under the record model and
+the call-aware variants scaled by sqrt(BT_HOLD), and `cc_lag`, the group's last date-mean residual from `cc_series`).
+Every block is guarded on the kernel having the object; what is missing is left out and the variant notebook skips the
+family that needs it. The quantile block re-runs the two cheap Section 10 models per month on the request rows (the lab's
+own cache keeps only the last month's predictions), about a minute a month.
 
 ## Definitions worth having in one place
 

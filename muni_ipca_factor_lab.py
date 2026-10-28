@@ -1,4 +1,4 @@
-# muni_ipca_factor_lab.py: lab v4.9.2. Cells 1 to 15 reconstructed from the v4 run (muni_ipca_factor_lab_v4.html; markdown re-derived from the rendered cells, code verbatim);
+# muni_ipca_factor_lab.py: lab v4.9.3. Cells 1 to 15 reconstructed from the v4 run (muni_ipca_factor_lab_v4.html; markdown re-derived from the rendered cells, code verbatim);
 # Sections 14d to 14g and 17 are new; Section 16 is lifted from the lab machine's run (muni_ipca_factor_lab (1).html) and needs its pipeline functions. Percent format; regenerate the .ipynb with the converter in docs/ipca_risk_model_notes.md.
 
 # %% [markdown]
@@ -7909,6 +7909,103 @@ if 'WF_MATCH' in _G and len(_G['WF_MATCH']):
 print(f'handoff written to {HANDOFF_DIR}: {len(_ho_bt):,} requests x {len(_ho_cols)} columns, {len(_ho_arrays)} arrays, {len(_ho_meta["pb_days"])} days, '
       f'{len(_G.get("BT_SIGMA_C") or {})} covariance days, {len(BT_CURVES)} pfill files, holding table {"yes" if _ho_hold is not None else "no"}, positions {len(_ho_pos) if _ho_pos is not None else 0:,} cusip-days, realised {len(_ho_real) if _ho_real is not None else 0:,} matched lots | {time.perf_counter() - _ho_t0:.0f}s')
 record('lab_handoff', path=str(HANDOFF_DIR), requests=int(len(_ho_bt)), columns=_ho_cols, arrays=sorted(_ho_arrays), holding=_ho_hold is not None, positions=_ho_pos is not None, realised=_ho_real is not None, seconds=time.perf_counter() - _ho_t0)
+
+# %% [markdown]
+# ### 15a [2]. The lab's models on the requests
+#
+# The pieces of the lab that have not been quoted through the optimizer, evaluated at each request from the last close strictly before it, so the
+# variant notebook can quote them without this kernel: the factor premium of 8b (the request's exposures times the mean daily factor realisation of
+# the Gamma in force, as an expected yield change over the record horizon), the conditional quantiles of 10 (the lookup grid by beta cluster x
+# activity and the location-scale model on XS + TS, for the next-day residual and the next-day total move, trained on the months before the
+# request's month), and the call structure of 9 (the group, the trailing sd of the residual under the record model and under the call-aware
+# variants, scaled to the record horizon, and the group's last date-mean residual). Written to `models.parquet`; whatever this kernel lacks is left
+# out and the variant notebook says so.
+
+# %%
+CELL_T('15a. Handoff to the variant notebook [2]')
+_hm_t0 = time.perf_counter(); _G = globals(); _hm = pd.DataFrame(index=np.arange(len(BT))); _hm_have = []
+_hm_dates = pd.to_datetime(BT['date']).dt.normalize(); _hm_cusip = BT['cusip'].astype(str).to_numpy()
+_hm_req = pd.DataFrame({'bt_row': np.arange(len(BT)), 'cusip': _hm_cusip, 'date': to_ns(_hm_dates)}).sort_values('date', kind='stable')
+
+
+def _hm_asof(frame: pd.DataFrame, cols: list[str], by: str = 'cusip') -> pd.DataFrame:
+    """The last row of frame strictly before each request's date, matched on `by`; NaN where there is none. Returned in request order."""
+    f = frame[[by, 'date'] + cols].dropna(subset=['date']).copy(); f[by] = f[by].astype(str); f['date'] = to_ns(f['date']); f = f.sort_values('date', kind='stable')
+    r = _hm_req if by == 'cusip' else _hm_req.assign(**{by: _hm[by].to_numpy()[_hm_req['bt_row'].to_numpy()]})
+    j = pd.merge_asof(r, f, on='date', by=by, direction='backward', allow_exact_matches=False)
+    return j.sort_values('bt_row', kind='stable')[cols].reset_index(drop=True)
+
+
+# ---- the model panel at the request: call structure, duration, yield level
+if 'model' in _G and 'call_structure' in model.columns:
+    _mp = _hm_asof(model, ['call_structure', 'modified_duration_lag1'])
+    _hm['call_structure'] = _mp['call_structure'].astype(str).where(_mp['call_structure'].notna(), 'NA').to_numpy(); _hm_have.append('call_structure')
+    _hm_dur = pd.to_numeric(_mp['modified_duration_lag1'], errors='coerce').to_numpy(float)
+else:
+    _hm_dur = np.full(len(BT), np.nan)
+if '_gz_dur' in _G and len(_G['_gz_dur']) == len(BT):
+    _hm_dur = np.where(np.isfinite(_hm_dur), _hm_dur, np.asarray(_G['_gz_dur'], float))
+_hm['mod_duration'] = _hm_dur
+_hm['carry_yield_bp'] = BT['signalyield'].to_numpy(float) * (BT_HOLD * 7.0 / 5.0) / 365.0 * 100.0 / np.where(np.isfinite(_hm_dur) & (_hm_dur > 0.25), _hm_dur, np.nan)   # carry over the record horizon, in bp of yield
+
+# ---- 8b: the factor premium as an expected yield change over the record horizon (positive = yields up), under the Gamma in force at the request
+if 'LAM' in _G and _G['LAM'] and 'folds' in _G and 'BT_BETA' in _G and np.asarray(BT_BETA).shape == (len(BT), CFG.selected_k):
+    _fe = sorted((pd.Timestamp(fo['train_end']), fo['fold']) for fo in folds if fo['fold'] in LAM)
+    _fend = np.array([d.to_datetime64() for d, _ in _fe]); _fid = [k for _, k in _fe]
+    _fi = np.searchsorted(_fend, _hm_dates.to_numpy(), side='left') - 1          # the last Gamma whose training ended before the request date
+    _lam = np.full((len(BT), CFG.selected_k), np.nan); _okf = _fi >= 0
+    if _okf.any():
+        _lam[_okf] = np.vstack([LAM[_fid[i]] for i in _fi[_okf]])
+    _hm['premium_dy_bp'] = np.einsum('ij,ij->i', np.nan_to_num(np.asarray(BT_BETA, float)), _lam) * BT_HOLD; _hm_have.append('premium_dy_bp')
+    print(f'factor premium on {np.isfinite(_hm["premium_dy_bp"]).sum():,} requests: expected yield change over {BT_HOLD} days, median {np.nanmedian(_hm["premium_dy_bp"]):+.2f} bp, IQR '
+          f'[{np.nanquantile(_hm["premium_dy_bp"], 0.25):+.2f}, {np.nanquantile(_hm["premium_dy_bp"], 0.75):+.2f}]')
+
+# ---- 10: conditional quantiles of the next-day residual and total move at the request's last close, walk-forward by the request's month
+if all(k in _G for k in ('qf', '_ls_quantiles', '_grid_quantiles', 'QR_SETS', 'QR_TAUS', 'QR_MAX_TRAIN')):
+    _qa = _hm_asof(qf.reset_index(names='qf_row'), ['qf_row']); _qr = _qa['qf_row'].to_numpy(float); _hq = np.isfinite(_qr)
+    _hm_month = BT['month'].astype(str).to_numpy(); _nq = 0
+    for _tg, _col in (('residual', 'next_residual'), ('total', 'next_total')):
+        for _mdl in ('grid', 'ls'):
+            for _t in QR_TAUS:
+                _hm[f'q_{_tg}_{_mdl}_{int(round(100 * _t)):02d}'] = np.nan
+    for m in sorted(set(_hm_month)):
+        _rm = np.flatnonzero(_hq & (_hm_month == m))
+        if not len(_rm):
+            continue
+        _te = qf.iloc[_qr[_rm].astype(int)]
+        for _tg, _col in (('residual', 'next_residual'), ('total', 'next_total')):
+            _tr = qf[(qf['target_month'] < pd.Period(m, 'M')) & qf[_col].notna()]
+            if len(_tr) < 20_000:
+                continue
+            _trs = _tr.sample(min(len(_tr), QR_MAX_TRAIN), random_state=CFG.seed); _lo, _hi = np.quantile(_tr[_col], [0.005, 0.995])
+            _Qg = _grid_quantiles(_tr, _te, _col); _Ql, _ = _ls_quantiles(_trs, _te, QR_SETS['XS + TS'], _col, _lo, _hi)
+            for _mdl, _Q in (('grid', _Qg), ('ls', _Ql)):
+                for j_, _t in enumerate(QR_TAUS):
+                    _hm.loc[_rm, f'q_{_tg}_{_mdl}_{int(round(100 * _t)):02d}'] = _Q[:, j_]
+            _nq += len(_rm)
+    _hm_have.append('quantiles'); print(f'conditional quantiles on {int(np.isfinite(_hm["q_residual_grid_50"]).sum()):,} requests (grid and location-scale, next-day residual and total; {len(QR_TAUS)} quantiles) | {time.perf_counter() - _hm_t0:.0f}s')
+
+# ---- 9: the trailing sd of the residual under the record model and the call-aware variants; the group's last date-mean residual
+if 'LAB_CS' in _G and _G['LAB_CS']:
+    _v0 = next((k for k in LAB_CS if k.startswith('V0')), None); _cs_names = {'v0': _v0, 'v1': next((k for k in LAB_CS if k.startswith('V1')), None), 'v5': next((k for k in LAB_CS if k.startswith('V5')), None)}
+    if _v0 is not None:
+        _base_cd = LAB_CS[_v0]['resid'][['cusip', 'date']].reset_index(drop=True)
+        for _tag, _nm in _cs_names.items():
+            if _nm is None or 'pit_residual' not in LAB_CS[_nm]['resid']:
+                continue
+            _rf = _base_cd.assign(e=LAB_CS[_nm]['resid']['pit_residual'].to_numpy(float)).sort_values(['cusip', 'date'], kind='stable')
+            _rf['sd'] = _rf.groupby('cusip', observed=True)['e'].rolling(20, min_periods=5).std().reset_index(level=0, drop=True) * np.sqrt(BT_HOLD)
+            _hm[f'idv_trail_{_tag}'] = _hm_asof(_rf, ['sd'])['sd'].to_numpy(float); _hm_have.append(f'idv_trail_{_tag}')
+if 'cc_series' in _G and 'call_structure' in _hm:
+    _ccf = pd.concat([pd.DataFrame({'call_structure': g, 'date': s.index, 'cc': s.to_numpy(float)}) for g, s in cc_series.items()], ignore_index=True)
+    _hm['cc_lag'] = _hm_asof(_ccf, ['cc'], by='call_structure')['cc'].to_numpy(float); _hm_have.append('cc_lag')
+
+for c in _hm.columns:
+    if _hm[c].dtype == object:
+        _hm[c] = _hm[c].astype(str)
+_hm.to_parquet(HANDOFF_DIR / 'models.parquet')
+print(f'models handoff: {len(_hm):,} requests x {_hm.shape[1]} columns to {HANDOFF_DIR / "models.parquet"} | present: {_hm_have or "none beyond duration and carry"} | {time.perf_counter() - _hm_t0:.0f}s')
+record('lab_handoff_models', columns=list(_hm.columns), present=_hm_have, seconds=time.perf_counter() - _hm_t0)
 
 # %% [markdown]
 # ## 15. Registry and runtimes
