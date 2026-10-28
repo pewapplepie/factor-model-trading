@@ -1,4 +1,4 @@
-# muni_rfq_factor_variants.py: variants v1.2. Every factor-derived quoting variant through the production optimizer, replayed on the desk's requests and read
+# muni_rfq_factor_variants.py: variants v1.2.1. Every factor-derived quoting variant through the production optimizer, replayed on the desk's requests and read
 # against production on the same four facts (win rate, cover, crossing, P&L under the sceptical exits), in four pairs. Reads the handoff written by
 # Section 15a of muni_ipca_factor_lab.py; needs no model code and no pipeline. Percent format; regenerate the .ipynb with the converter in docs/rfq_variants_notes.md.
 
@@ -89,7 +89,7 @@ pd.set_option('display.width', 250); pd.set_option('display.max_columns', 60)
 
 @dataclass(frozen=True)
 class VariantConfig:
-    spec_version: str = 'rfq_variants_v1_2'
+    spec_version: str = 'rfq_variants_v1_2_1'
     seed: int = 7
     sigmas: tuple[str, ...] = ('idiosyncratic',)              # v1: systematic and total worsened the fill-curve likelihood; the conditional scale covers 18 percent
     stretch_exponents: tuple[float, ...] = (0.25, 0.5, 1.0)
@@ -107,7 +107,9 @@ class VariantConfig:
     call_kappa_grid: tuple[float, ...] = (0.25, 0.5, 1.0, 1.5)   # v1.2, lab 9: the logit tilt strength picked per call-structure group; the last value is the winner's
     call_idv: tuple[str, ...] = ('v0', 'v5')                  # trailing residual sd under the record model and the call-aware variant V5
     min_fit_rows: int = 50                                    # the fewest earlier-month rows a walk-forward slope or pick is estimated on
-    frontier_widths: tuple[float, ...] = tuple(w / 2.0 for w in range(-20, 21))   # -10 .. +10 bp by 0.5
+    frontier_widths: tuple[float, ...] = tuple(sorted(set([w / 2.0 for w in range(-20, 21)] + [float(w) for w in range(-25, 26)])))   # -10 .. +10 by 0.5, then by 1 to +-25 (v1.2.1: the grid ran out at +10 when the manual charge was 13 bp)
+    period_split: tuple[str, ...] = ()                        # v1.2.1: the months of the first period; empty = split at the largest month-to-month jump in the median manual charge
+    period_modes: tuple[str, ...] = ('vs frontier at equal win rate', 'levelled to production')   # the comparators scored per period as well as pooled
     x_bins: int = 5
     dv01_trim_q: float = 0.99
     level_range_bp: float = 40.0
@@ -156,6 +158,14 @@ PRE_REGISTERED: dict[str, str] = {
                               'month\'s log-likelihood), the logit kappa per group picked walk-forward by the group\'s log-likelihood, the winner\'s tilt on the trailing residual sd '
                               'under V5 and under V0, and the group\'s last date-mean residual as value with a slope calibrated within the group. Every row is read by the v1.1 '
                               'scorecard with no threshold; nothing is gated by the lab\'s own verdicts on these pieces'),
+    'variants_v121_revisions': ('fixed 2026-10-28 from the review of the v1.1 run, before the v1.2 run: (1) the t beside every delta is of the same pooled mean, with week-clustered '
+                                'Newey-West standard errors; (2) the reading carries a dollars axis (DV01-trimmed record dollars) and the headline count requires cover, all four '
+                                'valuations and dollars; (3) the frontier grid runs to +-25 bp and the reading names the residual mismatch where the grid still falls short; (4) every '
+                                'pair is also scored on two periods split at the largest month-to-month jump of the median manual charge; (5) the comparator shift is reported in one sign '
+                                'convention (positive = more aggressive) for the frontier and the levelling; (6) the walk-forward k is picked by mean weekly hedged dollars, not the Sharpe; '
+                                '(7) the frontier plot shows one curve per month; (8) b(x) is the move from the quoted mid (markout minus the logged concession), the realised source '
+                                'centred on the earlier months\' median round trip. Not changed: the P&L sample share (markout coverage is what it is and is reported), the risk axis\'s '
+                                'dependence on the lab\'s covariance calibration (labelled), and the fact that on this data the results confirm rather than test'),
 }
 
 
@@ -467,6 +477,21 @@ def requote_const(b: np.ndarray, label: str, fam: str) -> dict:
 CELL_T('3. Machinery [3]')
 
 
+def cluster_t(d: np.ndarray, codes: np.ndarray, n_levels: int) -> float:
+    """t of the pooled mean of d with week-clustered Newey-West standard errors (Bartlett kernel over the weekly sums of the deviations, in week order):
+    the delta and its t are the same quantity (v1.2.1; before, the t was of the unweighted weekly means)."""
+    ok = np.isfinite(d); n = int(ok.sum())
+    if n < 4:
+        return np.nan
+    mu = float(d[ok].mean()); u = np.bincount(codes[ok], weights=d[ok] - mu, minlength=n_levels); has = np.bincount(codes[ok], minlength=n_levels) > 0; u = u[has]; W = len(u)
+    if W < 2:
+        return np.nan
+    L = int(np.floor(4.0 * (W / 100.0) ** (2.0 / 9.0))); v = float(u @ u)
+    for l in range(1, min(L, W - 1) + 1):
+        v += 2.0 * (1.0 - l / (L + 1.0)) * float(u[l:] @ u[:-l])
+    return float(mu * n / np.sqrt(v)) if v > 0 else np.nan
+
+
 def _sigmoid(z):
     return 1.0 / (1.0 + np.exp(-z))
 
@@ -572,14 +597,14 @@ def level_to(y_v: np.ndarray, y_b: np.ndarray, rows: np.ndarray) -> tuple[np.nda
     return y, widths
 
 
-def book_sd(win: np.ndarray) -> dict:
-    """Ex-ante daily sd of the policy's own book on the test days (fills held BT_HOLD days) and gross DV01: lab bt_book_g without the realised part."""
+def book_sd(win: np.ndarray, months: list[str] | None = None) -> dict:
+    """Ex-ante daily sd of the policy's own book on the test days (fills held BT_HOLD days; the given months' days when months is set) and gross DV01: lab bt_book_g without the realised part."""
     w = win & (_pb_u > 0); di = _pb_di[w] + 1
     F = np.column_stack([np.bincount(di, weights=EXPO[w, c], minlength=_pb_nd + 1) for c in range(_D)]); I = np.bincount(di, weights=V_IDIO[w], minlength=_pb_nd + 1); U = np.bincount(di, weights=_pb_u[w], minlength=_pb_nd + 1)
     F, I, U = F.cumsum(0), I.cumsum(0), U.cumsum(0); j = np.arange(_pb_nd); lo = np.maximum(0, j - (BT_HOLD - 1)); E, Iv, Uv = F[j] - F[lo], I[j] - I[lo], U[j] - U[lo]
     sd = np.array([np.sqrt(max(E[k] @ SIGMA[k] @ E[k], 0.0) + Iv[k]) if k in SIGMA else np.nan for k in j])
-    d = _tdays & np.isfinite(sd)
-    return {'sd': float(np.mean(sd[d])) if d.any() else np.nan, 'dv01': float(np.mean(Uv[_tdays])) if _tdays.any() else np.nan}
+    td = _tdays & (np.isin(_pb_month, months) if months is not None else True); d = td & np.isfinite(sd)
+    return {'sd': float(np.mean(sd[d])) if d.any() else np.nan, 'dv01': float(np.mean(Uv[td])) if td.any() else np.nan}
 
 
 def s_book(rows: np.ndarray, j: int, E: np.ndarray, expo: np.ndarray) -> np.ndarray:
@@ -648,26 +673,28 @@ _usd_cap = float(np.nanquantile(_usd[_tmw], CFG.dv01_trim_q)); _usd_trim = np.mi
 
 
 def score_pair(name: str, y_v: np.ndarray, y_b: np.ndarray, family: str = '', setting: str = '', regime: str = '', pair: str = '', mode: str = 'raw',
-               widths: dict | None = None, mismatch: dict | None = None, bk_base: dict | None = None) -> dict:
+               widths: dict | None = None, mismatch: dict | None = None, bk_base: dict | None = None, months: list[str] | None = None, period: str = 'all') -> dict:
     """The paired scorecard: variant quote y_v against comparator y_b on the test-month rows where both exist. No thresholds: every column is a change against the comparator with its t."""
-    rows = np.flatnonzero(_tmw & np.isfinite(y_v) & np.isfinite(y_b)); yv, yb = y_v[rows], y_b[rows]
+    rows = np.flatnonzero(_tmw & np.isfinite(y_v) & np.isfinite(y_b) & (np.isin(_month, months) if months is not None else True)); yv, yb = y_v[rows], y_b[rows]
+    if months is not None:
+        widths = {m: w for m, w in (widths or {}).items() if m in months} or None; mismatch = {m: w for m, w in (mismatch or {}).items() if m in months} or None
     wv, wb = bt_win_fast(rows, yv), bt_win_fast(rows, yb); g = _grp[rows]; dv, db = 100.0 * (_thr[rows] - yv), 100.0 * (_thr[rows] - yb)
     px_v, px_b = 100.0 * (yv - _y_tr[rows]), 100.0 * (yb - _y_tr[rows]); kept = wv & wb; new = wv & ~wb; gone = wb & ~wv; keptc = kept & (g == 'won, cover')
     cv, cb = wv & (g == 'won, cover'), wb & (g == 'won, cover')
-    res = {'variant': name, 'family': family, 'setting': setting, 'regime': regime, 'pair': pair, 'mode': mode, 'months': len(set(_month[rows])), 'requests': len(rows),
+    res = {'variant': name, 'family': family, 'setting': setting, 'regime': regime, 'pair': pair, 'mode': mode, 'period': period, 'months': len(set(_month[rows])), 'requests': len(rows),
            'win rate': float(wv.mean()), 'win rate, base': float(wb.mean()), 'win rate change': float(wv.mean() - wb.mean()), 'wins kept': float(kept.sum() / max(wb.sum(), 1)),
            'new wins': int(new.sum()), 'wins given up': int(gone.sum()),
            'bp left on table (won, cover)': float(dv[cv].mean()) if cv.any() else np.nan, 'bp left on table, base': float(db[cb].mean()) if cb.any() else np.nan,
            'bp saved on kept cover wins': float((db - dv)[keptc].mean()) if keptc.any() else np.nan,
            'crossing on new wins (bp)': float(-dv[new & (g == 'lost, printed')].mean()) if (new & (g == 'lost, printed')).any() else np.nan,
-           'comparator width (bp)': float(np.mean(list(widths.values()))) if widths else 0.0, 'win rate mismatch': float(np.mean(np.abs(list(mismatch.values())))) if mismatch else 0.0}
+           'comparator shift (bp, + = more aggressive)': float(np.mean(list(widths.values()))) if widths else 0.0, 'win rate mismatch': float(np.mean(np.abs(list(mismatch.values())))) if mismatch else 0.0}
     res['cover change (bp)'] = res['bp left on table (won, cover)'] - res['bp left on table, base']
     vals = {'record': (_M_REC[rows], _M_REC[rows]), 'guard': (_M_GUARD[rows], _M_GUARD[rows]), 'common markout': (np.where(new, _cm_rec[rows], _M_REC[rows]), _M_REC[rows]),
             'hedged': (_M_REC[rows] + _mmd5[rows] - CFG.hedge_cost_bp, _M_REC[rows] + _mmd5[rows] - CFG.hedge_cost_bp), 'other side': (_M_OTHER[rows], _M_OTHER[rows])}
     for key, (Mv, Mb) in vals.items():
         pv = np.where(wv, px_v + Mv, 0.0); pb = np.where(wb, px_b + Mb, 0.0); S = np.isfinite(pv) & np.isfinite(pb) & ~((wv & ~np.isfinite(Mv)) | (wb & ~np.isfinite(Mb)))
         d = np.where(S, pv - pb, np.nan); wk = _group_mean(d, _wk_code[rows], len(_wk_levels)); mm = _group_mean(d, _mo_code[rows], len(_mo_levels))
-        res[f'delta | {key} (bp)'] = float(np.nanmean(d)) if S.any() else np.nan; res[f'NW t | {key}'] = nw_t(wk); res[f'months > 0 | {key}'] = int(np.nansum(mm > 0))
+        res[f'delta | {key} (bp)'] = float(np.nanmean(d)) if S.any() else np.nan; res[f'NW t | {key}'] = cluster_t(d, _wk_code[rows], len(_wk_levels)); res[f'months > 0 | {key}'] = int(np.nansum(mm > 0))
         if key in ('record', 'hedged'):
             u, ut = _usd[rows], _usd_trim[rows]; dd = np.where(S, (pv - pb), 0.0)
             res[f'delta $ per month | {key} ($k)'] = float(np.nansum(dd * u) / 1e3 / max(res['months'], 1)); res[f'delta $ per month, trimmed | {key} ($k)'] = float(np.nansum(dd * ut) / 1e3 / max(res['months'], 1))
@@ -678,12 +705,12 @@ def score_pair(name: str, y_v: np.ndarray, y_b: np.ndarray, family: str = '', se
             res['delta: wins given up'] = float(-np.sum(pb[gone & S]) / max(S.sum(), 1))
             for cls, msk in (('manual modal', _man_modal[rows]), ('manual specific', ~_man_modal[rows])):
                 dm = np.where(S & msk, pv - pb, np.nan); res[f'delta | record, {cls} (bp)'] = float(np.nanmean(dm)) if (S & msk).any() else np.nan
-                res[f'NW t | record, {cls}'] = nw_t(_group_mean(dm, _wk_code[rows], len(_wk_levels)))
+                res[f'NW t | record, {cls}'] = cluster_t(dm, _wk_code[rows], len(_wk_levels))
         if key == 'hedged':
             res['hedged $ per month, variant ($k)'] = float(np.nansum(np.where(S, pv, 0.0) * _usd[rows]) / 1e3 / max(res['months'], 1)); res['hedged $ per month, base ($k)'] = float(np.nansum(np.where(S, pb, 0.0) * _usd[rows]) / 1e3 / max(res['months'], 1))
-    full_v = np.zeros(N, bool); full_v[rows] = wv; bk = book_sd(full_v)
-    if bk_base is None:
-        full_b = np.zeros(N, bool); full_b[rows] = wb; bk_base = book_sd(full_b)
+    full_v = np.zeros(N, bool); full_v[rows] = wv; bk = book_sd(full_v, months)
+    if bk_base is None or months is not None:
+        full_b = np.zeros(N, bool); full_b[rows] = wb; bk_base = book_sd(full_b, months)
     res['ex-ante daily sd ($k)'] = bk['sd'] / 1e3; res['ex-ante sd, base ($k)'] = bk_base['sd'] / 1e3; res['ex-ante sd vs base'] = bk['sd'] / bk_base['sd'] - 1.0 if bk_base['sd'] and np.isfinite(bk_base['sd']) else np.nan
     res['gross DV01 ($k/bp)'] = bk['dv01'] / 1e3
     res['hedged $ per $ of sd, variant'] = res['hedged $ per month, variant ($k)'] / res['ex-ante daily sd ($k)'] if res['ex-ante daily sd ($k)'] else np.nan
@@ -695,8 +722,11 @@ def score_pair(name: str, y_v: np.ndarray, y_b: np.ndarray, family: str = '', se
 def dominance(r: dict) -> str:
     """Sign-only reading against the comparator: cover (bp left on cover wins lower), P&L (the delta positive under the record exit, the guard, the common markout and the hedged exit), risk (book sd not higher)."""
     cov = r['cover change (bp)'] < 0; pnl_all = r['min delta, sceptical (bp)'] > 0; pnl_rec = r['delta | record (bp)'] > 0; rsk = (r['ex-ante sd vs base'] <= 0) if pd.notna(r['ex-ante sd vs base']) else False
-    parts = [n for n, ok in (('cover', cov), ('P&L under all four valuations', pnl_all), ('P&L under the record exit only', pnl_rec and not pnl_all), ('risk', rsk)) if ok]
-    return 'better on ' + ', '.join(parts) if parts else 'worse on every axis'
+    usd = r['delta $ per month, trimmed | record ($k)'] > 0 if pd.notna(r['delta $ per month, trimmed | record ($k)']) else False
+    parts = [n for n, ok in (('cover', cov), ('P&L under all four valuations', pnl_all), ('P&L under the record exit only', pnl_rec and not pnl_all), ('dollars', usd), ('risk', rsk)) if ok]
+    out = 'better on ' + ', '.join(parts) if parts else 'worse on every axis'
+    mism = r.get('win rate mismatch', 0.0)
+    return out + (f' (frontier short by {100 * mism:.1f} pp)' if pd.notna(mism) and mism > 0.001 else '')
 
 
 def pareto(frame: pd.DataFrame) -> pd.Series:
@@ -709,14 +739,15 @@ def pareto(frame: pd.DataFrame) -> pd.Series:
 
 
 def wf_pick(settings: dict[str, tuple[np.ndarray, np.ndarray]], order: list[str]) -> tuple[np.ndarray, np.ndarray, list[dict]]:
-    """Walk-forward pick among settings per test month by the hedged weekly $ Sharpe of the manual-kept quote on the earlier test months; the first month takes order[0]."""
+    """Walk-forward pick among settings per test month by the mean weekly hedged $ of the manual-kept quote on the earlier test months (v1.2.1: dollars, not the
+    Sharpe, which rewarded quoting less and sat at the edge of the grid); the first month takes order[0]."""
     def sharpe(y: np.ndarray, months: list[str]) -> float:
         r = np.flatnonzero(_tmw & np.isfinite(y) & np.isin(_month, months))
         if not len(r):
             return np.nan
         w = bt_win_fast(r, y[r]); pnl = np.where(w, (100.0 * (y[r] - _y_tr[r]) + _M_REC[r] + _mmd5[r] - CFG.hedge_cost_bp) * _usd[r], 0.0); ok = np.isfinite(pnl)
         wk = np.bincount(_wk_code[r][ok], weights=pnl[ok], minlength=len(_wk_levels)); has = np.bincount(_wk_code[r][ok], minlength=len(_wk_levels)) > 0; wk = wk[has]
-        return float(wk.mean() / wk.std(ddof=1)) if len(wk) > 2 and wk.std(ddof=1) > 0 else np.nan
+        return float(wk.mean() / 1e3) if len(wk) > 0 else np.nan   # $k per week
 
     yM, y0, rows = np.full(N, np.nan), np.full(N, np.nan), []
     for i, m in enumerate(TEST_M):
@@ -725,7 +756,7 @@ def wf_pick(settings: dict[str, tuple[np.ndarray, np.ndarray]], order: list[str]
             sc = {k: sharpe(v[0], earlier) for k, v in settings.items()}; best = max(sc, key=lambda k: (np.nan_to_num(sc[k], nan=-np.inf)))
         else:
             sc, best = {}, order[0]
-        te = _month == m; yM[te] = settings[best][0][te]; y0[te] = settings[best][1][te]; rows.append({'test month': m, 'picked': best, **{f'train Sharpe {k}': v for k, v in sc.items()}})
+        te = _month == m; yM[te] = settings[best][0][te]; y0[te] = settings[best][1][te]; rows.append({'test month': m, 'picked': best, **{f'train hedged $k/week {k}': v for k, v in sc.items()}})
     return yM, y0, rows
 
 
@@ -769,30 +800,42 @@ for reg in ('M', '0'):
                              'P&L per request, record (bp)': float(np.nanmean(np.where(r, np.where(ww, pv, 0.0), np.nan)))})
 FRONTIER = pd.DataFrame(_fr_rows)
 _fr_show = FRONTIER[FRONTIER['width'].isin([-10, -5, -2, -1, 0, 1, 2, 5, 10])].pivot_table(index=['regime', 'width'], columns='month', values='win rate')
-print('Production\'s width frontier, win rate by month (manual kept = M, manual removed = 0; the full grid is 0.5 bp from -10 to +10):'); display(_fr_show.round(4))
+print('Production\'s width frontier, win rate by month (manual kept = M, manual removed = 0; the grid is 0.5 bp from -10 to +10 and 1 bp to +-25; positive = more aggressive):'); display(_fr_show.round(4))
 _wbM, _wb0 = np.zeros(N, bool), np.zeros(N, bool); _wbM[_tm_rows] = bt_win_fast(_tm_rows, Y_PM[_tm_rows]); _wb0[_tm_rows] = bt_win_fast(_tm_rows, Y_P0[_tm_rows])
+_man_m = pd.Series(_man[_tmw]).groupby(_month[_tmw]).agg(['mean', 'median']); _man_m.columns = ['manual charge, mean (bp)', 'median (bp)']
 BK_BASE = {'M': book_sd(_wbM), '0': book_sd(_wb0)}
+# v1.2.1: two periods. The median manual charge moves by an order of magnitude between months (the v1.1 run: about 1 bp to 13 bp); the split is at the
+# largest month-to-month jump of that median unless CFG.period_split names the first period's months.
+_mm_med = _man_m['median (bp)'].reindex(TEST_M); _jump = _mm_med.diff().abs()
+_p1 = list(CFG.period_split) if CFG.period_split else TEST_M[:int(np.argmax(_jump.fillna(0).to_numpy()))] if len(TEST_M) > 1 and _jump.notna().any() else TEST_M
+PERIODS = {f'{_p1[0]}..{_p1[-1]}': _p1} if _p1 else {}
+_p2 = [m for m in TEST_M if m not in _p1]
+if _p2:
+    PERIODS[f'{_p2[0]}..{_p2[-1]}'] = _p2
+print(f'periods for the split tables: {PERIODS} (median manual charge by month {_mm_med.round(2).to_dict()})')
 _d_rows = [score_pair('production, manual removed', Y_P0, Y_PM, family='reference', setting='manual removed', regime='0', pair='D', mode='vs production', bk_base=BK_BASE['M'])]
 _yf, _wf_, _mm_ = match_frontier(Y_P0, 'M', _tm_rows)
 _d_rows.append(score_pair('production, manual removed', Y_P0, _yf, family='reference', setting='manual removed', regime='0', pair='D', mode='vs frontier at equal win rate', widths=_wf_, mismatch=_mm_))
 _yl, _wd = level_to(Y_P0, Y_PM, _tm_rows)
-_d_rows.append(score_pair('production, manual removed', _yl, Y_PM, family='reference', setting='manual removed', regime='0', pair='D', mode='levelled to production', widths=_wd, bk_base=BK_BASE['M']))
+_d_rows.append(score_pair('production, manual removed', _yl, Y_PM, family='reference', setting='manual removed', regime='0', pair='D', mode='levelled to production', widths={m: -w for m, w in _wd.items()}, bk_base=BK_BASE['M']))
 PAIR_D = pd.DataFrame(_d_rows).set_index('mode'); PAIR_D['reading'] = [dominance(r) for _, r in PAIR_D.iterrows()]
 SHOW = ['win rate', 'win rate, base', 'wins kept', 'new wins', 'wins given up', 'bp left on table (won, cover)', 'bp left on table, base', 'cover change (bp)', 'bp saved on kept cover wins', 'crossing on new wins (bp)',
-        'comparator width (bp)', 'win rate mismatch', 'delta | record (bp)', 'NW t | record', 'months > 0 | record', 'delta | guard (bp)', 'NW t | guard', 'delta | common markout (bp)', 'NW t | common markout',
+        'comparator shift (bp, + = more aggressive)', 'win rate mismatch', 'delta | record (bp)', 'NW t | record', 'months > 0 | record', 'delta | guard (bp)', 'NW t | guard', 'delta | common markout (bp)', 'NW t | common markout',
         'delta | hedged (bp)', 'NW t | hedged', 'min delta, sceptical (bp)', 'delta | other side (bp)', 'delta $ per month | record ($k)', 'delta $ per month, trimmed | record ($k)', 'top 1% DV01 share of delta $ | record',
         'delta | record, manual modal (bp)', 'NW t | record, manual modal', 'delta | record, manual specific (bp)', 'NW t | record, manual specific', 'P&L sample share',
         'ex-ante daily sd ($k)', 'ex-ante sd vs base', 'gross DV01 ($k/bp)', 'hedged $ per $ of sd, variant', 'hedged $ per $ of sd, base', 'reading']
-_man_m = pd.Series(_man[_tmw]).groupby(_month[_tmw]).agg(['mean', 'median']); _man_m.columns = ['manual charge, mean (bp)', 'median (bp)']
+SHOW_P = ['win rate', 'win rate, base', 'wins kept', 'cover change (bp)', 'comparator shift (bp, + = more aggressive)', 'win rate mismatch', 'min delta, sceptical (bp)', 'delta | record (bp)', 'NW t | record', 'delta | common markout (bp)',
+          'NW t | common markout', 'delta | hedged (bp)', 'NW t | hedged', 'delta $ per month, trimmed | record ($k)', 'ex-ante sd vs base', 'reading']
 _wr_m = pd.DataFrame({'win rate, manual kept': pd.Series(_wbM[_tm_rows]).groupby(_month[_tm_rows]).mean(), 'win rate, manual removed': pd.Series(_wb0[_tm_rows]).groupby(_month[_tm_rows]).mean(),
                       'share of requests at the month\'s modal manual charge': pd.Series(_man_modal[_tm_rows]).groupby(_month[_tm_rows]).mean()})
 print('The manual charge by test month, production\'s win rate with and without it, and the share of requests carrying the month\'s modal charge (no request-specific trader input):'); display(_man_m.join(_wr_m).round(4))
 print('PAIR D (reference): production without the manual charge, read three ways:'); display(PAIR_D[SHOW].T)
 fig, ax = plt.subplots(1, 2, figsize=(14, 4.5))
 for reg, col in (('M', '#4C72B0'), ('0', '#C44E52')):
-    f_ = FRONTIER[FRONTIER['regime'] == reg].groupby('width')[['win rate', 'P&L per request, record (bp)']].mean()
-    ax[0].plot(f_['win rate'], f_['P&L per request, record (bp)'], '-', color=col, lw=1.2, label='manual kept' if reg == 'M' else 'manual removed')
-ax[0].set_xlabel('win rate'); ax[0].set_ylabel('P&L per request, record exit (bp)'); ax[0].set_title('Width frontiers of the two regimes (0.5 bp grid, mean over months)', fontsize=10); ax[0].legend(fontsize=8)
+    for i_, (m_, f_) in enumerate(FRONTIER[FRONTIER['regime'] == reg].sort_values('width').groupby('month')):
+        ax[0].plot(f_['win rate'], f_['P&L per request, record (bp)'], '-', color=col, lw=0.9, alpha=0.8, label=('manual kept' if reg == 'M' else 'manual removed') if i_ == 0 else None)
+        ax[0].annotate(m_[-2:], (f_['win rate'].iloc[-1], f_['P&L per request, record (bp)'].iloc[-1]), fontsize=6, color=col)
+ax[0].set_xlabel('win rate'); ax[0].set_ylabel('P&L per request, record exit (bp)'); ax[0].set_title('Width frontiers of the two regimes, one curve per month (v1.2.1; no averaging across months)', fontsize=10); ax[0].legend(fontsize=8)
 ax[1].bar(np.arange(len(_wr_m)), _wr_m['win rate, manual kept'], width=0.4, color='#4C72B0', label='manual kept'); ax[1].bar(np.arange(len(_wr_m)) + 0.4, _wr_m['win rate, manual removed'], width=0.4, color='#C44E52', label='manual removed')
 ax[1].set_xticks(np.arange(len(_wr_m)) + 0.2); ax[1].set_xticklabels(_wr_m.index, fontsize=8); ax[1].set_title('Production win rate by month, with and without the manual charge', fontsize=10); ax[1].legend(fontsize=8)
 savefig('v4_references')
@@ -989,8 +1032,8 @@ for kind, fam in (('own real', 'concentration, real book'), ('own replayed', 'co
     sets = {f'{kind} | k={k}': (VARIANTS[f'{kind} | k={k}']['yM'], VARIANTS[f'{kind} | k={k}']['y0']) for k in CFG.k_grid if f'{kind} | k={k}' in VARIANTS}
     if sets:
         yM, y0, rows = wf_pick(sets, list(sets)); VARIANTS[f'{kind} | walk-forward k'] = {'family': fam, 'setting': 'walk-forward k', 'yM': yM, 'y0': y0}
-        t_ = pd.DataFrame(rows).set_index('test month'); t_.columns = [c.replace(f'train Sharpe {kind} | ', 'Sharpe ') for c in t_.columns]; t_['picked'] = t_['picked'].str.replace(f'{kind} | ', ''); CHARGE_PICKS[kind] = t_
-print('Walk-forward k (hedged weekly $ Sharpe of the manual-kept quote on the earlier test months; the first test month takes k = 1):'); display(pd.concat(CHARGE_PICKS, names=['family']).round(3))
+        t_ = pd.DataFrame(rows).set_index('test month'); t_.columns = [c.replace(f'train hedged $k/week {kind} | ', '$k/wk ') for c in t_.columns]; t_['picked'] = t_['picked'].str.replace(f'{kind} | ', ''); CHARGE_PICKS[kind] = t_
+print('Walk-forward k (mean weekly hedged $ of the manual-kept quote on the earlier test months; the first test month takes k = 1):'); display(pd.concat(CHARGE_PICKS, names=['family']).round(3))
 record('variants_charges', s_median=S_MED, picks={k: flat_records(v) for k, v in CHARGE_PICKS.items()}, seconds=time.perf_counter() - _g_t0)
 print(f'[6] {time.perf_counter() - _g_t0:.0f}s')
 
@@ -998,9 +1041,12 @@ print(f'[6] {time.perf_counter() - _g_t0:.0f}s')
 # ## 7. The value of a win as a function of the concession: b(x)
 #
 # Production values every win at the same key at `x + c` wherever on the curve it was won. The post-trade state differs with x: a win far inside the
-# cover is more often a weak cover, a stale mark or a bond nobody else wanted. `b(x) = E[markout | won at x]` is estimated per key group (coupon bin x
-# call group) and x-quintile, walk-forward, from two sources: the exit of record on production's wins, and the desk's realised round trips from
-# WFTrade on the matched fills. Empirical-Bayes shrinkage to the group mean; a step function on the key's grid; quoted as `argmax (x + c + b(x)) p(x)`.
+# cover is more often a weak cover, a stale mark or a bond nobody else wanted. `b(x) = E[markout - x | won at x]`, the move from the quoted mid to the
+# exit (v1.2.1: the markout from the traded level already contains x, and the objective adds x again; measured from the mid there is no double count),
+# is estimated per key group (coupon bin x call group) and x-quintile, walk-forward, from two sources: the exit of record on production's wins, and
+# the desk's realised round trips from WFTrade on the matched fills, centred on the median round trip of the earlier months so the desk's resale
+# markup does not enter as a value of winning anything. Empirical-Bayes shrinkage to the group mean; a step function on the key's grid; quoted as
+# `argmax (x + c + b(x)) p(x)`.
 # The combination with the walk-forward logit curve is the first variant to change both the distribution and the value along x.
 
 # %%
@@ -1009,9 +1055,12 @@ _b_t0 = time.perf_counter()
 _won_rec = _w_van_all & np.isfinite(_M_REC); _won_real = _w_van_all & np.isfinite(_real_bp)
 
 
-def _bx_tables(target: np.ndarray, have: np.ndarray, m: str) -> tuple[dict, dict, pd.DataFrame]:
-    """Per key group: x-quintile edges on the earlier months' wins and the shrunk mean of the target per bin; returns edges, b per (group, bin) and a table."""
+def _bx_tables(target: np.ndarray, have: np.ndarray, m: str, centre: bool = False) -> tuple[dict, dict, pd.DataFrame]:
+    """Per key group: x-quintile edges on the earlier months' wins and the shrunk mean of the target per bin; returns edges, b per (group, bin) and a table.
+    With centre, the target is taken net of its median over the earlier months (the realised source: the resale markup common to every fill is not a value of x)."""
     tr = (_month < m) & have & np.isfinite(_xlog); edges, bvals, rows_ = {}, {}, []
+    if centre and tr.any():
+        target = target - float(np.nanmedian(target[tr]))
     for grp_, ii in pd.Series(np.flatnonzero(tr)).groupby(_kgrp[tr]).indices.items():
         r = np.flatnonzero(tr)[ii]
         if len(r) < 50:
@@ -1038,7 +1087,7 @@ def _vadd_for(edges: dict, bvals: dict) -> dict:
 
 def _value_family() -> dict:
     out, tabs = {}, []
-    srcs = [('record', _M_REC, _won_rec)] + ([('realised', _real_bp, _won_real)] if np.isfinite(_real_bp).sum() > 1000 else [])
+    srcs = [('record', _M_REC - _xlog, _won_rec)] + ([('realised', _real_bp - _xlog, _won_real)] if np.isfinite(_real_bp).sum() > 1000 else [])   # the move from the quoted mid, not from the traded level
     logit_wf = next((k for k in VARIANTS if k.startswith('logit walk-forward')), None)
     for sname, target, have in srcs:
         for combo in (False, True):
@@ -1046,7 +1095,7 @@ def _value_family() -> dict:
                 continue
             t0 = time.perf_counter(); nm = f'b(x) {sname}' + (f' + {logit_wf}' if combo else ''); yM, y0 = np.full(N, np.nan), np.full(N, np.nan)
             for m in TEST_M:
-                edges, bvals, tab = _bx_tables(target, have, m)
+                edges, bvals, tab = _bx_tables(target, have, m, centre=(sname == 'realised'))
                 if not combo:
                     tabs.append(tab.assign(source=sname))
                 vadd = _vadd_for(edges, bvals); te = np.flatnonzero((_month == m) & _winable)
@@ -1065,7 +1114,7 @@ for k_, v_ in _vf['variants'].items():
 BX_TAB = _vf['tables']
 if len(BX_TAB):
     _last = BX_TAB[BX_TAB['month'] == TEST_M[-1]]
-    print(f'b(x) on the wins before {TEST_M[-1]}: the expected markout by x-quintile and key group (bin 0 = the least aggressive fifth of production\'s concessions, {CFG.x_bins - 1} = the most aggressive):')
+    print(f'b(x) on the wins before {TEST_M[-1]}: the expected move from the quoted mid to the exit by x-quintile and key group (bin 0 = the least aggressive fifth of production\'s concessions, {CFG.x_bins - 1} = the most aggressive; realised centred):')
     display(_last.pivot_table(index=['source', 'group'], columns='x bin', values='b(x) (bp)').round(2))
     print('... wins behind each cell:'); display(_last.pivot_table(index=['source', 'group'], columns='x bin', values='wins').astype(int))
 record('variants_value', tables=flat_records(BX_TAB), settings=list(_vf['variants']), seconds=time.perf_counter() - _b_t0)
@@ -1365,35 +1414,50 @@ for nm, v_ in VARIANTS.items():
         yf, wf_, mm_ = match_frontier(yv, reg, rows)
         _rows_vm.append(score_pair(nm, yv, yf, family=v_['family'], setting=v_['setting'], regime=reg, pair=pair, mode='vs frontier at equal win rate', widths=wf_, mismatch=mm_))
         yl, wd = level_to(yv, yb, rows)
-        _rows_vm.append(score_pair(nm, yl, yb, family=v_['family'], setting=v_['setting'], regime=reg, pair=pair, mode='levelled to production', widths=wd, bk_base=bk))
+        _rows_vm.append(score_pair(nm, yl, yb, family=v_['family'], setting=v_['setting'], regime=reg, pair=pair, mode='levelled to production', widths={m: -w for m, w in wd.items()}, bk_base=bk))
+        for per_, mons_ in PERIODS.items():
+            if len(PERIODS) < 2:
+                continue
+            if 'vs production' in CFG.period_modes:
+                _rows_vm.append(score_pair(nm, yv, yb, family=v_['family'], setting=v_['setting'], regime=reg, pair=pair, mode='vs production', months=mons_, period=per_))
+            if 'vs frontier at equal win rate' in CFG.period_modes:
+                _rows_vm.append(score_pair(nm, yv, yf, family=v_['family'], setting=v_['setting'], regime=reg, pair=pair, mode='vs frontier at equal win rate', widths=wf_, mismatch=mm_, months=mons_, period=per_))
+            if 'levelled to production' in CFG.period_modes:
+                _rows_vm.append(score_pair(nm, yl, yb, family=v_['family'], setting=v_['setting'], regime=reg, pair=pair, mode='levelled to production', widths={m: -w for m, w in wd.items()}, months=mons_, period=per_))
 VM = pd.DataFrame(_rows_vm); VM['reading'] = [dominance(r) for _, r in VM.iterrows()]
 VM['pareto'] = False
-for (pair, mode), idx in VM.groupby(['pair', 'mode']).indices.items():
+for (pair, mode, per_), idx in VM.groupby(['pair', 'mode', 'period']).indices.items():
     VM.loc[VM.index[idx], 'pareto'] = pareto(VM.iloc[idx]).to_numpy()
 VERDICTS = {}
 for pair, q in (('A', 'variant with the manual charge, against production'), ('B', 'variant without the manual charge, against production'), ('C', 'both without the manual charge')):
     for mode in ('vs frontier at equal win rate', 'vs production', 'levelled to production'):
-        t = VM[(VM['pair'] == pair) & (VM['mode'] == mode)].set_index('variant').sort_values('min delta, sceptical (bp)', ascending=False, na_position='last')
-        better = t.index[t['reading'].str.contains('P&L under all four') & t['reading'].str.contains('cover')].tolist()
-        VERDICTS[f'{pair} | {mode}'] = (f'{len(better)} of {len(t)} better than the comparator on cover and on P&L under all four valuations' + (f': {better}' if better else '')
+        t = VM[(VM['pair'] == pair) & (VM['mode'] == mode) & (VM['period'] == 'all')].set_index('variant').sort_values('min delta, sceptical (bp)', ascending=False, na_position='last')
+        better = t.index[t['reading'].str.contains('P&L under all four') & t['reading'].str.contains('cover') & t['reading'].str.contains('dollars')].tolist()
+        VERDICTS[f'{pair} | {mode}'] = (f'{len(better)} of {len(t)} better than the comparator on cover, on P&L under all four valuations and on DV01-trimmed dollars' + (f': {better}' if better else '')
                                         + f'; Pareto set {t.index[t["pareto"]].tolist()}')
         _top = t.index[:25].union(t.index[t['pareto']], sort=False)
         print(f'\nPAIR {pair}, {mode.upper()} ({q}; ranked by the smallest delta over the four sceptical valuations; {len(_top)} of {len(t)} rows shown):'); display(t.loc[_top, SHOW + ['pareto']].round(4))
         print(f'READING (pair {pair}, {mode}): {VERDICTS[f"{pair} | {mode}"]}')
+        for per_ in [p_ for p_ in PERIODS if len(PERIODS) > 1 and mode in CFG.period_modes]:
+            tp = VM[(VM['pair'] == pair) & (VM['mode'] == mode) & (VM['period'] == per_)].set_index('variant').sort_values('min delta, sceptical (bp)', ascending=False, na_position='last')
+            bp_ = tp.index[tp['reading'].str.contains('P&L under all four') & tp['reading'].str.contains('cover') & tp['reading'].str.contains('dollars')].tolist()
+            VERDICTS[f'{pair} | {mode} | {per_}'] = f'{len(bp_)} of {len(tp)} better on cover, all four valuations and dollars' + (f': {bp_}' if bp_ else '') + f'; Pareto set {tp.index[tp["pareto"]].tolist()}'
+            print(f'\n  period {per_} ({tp["months"].max()} months), pair {pair}, {mode}; top 15 by the smallest sceptical delta:'); display(tp.loc[tp.index[:15], SHOW_P].round(4))
+            print(f'  READING (pair {pair}, {mode}, {per_}): {VERDICTS[f"{pair} | {mode} | {per_}"]}')
 print('\nThe reference pair D (Section 4):', {m: f'{r["reading"]}; win rate {r["win rate"]:.3f} vs {r["win rate, base"]:.3f}, cover change {r["cover change (bp)"]:+.2f} bp, min sceptical delta {r["min delta, sceptical (bp)"]:+.3f} bp' for m, r in PAIR_D.iterrows()})
 _fc = dict(zip(sorted(VM['family'].unique()), ['#4C72B0', '#55A868', '#C44E52', '#8172B3', '#937860', '#DD8452', '#64B5CD', '#8C8C8C', '#CCB974']))
 fig, ax = plt.subplots(1, 3, figsize=(22, 6))
 for a_, pair in ((ax[0], 'A'), (ax[1], 'C')):
-    t = VM[(VM['pair'] == pair) & (VM['mode'] == 'vs frontier at equal win rate')]
+    t = VM[(VM['pair'] == pair) & (VM['mode'] == 'vs frontier at equal win rate') & (VM['period'] == 'all')]
     for fam, g in t.groupby('family'):
         a_.scatter(g['cover change (bp)'], g['min delta, sceptical (bp)'], s=20 + 200 * np.clip(-g['ex-ante sd vs base'].fillna(0), 0, 1), color=_fc.get(fam, '#999999'), label=fam, alpha=0.8, edgecolors=np.where(g['pareto'], 'k', 'none'))
     a_.axhline(0, color='k', lw=0.5); a_.axvline(0, color='k', lw=0.5); a_.set_xlabel('cover change vs production at equal win rate (bp, negative = less left on the table)'); a_.set_ylabel('smallest delta over the four sceptical valuations (bp)')
     a_.set_title(f'Pair {pair} at equal win rate: the true win is the lower-left of cover and upper of P&L (size = risk cut, black edge = Pareto)', fontsize=9); a_.legend(fontsize=7)
-_fam = VM[(VM['pair'] == 'A') & (VM['mode'] == 'vs frontier at equal win rate')].groupby('family')['min delta, sceptical (bp)'].agg(['max', 'median'])
+_fam = VM[(VM['pair'] == 'A') & (VM['mode'] == 'vs frontier at equal win rate') & (VM['period'] == 'all')].groupby('family')['min delta, sceptical (bp)'].agg(['max', 'median'])
 ax[2].barh(_fam.index, _fam['max'], color='#55A868', label='best setting'); ax[2].barh(_fam.index, _fam['median'], color='#937860', label='median setting'); ax[2].axvline(0, color='k', lw=0.6)
 ax[2].set_title('Pair A at equal win rate: smallest sceptical delta by family (bp per request)', fontsize=9); ax[2].legend(fontsize=8); ax[2].tick_params(axis='y', labelsize=8)
 savefig('v8_matrix')
-record('variants_matrix', table=flat_records(VM.set_index(['variant', 'pair', 'mode'])), verdicts=VERDICTS, seconds=time.perf_counter() - _x_t0)
+record('variants_matrix', table=flat_records(VM.set_index(['variant', 'pair', 'mode', 'period'])), verdicts=VERDICTS, periods=PERIODS, seconds=time.perf_counter() - _x_t0)
 VM.to_parquet(OUT / 'variant_matrix.parquet')
 print(f'matrix written: {OUT / "variant_matrix.parquet"} ({len(VM)} rows) | [8] {time.perf_counter() - _x_t0:.0f}s')
 

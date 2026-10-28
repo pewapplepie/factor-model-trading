@@ -1,4 +1,4 @@
-# RFQ factor variants: the production optimizer as the judge (variants v1.2)
+# RFQ factor variants: the production optimizer as the judge (variants v1.2.1)
 
 Companion to `muni_rfq_factor_variants.py` / `.ipynb`. The notebook quotes every factor-derived variant through the
 production optimizer, replays it on the desk's requests and reads it against production on the same four facts (win
@@ -23,6 +23,33 @@ for i in range(1, len(parts), 2):
         cells.append(new_code_cell(body))
 nbformat.write(new_notebook(cells=cells, metadata={'kernelspec': {'name': 'python3', 'display_name': 'Python 3', 'language': 'python'}, 'language_info': {'name': 'python'}}), dst)
 ```
+
+## v1.2.1, revisions from the review of the v1.1 run (2026-10-28)
+
+The Variant Lab Review page (Notion, MM Models) read the v1.1 html and raised ten points. Eight are code changes, made
+before the v1.2 run so that run carries them; two are caveats the notebook already states and cannot remove.
+
+| Review point | What changed | Where |
+|---|---|---|
+| The delta is a pooled mean, the t is of unweighted weekly means; signs disagree in some rows | `cluster_t`: the t of the same pooled mean with week-clustered Newey-West standard errors (weekly sums of the deviations, Bartlett kernel in week order) | [3] `cluster_t`, `score_pair` |
+| The reading ignores dollars | a `dollars` axis (DV01-trimmed record dollars positive) in the reading; the headline count per pair requires cover, all four valuations and dollars | [3] `dominance`, [8] |
+| The +-10 bp frontier cannot reach the variant's win rate when the manual charge is 13 bp | the grid runs by 0.5 to +-10 and by 1 to +-25 (71 widths; the frontier cell takes about twice as long and recomputes); the reading names the residual mismatch where the grid still falls short instead of dropping the row (no threshold: it is a flag on the reading) | config, [4], [8] |
+| Two regimes pooled (manual charge about 1 bp May to August, 11 to 13 bp in September and October) | every pair is also scored on two periods, split at the largest month-to-month jump of the median manual charge on the test winnable requests (or `CFG.period_split`), for the frontier and levelled comparators; a `period` column, Pareto sets per period, top-15 tables per period | [4] `PERIODS`, [8] |
+| The comparator width mixes sign conventions | one convention, `comparator shift (bp, + = more aggressive)`, for the frontier and the levelling (the levelling width is negated) | `score_pair`, [4], [8] |
+| The walk-forward k sits at the edge of the grid; the Sharpe rewards quoting less | the pick is by mean weekly hedged dollars on the earlier months | [3] `wf_pick` |
+| The frontier plot averages months whose win rates differ 20x | one curve per month, labelled | [4] |
+| b(x) double counts x: the markout from the traded level contains the concession and the objective adds it again | `b(x) = E[markout - x | won at x]`, the move from the quoted mid to the exit; the realised source is also centred on the earlier months' median round trip so the resale markup is not a value of winning anything | [7] |
+| The P&L sample share runs 0.79 to 0.98 | not changed: the exit of record covers 44% of winnable requests and the share is reported per row; imputing a markout would invent P&L | - |
+| The risk axis rests on a covariance the lab labels uncalibrated | not changed here: the label is carried from the handoff and printed in [2]; the sd axis is read with it | - |
+
+Two review remarks are observations, not errors: the real book is held on a small share of requests, so the real-book
+and replayed-book concentration terms agree (that is the finding), and the results on this data are confirmations under
+rules written after the v1 run (the setup cell says so; the pre-registered test is on data from November on).
+
+The review's proposed candidate, stretch 1 alongside the manual charge, is not what the run supports: in pair A every
+curve variant is within 0.01 bp of production at equal win rate. The curve's value shows in pair C, without the manual
+charge, and the balanced choice there is logit 1.5 (96% of wins kept, the same cover saving, the higher common-markout
+t). Both are frozen as the candidates for the November data.
 
 ## v1.2, the lab pieces never quoted through the optimizer (2026-10-28)
 
