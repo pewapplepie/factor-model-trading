@@ -18,6 +18,15 @@
 # across runs. It changes which bonds the desk wins, not the price on the ones it keeps; it only ever widens a quote; and it needs one number per bond
 # from the model, computed at the last close.
 #
+# **v1.0.2.** The first valid run (v1.0.1, June to October) read the charge as safe and roughly neutral: at a realistic size it keeps 89% of the wins at
+# equal win rate for +0.00 to +0.03 bp per request, and the decomposition showed the bonds it widens most were the desk's best fills. This version does
+# four things to that backtest. The win rule is read in price space anchored on production's own logged bid price (the cover's and the matched print's
+# logged prices through the service DV01 at our quote), with the linearisation measured against the service. The settle date production priced with
+# and the carry finance charge it loaded after the optimizer come from the RFQ log and are checked (Section 5). Two two-sided variations let the charge
+# tighten as well as widen, so a request production lost can be won by crossing its print (Section 8). And the scorecard is split by outcome term, with
+# the lost requests laid out by how far production was behind the print and what the street's winning trade was then worth (Section 10). The data run to
+# the end of October.
+#
 # **What a reader gets, in order.**
 #
 # | Section | Content | The plot to look at |
@@ -81,9 +90,10 @@ C_BLUE, C_RED, C_GREEN, C_ORANGE, C_PURPLE, C_GREY, C_BROWN = '#4C72B0', '#C44E5
 @dataclass(frozen=True)
 class RunConfig:
     spec_version: str = 'width_charge_v1_0'
+    version: str = '1.0.2'                    # the notebook version (not a cache key: the data and code fingerprints decide what rebuilds)
     # ---- window
     start_date: str = '2026-01-01'
-    end_date: str = '2026-10-23'
+    end_date: str = '2026-10-30'
     train_start: str = '2026-01-02'
     first_oos_date: str = '2026-04-01'
     # ---- the factor model (the lab's record spec ipca_v3_k3_xmmd, unchanged)
@@ -113,7 +123,11 @@ class RunConfig:
     wc_k_total: tuple[float, ...] = (2.0,)                        # the total-move variation at the candidate's k only
     wc_k_extended: tuple[float, ...] = (1.0, 2.0)                 # the charge on every request through the width model, gamma rescaled on the extended population
     wc_band: float = 0.80                                          # the band whose half-width is the charge's measure
+    wc_k_two_sided: tuple[float, ...] = (1.0, 2.0)                # the two-sided charge gamma (W - centre), both signs, k on the same dial (v1.0.2)
+    wc_center_days: int = 20                                       # the centre: median W over the previous request days, strictly before the request date
     min_fit_rows: int = 200
+    # ---- the replay's checks (Section 7, v1.0.2)
+    px_check_sample: int = 2000               # (request, move) pairs priced through the service to measure the DV01 linearisation at the crossing distance
     # ---- the backtest (Section 9)
     frontier_widths: tuple[float, ...] = tuple(sorted(set([w / 2.0 for w in range(-20, 21)] + [float(w) for w in range(-25, 26)])))
     level_range_bp: float = 40.0; level_iters: int = 16
@@ -314,9 +328,26 @@ PRE_REGISTERED = {
                          'bucket, mark-to-P, h = 5), the own other-side print exit, the common markout (new wins valued at the day\'s median), and the realised WFTrade round trip on '
                          'matched fills. No threshold: every cell is a change against the comparator with a week-clustered t. The reading is the sign on cover, on P&L under the '
                          'sceptical valuations and on DV01-trimmed dollars'),
+    'width_charge_v102': ('fixed 2026-11-02 before the rerun on the data to 2026-10-30. (1) The settle date sent to the pricing service is the one production logged on the '
+                          'RFQ log, kept where it lies between the trade date and T+2 on the bond calendar, T+2 otherwise (with the rows outside the window reported). '
+                          '(2) The win rule is read in price space anchored on production\'s own logged bid price: the cover and the matched MSRB print are turned into '
+                          'yields through our logged price, their logged price and the service DV01 at our logged quote, so the service is used only in production\'s '
+                          'direction (yield to price); the tape yield is the fallback where a price or DV01 is missing. The vanilla pass (every logged win and loss '
+                          'reproduced) must still hold. The linearisation is measured against the service on a fixed sample at the crossing distance. (3) The carry '
+                          'finance charge from the RFQ log is checked against the loading production applied after the optimizer (final yield minus optimal yield), '
+                          'which every requote carries; it is not added a second time. (4) Section 7: the price of our quote recomputed from its yield against the '
+                          'logged bid price and the WFTrade fill; the matched print of a lost request checked as the winning bid. (5) Two two-sided variations, '
+                          'charge gamma (W_i - centre) with the same gamma = k / median W and the centre the trailing median W over the previous 20 request days, '
+                          'k in {1, 2}, residual, location-scale, manual charge kept: one tightens on bands narrower than the centre (the v1.0.2 draft), the other '
+                          'on bands wider than it (the reverse, after the draft run showed the street\'s winning trades richen most on wide bands). Either can cross '
+                          'the print of a request production lost. (6) Section 10: pair A at about the same win rate split by outcome term (won with a cover, won '
+                          'without, lost with a richer print, not winnable), each with its own numbers and its contribution to the pooled delta; the lost requests '
+                          'by how far production was behind the print, with the street winner\'s markout, so the size of a crossing rule can be read from the data '
+                          'before one is built. The one-sided candidate, the comparators and the pooled scorecard are unchanged.'),
 }
 print('ROOT', ROOT, '| pipeline manifest:', (PIPELINE_ROOT / 'data_pipeline_manifest.json').exists())
-print(f'spec {CFG.spec_version} | window {CFG.start_date} -> {CFG.end_date} | first OOS {CFG.first_oos_date} | K {CFG.selected_k} | dependent variable {CFG.target_mode} | candidate: residual, ls, k = 2, manual charge kept')
+print(f'spec {CFG.spec_version} v{CFG.version} | window {CFG.start_date} -> {CFG.end_date} | first OOS {CFG.first_oos_date} | K {CFG.selected_k} | dependent variable {CFG.target_mode} | candidate: residual, ls, k = 2, manual charge kept')
+print('pre-registered:', list(PRE_REGISTERED))
 
 # %% [markdown]
 # ## 2. Data
@@ -380,6 +411,9 @@ print(f'trade-size characteristic on {raw_panel["trade_size_lag"].notna().mean()
 BT_SO_COLS = ['date', 'ecnreqid', 'cusip', 'side', 'quantity', 'signalyield', 'optimalyield', 'optimalQuantileBp', 'pfill', 'pfillKey', 'liquiditycharge', 'riskcharge', 'manualcharges', 'finalquoteyield']
 BT_TR_COLS = ['date', 'strategy_ecn_req_id', 'cusip', 'rfq_received_time', 'is_final', 'quoted', 'strategy_is_pricing_error', 'manual_takeover', 'is_manual_mode', 'msrb_yield', 'msrb_price', 'msrb_tradetype',
               'msrb_tradetime', 'algo_won', 'cover', 'cover_price_value', 'cover_price_value_backup', 'effective_cover_price', 'our_bid_price', 'tenor_bucket', 'qty_bucket', 'call_bucket', 'coupon_bucket', 'final_comp_rating']
+# v1.0.2: the settle date production priced with and the carry finance charge it loaded after the optimizer, both on the RFQ log (muni_algo_trade_track); the names are resolved on the store
+BT_SETTLE_NAMES = ('settle_date', 'settlement_date', 'settle_dt', 'settlement_dt', 'settledate', 'settle')
+BT_CARRY_NAMES = ('carry_finance_charge', 'carry_financing_charge', 'carryfinancecharge', 'carry_charge', 'financing_charge', 'carry')
 
 
 def bt_flag(v: pd.Series) -> np.ndarray:
@@ -388,10 +422,35 @@ def bt_flag(v: pd.Series) -> np.ndarray:
     return (pd.to_numeric(v, errors='coerce').fillna(0) > 0).to_numpy(bool)
 
 
+def store_columns(store) -> list[str]:
+    """The column names of a partition store without reading it (the schema of its dataset), or of its frame when the store has no dataset."""
+    try:
+        d = store.dataset()
+        if d is not None:
+            return [str(c) for c in d.schema.names]
+    except AttributeError:
+        pass
+    f = store.read(columns=None, categorical=False)
+    return [str(c) for c in f.columns] if f is not None else []
+
+
+def resolve_column(columns: list[str], wanted: tuple[str, ...], contains: str | None = None) -> str | None:
+    """The first wanted name present (case-insensitive), else the first column containing the substring."""
+    low = {c.lower(): c for c in columns}
+    for w in wanted:
+        if w.lower() in low:
+            return low[w.lower()]
+    return next((c for c in columns if contains and contains in c.lower()), None)
+
+
+_tr_cols = store_columns(PIPE.store('track_rfq'))
+SETTLE_COL, CARRY_COL = resolve_column(_tr_cols, BT_SETTLE_NAMES), resolve_column(_tr_cols, BT_CARRY_NAMES, contains='carry')
+print(f'track_rfq columns: {len(_tr_cols)} | settle date column: {SETTLE_COL or "NONE (every request priced at T+2)"} | carry finance charge column: {CARRY_COL or "NONE (the logged loading is carried as is)"}')
 _so = PIPE.store('strategy_output').read(columns=BT_SO_COLS, categorical=False)
-_tr = PIPE.store('track_rfq').read(columns=BT_TR_COLS, categorical=False)
+_tr = PIPE.store('track_rfq').read(columns=BT_TR_COLS + [c for c in (SETTLE_COL, CARRY_COL) if c and c not in BT_TR_COLS], categorical=False)
 if _so is None or _tr is None:
     raise RuntimeError('strategy_output or track_rfq is not pulled under the pipeline root')
+_tr = _tr.rename(columns={c: n for c, n in ((SETTLE_COL, 'settle_date'), (CARRY_COL, 'carry_finance_charge')) if c and c != n})
 for _f in (_so, _tr):
     _f['date'] = pd.to_datetime(_f['date']).dt.normalize()
 _so['ecnreqid'] = _so['ecnreqid'].astype('string'); _tr['ecnreqid'] = _tr['strategy_ecn_req_id'].astype('string')
@@ -855,6 +914,14 @@ print(f'[4] bond-day quantiles on {len(QBD):,} rows | {time.perf_counter() - _q_
 # its yield is at or below it; `d = 100 (threshold - y)` is the bp left on the table); won without a cover (threshold = our logged yield); lost with a
 # matched print richer than our quote (the print is the winner; a quote wins iff strictly richer than it); lost with the print at or cheaper than our
 # quote (no fill); no matched print (no fill). The first three groups are "winnable" and every comparison runs on them.
+#
+# **Read in price space (v1.0.2).** The cover and the print are logged as prices; production's quote is logged as a yield and a price. The threshold yield
+# is therefore `our logged yield + (our logged price - the other price) / DV01`, with DV01 from the pricing service at our logged quote and settle date:
+# the level comes from production's own (yield, price) pair, so a convention gap between the service and production cancels and only the slope comes
+# from the service, which is used in production's direction only (yield to price), as production uses it. The tape yield of the print is the fallback
+# where a price or DV01 is missing, and the gap between the two readings is reported by call bucket. Section 7 measures the tangent against the service
+# at the crossing distance. The settle date is the one production logged, kept where it lies between the trade date and T+2 on the bond calendar; the
+# carry finance charge production loads after the optimizer is checked against the logged loading, which every requote carries, and is not added again.
 
 # %%
 CELL_T('5. The replay [1]')
@@ -930,6 +997,35 @@ BT[['bt_opt_bp', 'bt_pfill', 'bt_util']] = _rep[['bt_opt_bp', 'bt_pfill', 'bt_ut
 BT['bt_optyield'] = BT['signalyield'] + BT['bt_opt_bp'] / 100.0; BT['adj_yield'] = BT['finalquoteyield'] - BT['optimalyield']
 bt_gate_month = bt_gate(BT, 'month'); BT_REPLAY_PASS = bool(bt_gate_month['passes'].all())
 print(f'Replay gate (|d optimal concession| <= {BT_TOL_BP} bp and |d pfill| <= {BT_TOL_PF} on >= {BT_GATE:.0%} of requests), by month:'); display(bt_gate_month.round(4))
+# ---- v1.0.2: the carry finance charge. Production loads it after the optimizer, so it sits inside adj_yield (final yield - optimal yield), which every requote carries unchanged.
+# The check: does the logged carry account for the loading, in which unit, and what else is in it. Nothing is added a second time.
+BT_ADJ_TOL = 1e-6   # yield units: equality up to the log's own rounding
+
+
+def bt_carry_check(frame: pd.DataFrame) -> tuple[pd.Series, dict]:
+    adj = frame['adj_yield'].to_numpy(float)
+    if 'carry_finance_charge' not in frame:
+        return pd.Series(np.nan, index=frame.index), {'present': False}
+    cr = pd.to_numeric(frame['carry_finance_charge'], errors='coerce').to_numpy(float); has = np.isfinite(cr) & np.isfinite(adj)
+    fits = {'yield': float((np.abs(adj - cr)[has] <= BT_ADJ_TOL).mean()) if has.any() else np.nan, 'bp': float((np.abs(adj - cr / 100.0)[has] <= BT_ADJ_TOL).mean()) if has.any() else np.nan}
+    unit = 'bp' if (fits['bp'] > fits['yield']) else 'yield'; cy = cr / 100.0 if unit == 'bp' else cr; other = adj - cy
+    aud = {'present': True, 'logged on': float(np.isfinite(cr).mean()), 'unit': unit, 'share of requests where the loading equals the carry': fits[unit], 'fit if read as yield': fits['yield'], 'fit if read as bp': fits['bp'],
+           'carry median (bp)': float(np.nanmedian(cy) * 100.0), 'carry p90 (bp)': float(np.nanpercentile(cy[np.isfinite(cy)], 90) * 100.0) if np.isfinite(cy).any() else np.nan,
+           'loading beyond the carry: share nonzero': float((np.abs(other[has]) > BT_ADJ_TOL).mean()) if has.any() else np.nan, 'loading beyond the carry, median |bp|': float(np.nanmedian(np.abs(other[has])) * 100.0) if has.any() else np.nan}
+    return pd.Series(cy, index=frame.index), aud
+
+
+BT['carry_y'], CARRY_AUDIT = bt_carry_check(BT)
+if CARRY_AUDIT['present']:
+    print('The carry finance charge against the loading production applied after the optimizer (adj_yield = final - optimal):', {k: (round(v, 4) if isinstance(v, float) else v) for k, v in CARRY_AUDIT.items()})
+    _cm = BT.assign(carry_bp=BT['carry_y'] * 100.0, other_bp=(BT['adj_yield'] - BT['carry_y']) * 100.0).groupby('month').agg(**{'carry, median (bp)': ('carry_bp', 'median'), 'carry, mean (bp)': ('carry_bp', 'mean'), 'carry logged': ('carry_bp', lambda s: s.notna().mean()),
+                                                                                                                                 'loading = carry': ('other_bp', lambda s: (s.abs() <= BT_ADJ_TOL * 100.0).mean()), 'other loading, mean (bp)': ('other_bp', 'mean')})
+    print('... by month:'); display(_cm.round(4))
+    if CARRY_AUDIT['share of requests where the loading equals the carry'] < 0.95:
+        print('WARNING: the loading after the optimizer is not the carry charge alone on more than 5% of requests; the requotes carry the full logged loading, so whatever else is in it rides along. Say what it is before reading a crossing result.')
+else:
+    print('carry_finance_charge is not on the RFQ log pull: the loading after the optimizer (adj_yield) is carried as logged, which holds the carry charge if production applied one; re-pull track_rfq to check it')
+record('carry', **{k: v for k, v in CARRY_AUDIT.items()})
 BT['cover_px'] = pd.to_numeric(BT['cover_price_value'], errors='coerce').fillna(pd.to_numeric(BT['effective_cover_price'], errors='coerce'))
 BT['won_cover'] = BT['cover_px'].notna(); BT['won_logged'] = bt_flag(BT['algo_won']); BT['manual'] = np.zeros(len(BT), bool)
 for _c in ('manual_takeover', 'is_manual_mode'):
@@ -958,6 +1054,19 @@ def bt_settle(dates: pd.Series, lag: int = CFG.settle_lag) -> pd.Series:
     d = pd.to_datetime(dates).dt.normalize(); u = pd.Series(pd.DatetimeIndex(d.unique())); return d.map(dict(zip(u, u + BT_BDAY * lag))).dt.strftime('%Y-%m-%d')
 
 
+def bt_logged_settle(v: pd.Series) -> pd.Series:
+    """A logged settle date as a normalised datetime, NaT where missing; integers are read as yyyymmdd or as epoch days / s / ms / us / ns by their magnitude."""
+    if pd.api.types.is_numeric_dtype(v) and not pd.api.types.is_bool_dtype(v):
+        x = pd.to_numeric(v, errors='coerce'); a = float(x.abs().median()) if x.notna().any() else np.nan
+        if 19_000_101 <= a <= 21_001_231:
+            v = pd.to_datetime(x.astype('Int64').astype(str), format='%Y%m%d', errors='coerce')
+        else:
+            v = pd.to_datetime(x, unit='ns' if a > 1e17 else 'us' if a > 1e14 else 'ms' if a > 1e11 else 's' if a > 1e8 else 'D', errors='coerce')
+    elif v.dtype == object or str(v.dtype).startswith('string'):
+        v = pd.to_datetime(v.astype('string').str.strip(), errors='coerce', format='mixed')
+    return to_ns(v).dt.normalize()
+
+
 def _bt_post(sess, endpoint: str, chunk: pd.DataFrame) -> list[dict]:
     import requests  # noqa: F401  (the desk's network only)
 
@@ -982,7 +1091,8 @@ def _bt_post(sess, endpoint: str, chunk: pd.DataFrame) -> list[dict]:
 
 def bt_pricing(endpoint: str, req: pd.DataFrame) -> pd.DataFrame:
     """price2yield / yield2price for (cusip, value, settle) through the desk's pricing service, cached on disk. A PRICING_OVERRIDE global (a function with the
-    same signature) replaces the service, for a run away from the desk's network."""
+    same signature) replaces the service, for a run away from the desk's network. 'missing from response' is an input the service answered but cannot price;
+    the service counts as down only when every call of the first full batch raised."""
     req = req.assign(cusip=req['cusip'].astype(str), value=pd.to_numeric(req['value'], errors='coerce').round(6)).dropna(subset=['value']).drop_duplicates(['cusip', 'value', 'settle'])
     if callable(globals().get('PRICING_OVERRIDE')):
         return globals()['PRICING_OVERRIDE'](endpoint, req)
@@ -998,30 +1108,63 @@ def bt_pricing(endpoint: str, req: pd.DataFrame) -> pd.DataFrame:
         for _, g in todo.groupby('_k'):
             for s in range(0, len(g), BT_PRICING_BATCH):
                 rows += _bt_post(sess, endpoint, g.iloc[s:s + BT_PRICING_BATCH])
-                if len(rows) >= BT_PRICING_BATCH and all(r['status'] != 'ok' for r in rows):   # the service is not answering: stop after the first full batch, say why, leave the rest unpriced
+                if len(rows) >= BT_PRICING_BATCH and all(r['status'] not in ('ok', 'missing from response') for r in rows):   # not answering: stop after the first full batch, say why, leave the rest unpriced
                     down = rows[0]['status']; break
             if down is not None:
                 break
         if down is not None:
-            print(f'  PRICING SERVICE DOWN ({endpoint}): every input of the first batch failed ({down[:120]}); {len(todo) - len(rows):,} inputs left unpriced. Rerun when {BT_PRICING_HOST} answers, or with the lab cache in place')
+            print(f'  PRICING SERVICE DOWN ({endpoint}): every call of the first batch raised ({down[:120]}); {len(todo) - len(rows):,} inputs left unpriced. Rerun when {BT_PRICING_HOST} answers, or with the lab cache in place')
         if rows:
             cache = pd.concat([cache, pd.DataFrame(rows)], ignore_index=True); cache[cache['status'] == 'ok'].to_parquet(BT_PRICING_CACHE, index=False)
-        print(f'  pricing service {endpoint}: {len(rows):,} new inputs in {time.perf_counter() - t0:.0f}s, {sum(r["status"] != "ok" for r in rows):,} failed')
+        _miss = sum(r['status'] == 'missing from response' for r in rows)
+        print(f'  pricing service {endpoint}: {len(rows):,} new inputs in {time.perf_counter() - t0:.0f}s, {sum(r["status"] != "ok" for r in rows):,} failed ({_miss:,} answered but not priceable)')
     return req.merge(cache[cache['endpoint'] == endpoint].drop(columns='endpoint'), on=['cusip', 'value', 'settle'], how='left')
 
 
-def bt_price_to_yield(frame: pd.DataFrame, price_col: str, mask: pd.Series) -> np.ndarray:
-    q = frame.loc[mask, ['cusip', price_col, 'settle']].rename(columns={price_col: 'value'}).astype({'cusip': str}); q['value'] = pd.to_numeric(q['value'], errors='coerce').round(6)
-    r = bt_pricing('price2yield', q.dropna(subset=['value'])); out = np.full(len(frame), np.nan)
-    out[np.flatnonzero(mask.to_numpy())] = q.merge(r[['cusip', 'value', 'settle', 'yield']], on=['cusip', 'value', 'settle'], how='left')['yield'].to_numpy(float); return out
+# ---- the settle date: production's logged one where it lies between the trade date and T+2 on the bond calendar, T+2 otherwise (the rows outside the window are reported, not dropped)
+BT['settle_t2'] = bt_settle(BT['date']); _t2 = pd.to_datetime(BT['settle_t2']); _d0 = BT['date'].dt.normalize()
+_sl = bt_logged_settle(BT['settle_date']) if 'settle_date' in BT else pd.Series(pd.NaT, index=BT.index, dtype='datetime64[ns]')
+if 'settle_date' in BT:
+    print(f'settle_date as logged: dtype {BT["settle_date"].dtype} | non-null {BT["settle_date"].notna().mean():.1%} | read as a date {_sl.notna().mean():.1%} | e.g. {BT["settle_date"].dropna().astype(str).head(3).tolist()}')
+_sl_ok = (_sl.notna() & (_sl >= _d0) & (_sl <= _t2)).to_numpy()
+BT['settle'] = np.where(_sl_ok, _sl.dt.strftime('%Y-%m-%d'), BT['settle_t2'])
+BT['settle_source'] = np.select([_sl.isna().to_numpy(), (_sl < _d0).to_numpy(), (_sl > _t2).to_numpy(), (_sl == _t2).to_numpy()],
+                                ['not logged -> T+2', 'logged before the trade date -> T+2', 'logged beyond T+2 -> T+2', 'logged, = T+2'], 'logged, before T+2')
+_st_lag = pd.Series(np.busday_count(_d0.to_numpy('datetime64[D]'), pd.to_datetime(BT['settle']).to_numpy('datetime64[D]')))
+SETTLE_AUDIT = {'source': BT['settle_source'].value_counts(normalize=True).round(4).to_dict(), 'logged and read as a date': float(_sl.notna().mean()),
+                'logged beyond T+2 (sent as T+2)': float((_sl > _t2).mean()), 'weekdays from trade to settle as sent (holidays counted)': _st_lag.value_counts(normalize=True).sort_index().round(4).to_dict()}
+print(f'settle date sent to the pricing service: {SETTLE_AUDIT["source"]} | weekdays from trade to settle: {SETTLE_AUDIT["weekdays from trade to settle as sent (holidays counted)"]}')
+if 'settle_date' in BT and BT['settle_date'].notna().any() and not _sl.notna().any():
+    print('WARNING: settle_date is logged but none of it reads as a date; every request fell back to T+2. Check the format printed above.')
+# ---- DV01 per 100 par at the logged quote, one call per (bond, settle) at the bond's median logged yield that day, on every request with an outcome to price (won, or a matched print)
+_dv_need = (bt_flag(BT['algo_won']) | pd.to_numeric(BT['msrb_yield'], errors='coerce').notna()).to_numpy()
+_dq = BT.loc[_dv_need, ['cusip', 'settle', 'finalquoteyield']].astype({'cusip': str}).groupby(['cusip', 'settle'], as_index=False)['finalquoteyield'].median().rename(columns={'finalquoteyield': 'value'})
+_dv = bt_pricing('yield2price', _dq); _dv = _dq.assign(value=_dq['value'].round(6)).merge(_dv[['cusip', 'value', 'settle', 'dv01', 'price']], on=['cusip', 'value', 'settle'], how='left')
+_dvj = BT[['cusip', 'settle']].astype({'cusip': str}).merge(_dv[['cusip', 'settle', 'dv01', 'price']], on=['cusip', 'settle'], how='left')
+BT['dv01'] = pd.to_numeric(_dvj['dv01'], errors='coerce').to_numpy(); BT['svc_px_at_quote'] = pd.to_numeric(_dvj['price'], errors='coerce').to_numpy()   # DV01 in price points per bp per 100 par
+BT['usd_per_bp'] = pd.to_numeric(BT['quantity'], errors='coerce') / 100.0 * BT['dv01']
+BT['our_px'] = pd.to_numeric(BT['our_bid_price'], errors='coerce') if 'our_bid_price' in BT else np.nan
+BT['msrb_px'] = pd.to_numeric(BT['msrb_price'], errors='coerce') if 'msrb_price' in BT else np.nan
+
+
+def bt_px_to_yield(frame: pd.DataFrame, px_other: np.ndarray) -> np.ndarray:
+    """The yield, in our quote's own convention, at which another price sits: our logged yield + (our logged price - the other price) / DV01. Anchored on production's
+    own (yield, price) pair, so a convention gap between the service and production cancels; only the slope comes from the service. NaN where a price or DV01 is missing."""
+    yl = frame['finalquoteyield'].to_numpy(float); dv = frame['dv01'].to_numpy(float); px = frame['our_px'].to_numpy(float); ok = np.isfinite(px) & np.isfinite(px_other) & np.isfinite(dv) & (dv > 0)
+    return np.where(ok, yl + (px - np.where(ok, px_other, 0.0)) / np.where(ok, dv, 1.0) / 100.0, np.nan)
 
 
 def bt_thresholds(frame: pd.DataFrame) -> pd.DataFrame:
-    """Each request's group and street threshold yield; fixed by the logged outcome, independent of any variant."""
-    yl = frame['finalquoteyield'].to_numpy(float); yc = frame['cover_y'].to_numpy(float); ym = frame['msrb_yield'].to_numpy(float)
-    won = frame['won_logged'].to_numpy(bool); has_cover = won & np.isfinite(yc); printed = ~won & np.isfinite(ym)
+    """Each request's group and street threshold yield, fixed by the logged outcome and independent of any variant. v1.0.2: read in price space anchored on production's
+    logged bid price (the cover's and the print's logged prices through DV01 at our quote); the tape yield is the fallback where a price or DV01 is missing."""
+    yl = frame['finalquoteyield'].to_numpy(float); won = frame['won_logged'].to_numpy(bool)
+    yc_px = bt_px_to_yield(frame, frame['cover_px'].to_numpy(float)); yc = yc_px                                     # the cover: price-anchored only (its logged value is a price)
+    ym_px = bt_px_to_yield(frame, frame['msrb_px'].to_numpy(float)); ym_tape = frame['msrb_yield'].to_numpy(float); ym = np.where(np.isfinite(ym_px), ym_px, ym_tape)
+    has_cover = won & np.isfinite(yc); printed = ~won & np.isfinite(ym)
     grp = np.select([has_cover, won, printed & (ym < yl), printed], BT_GROUPS[:4], BT_GROUPS[4]); thr = np.select([has_cover, won, printed & (ym < yl)], [np.maximum(yc, yl), yl, ym], np.nan)
-    return pd.DataFrame({'group': grp, 'threshold_y': thr}, index=frame.index)
+    src = np.select([has_cover, won, printed & np.isfinite(ym_px), printed], ['cover price', 'our quote', 'print price', 'print yield (tape)'], 'none')
+    return pd.DataFrame({'group': grp, 'threshold_y': thr, 'threshold_source': src, 'cover_y': yc, 'cover_margin_px': frame['our_px'].to_numpy(float) - frame['cover_px'].to_numpy(float),
+                         'print_y_px': ym_px, 'print_gap_bp': 100.0 * (ym_tape - ym_px)}, index=frame.index)
 
 
 def bt_outcomes(frame: pd.DataFrame, y_final) -> pd.DataFrame:
@@ -1030,29 +1173,54 @@ def bt_outcomes(frame: pd.DataFrame, y_final) -> pd.DataFrame:
     return pd.DataFrame({'group': grp, 'win': win, 'd_bp': d_bp, 'shift_bp': 100.0 * (y - frame['finalquoteyield'].to_numpy(float))}, index=frame.index)
 
 
-BT['settle'] = bt_settle(BT['date'])
-BT['cover_y'] = bt_price_to_yield(BT, 'cover_px', BT['won_cover']); BT = BT.join(bt_thresholds(BT))
+BT = BT.drop(columns=[c for c in ('group', 'threshold_y', 'threshold_source', 'cover_y', 'cover_margin_px', 'print_y_px', 'print_gap_bp') if c in BT.columns]).join(bt_thresholds(BT))
 BT['y_vanilla'] = BT['bt_optyield'] + BT['adj_yield']; _ov = bt_outcomes(BT, BT['y_vanilla']); _won_rule = _ov['group'].isin(['won, cover', 'won, no cover'])
 BT_VANILLA_PASS = bool((_ov['win'] == _won_rule).all() and (_won_rule == BT['won_logged']).all())
-BT['winnable'] = BT['group'].isin(BT_WINNABLE); BT['y_trade'] = np.where(_won_rule, BT['finalquoteyield'], np.where(BT['group'] == 'lost, printed', BT['msrb_yield'], np.nan))
+BT['winnable'] = BT['group'].isin(BT_WINNABLE)
+# the traded level: for the markouts the tape's own yield of the print (the exits are tape yields); for the price term of a new win the print's price in our quote's convention
+BT['y_trade'] = np.where(_won_rule, BT['finalquoteyield'], np.where(BT['group'] == 'lost, printed', BT['msrb_yield'], np.nan))
+BT['y_trade_px'] = np.where((BT['group'] == 'lost, printed') & np.isfinite(BT['print_y_px']), BT['print_y_px'], BT['y_trade'])
 _sum = _ov.assign(manual=BT['manual']).groupby('group').agg(requests=('win', 'size'), share=('win', lambda s: len(s) / len(_ov)), wins=('win', 'mean'), manual=('manual', 'mean'), d_bp_median=('d_bp', 'median'), d_bp_p90=('d_bp', lambda s: s.quantile(0.9)))
 print('The requests by outcome group (d = threshold yield - our final yield in bp: on cover wins the bp left on the table, on lost printed requests the bp short of the print):'); display(_sum.round(3))
 print(f'the replayed quote reproduces the logged win / loss on every request: {BT_VANILLA_PASS} | winnable requests {BT["winnable"].mean():.1%} | logged win rate {BT["won_logged"].mean():.2%} | manual requests {BT["manual"].mean():.1%}')
 assert BT_REPLAY_PASS and BT_VANILLA_PASS, 'production not reproduced: nothing below is comparable'
-_cov_priced = float(np.isfinite(BT['cover_y'].to_numpy(float))[BT['won_cover'].to_numpy(bool)].mean()) if BT['won_cover'].any() else np.nan
-print(f'cover yields priced on {_cov_priced:.1%} of the wins with a cover price')
-assert not (np.isfinite(_cov_priced) and _cov_priced < 0.5), ('the cover yields did not price (the pricing service did not answer): without them every win is scored against our own quote and any '
+# ---- the audits of the price-anchored rule
+_cw = (BT['won_cover'] & BT['won_logged']).to_numpy(bool); _mg = BT['cover_margin_px'].to_numpy(float)[_cw]; _cbp = 100.0 * (BT['cover_y'] - BT['finalquoteyield']).to_numpy(float)[_cw]
+_clog = pd.to_numeric(BT['cover'], errors='coerce').to_numpy(float)[_cw] if 'cover' in BT else np.full(int(_cw.sum()), np.nan)
+COVER_AUDIT = {'wins with a cover price': int(_cw.sum()), 'cover yield found': float(np.isfinite(_cbp).mean()) if _cw.any() else np.nan, 'our price below the cover price': float((_mg < 0).mean()) if _cw.any() else np.nan,
+               'bp won by, median': float(np.nanmedian(_cbp)) if np.isfinite(_cbp).any() else np.nan, 'bp won by, p90': float(np.nanpercentile(_cbp[np.isfinite(_cbp)], 90)) if np.isfinite(_cbp).any() else np.nan,
+               'bp won by, p99': float(np.nanpercentile(_cbp[np.isfinite(_cbp)], 99)) if np.isfinite(_cbp).any() else np.nan, 'logged cover field = our price - cover price (within 0.001)': float((np.abs(_clog - _mg) <= 1e-3).mean()) if _cw.any() else np.nan}
+print('The cover as a yield, from the logged price margin and the service DV01 at our quote (no price-to-yield call):', {k: round(v, 4) if isinstance(v, float) else v for k, v in COVER_AUDIT.items()})
+_lp = (~BT['won_logged'] & BT['msrb_yield'].notna()).to_numpy(bool); _yl = BT['finalquoteyield'].to_numpy(float); _ymt = BT['msrb_yield'].to_numpy(float); _ymp = BT['print_y_px'].to_numpy(float)
+_both = _lp & np.isfinite(_ymp); _rich_px = _ymp < _yl; _rich_tape = _ymt < _yl
+_pa = pd.DataFrame({'call bucket': BT['call_bucket'].astype(str).to_numpy()[_both] if 'call_bucket' in BT else 'all', 'gap': BT['print_gap_bp'].to_numpy(float)[_both], 'disagree': (_rich_px != _rich_tape)[_both]})
+PRINT_AUDIT = {'lost requests with a print': int(_lp.sum()), 'read through the print price': float(_both[_lp].mean()) if _lp.any() else np.nan,
+               'richer by price but not by tape yield, or the reverse': float(_pa['disagree'].mean()) if len(_pa) else np.nan, 'tape yield - price-anchored yield, median (bp)': float(_pa['gap'].median()) if len(_pa) else np.nan,
+               '|gap| <= 0.1 bp': float((_pa['gap'].abs() <= 0.1).mean()) if len(_pa) else np.nan, '|gap| p99 (bp)': float(_pa['gap'].abs().quantile(0.99)) if len(_pa) else np.nan}
+print('The matched print as a yield in our quote\'s convention, from its logged price and the service DV01, against the tape yield:', {k: round(v, 4) if isinstance(v, float) else v for k, v in PRINT_AUDIT.items()})
+if len(_pa):
+    PRINT_BY_CALL = _pa.groupby('call bucket').agg(**{'lost printed': ('gap', 'size'), 'gap median (bp)': ('gap', 'median'), '|gap| <= 0.1 bp': ('gap', lambda s: (s.abs() <= 0.1).mean()), '|gap| p99 (bp)': ('gap', lambda s: s.abs().quantile(0.99)), 'rule disagrees': ('disagree', 'mean')})
+    print('... by the logged call bucket (a gap concentrated on callables is a yield-to-worst convention gap between the tape and production):'); display(PRINT_BY_CALL.round(4))
+else:
+    PRINT_BY_CALL = pd.DataFrame()
+_cov_priced = COVER_AUDIT['cover yield found'] if _cw.any() else np.nan
+print(f'cover yields found on {_cov_priced:.1%} of the wins with a cover price | thresholds by source: {BT.loc[BT["winnable"], "threshold_source"].value_counts(normalize=True).round(4).to_dict()}')
+assert not (np.isfinite(_cov_priced) and _cov_priced < 0.5), ('the cover yields are missing (no DV01 from the pricing service, or no logged bid price): without them every win is scored against our own quote and any '
                                                                  'widening loses it, so the backtest is not meaningful. Rerun when the service answers, or with the lab pricing cache in place')
+_dv_cov = float(BT.loc[BT['winnable'], 'usd_per_bp'].notna().mean())
+print(f'DV01 priced on {_dv_cov:.1%} of winnable requests; $ per bp of a fill: median {BT.loc[BT["winnable"], "usd_per_bp"].median():.2f}')
+if _dv_cov < 0.5:
+    print('WARNING: DV01 is missing on most winnable requests, so every dollar and gross-DV01 column below is empty; the bp-per-request columns stand')
 _ch_m = BT[BT['winnable']].groupby('month').agg(**{'manual (median bp)': ('manualcharges', 'median'), 'manual (mean bp)': ('manualcharges', 'mean'), 'liquidity (median bp)': ('liquiditycharge', 'median'), 'risk (median bp)': ('riskcharge', 'median'),
                                                    'win rate': ('won_logged', 'mean'), 'concession x* (median bp)': ('optimalQuantileBp', 'median')})
 print('The charges production applied, by month (winnable requests), with the win rate and the median optimal concession:'); display(_ch_m.round(3))
 fig, ax = plt.subplots(1, 3, figsize=(19, 4.5))
 _ch_m[['manual (median bp)', 'liquidity (median bp)', 'risk (median bp)']].plot.bar(ax=ax[0], color=[C_RED, C_BLUE, C_GREEN]); ax[0].set_title('Production\'s charges by month (median bp of yield)', fontsize=10); ax[0].set_xlabel('')
 _d = _ov.loc[_ov['group'] == 'won, cover', 'd_bp']; ax[1].hist(_d.clip(0, 30), bins=60, color=C_BLUE); ax[1].axvline(_d.median(), color='k', ls='--', lw=0.8, label=f'median {_d.median():.1f} bp'); ax[1].legend(fontsize=8)
-ax[1].set_xlabel('bp left on the table against the cover (clipped at 30)'); ax[1].set_title('Cover wins: how much we won by', fontsize=10)
+ax[1].set_xlabel('bp left on the table against the cover (clipped at 30)'); ax[1].set_title('Cover wins: how much we won by (price-anchored)', fontsize=10)
 _x = BT.loc[BT['winnable'], 'optimalQuantileBp']; ax[2].hist(_x.clip(-10, 40), bins=50, color=C_GREEN); ax[2].set_xlabel('optimal concession x* (bp above the model mid)'); ax[2].set_title('The concession production chose, winnable requests', fontsize=10)
 savefig('05_requests')
-record('replay', vanilla_pass=BT_VANILLA_PASS, groups=flat_records(_sum), charges_by_month=flat_records(_ch_m))
+record('replay', vanilla_pass=BT_VANILLA_PASS, settle=SETTLE_AUDIT, cover=COVER_AUDIT, print_rule=PRINT_AUDIT, print_by_call=flat_records(PRINT_BY_CALL) if len(PRINT_BY_CALL) else [], dv01_coverage=_dv_cov, groups=flat_records(_sum), charges_by_month=flat_records(_ch_m))
 print(f'[5-2] {time.perf_counter() - _r_t0:.0f}s')
 
 # %% [markdown]
@@ -1112,17 +1280,8 @@ def bt_side_exit(frame: pd.DataFrame, h: int) -> tuple[np.ndarray, np.ndarray]:
 BT_TAPE = bt_tape(msrb_raw)
 _ex = cached('rfq_exits', lambda: bt_exits(BT, BT_TAPE), deps=[frame_fingerprint(BT[['finalquoteyield', 'msrb_yield', 'date']]), len(BT_TAPE), float(BT_TAPE['y'].sum())], code=[bt_exits, bt_tape], cfg=('h_record', 'yield_mad_k'))
 BT = BT.drop(columns=[c for c in _ex.columns if c in BT.columns]).join(_ex.set_index(BT.index))
-BT['yx_X'], BT['xtype'] = bt_side_exit(BT, BT_H_RECORD); BT['M_other'] = 100.0 * (BT['y_trade'] - BT['yx_X'])
-# DV01 per 100 par at the logged final yield, one call per (bond, settle) of the winnable requests
-_dq = BT.loc[BT['winnable'], ['cusip', 'settle', 'finalquoteyield']].astype({'cusip': str}).groupby(['cusip', 'settle'], as_index=False)['finalquoteyield'].median().rename(columns={'finalquoteyield': 'value'})
-_dv = bt_pricing('yield2price', _dq); _dv = _dq.assign(value=_dq['value'].round(6)).merge(_dv[['cusip', 'value', 'settle', 'dv01']], on=['cusip', 'value', 'settle'], how='left')
-BT['dv01'] = pd.to_numeric(BT[['cusip', 'settle']].astype({'cusip': str}).merge(_dv[['cusip', 'settle', 'dv01']], on=['cusip', 'settle'], how='left')['dv01'], errors='coerce').to_numpy()
-BT['usd_per_bp'] = pd.to_numeric(BT['quantity'], errors='coerce') / 100.0 * BT['dv01']
-_dv_cov = float(BT.loc[BT['winnable'], 'usd_per_bp'].notna().mean())
-print(f'print tape {len(BT_TAPE):,} prints | own other-side exit within {BT_H_RECORD} business days on {BT.loc[BT["winnable"], "M_other"].notna().mean():.1%} of winnable requests | '
-      f'DV01 priced on {_dv_cov:.1%}; $ per bp of a fill: median {BT.loc[BT["winnable"], "usd_per_bp"].median():.2f} | {time.perf_counter() - _e_t0:.0f}s')
-if _dv_cov < 0.5:
-    print('WARNING: DV01 is missing on most winnable requests, so every dollar and gross-DV01 column below is empty; the bp-per-request columns stand')
+BT['yx_X'], BT['xtype'] = bt_side_exit(BT, BT_H_RECORD); BT['M_other'] = 100.0 * (BT['y_trade'] - BT['yx_X'])   # the markouts use the tape's own yields (DV01 and the price-anchored thresholds are Section 5)
+print(f'print tape {len(BT_TAPE):,} prints | own other-side exit within {BT_H_RECORD} business days on {BT.loc[BT["winnable"], "M_other"].notna().mean():.1%} of winnable requests | {time.perf_counter() - _e_t0:.0f}s')
 
 # %%
 CELL_T('6. Exits: the comparable-bond exit of record, the common markout [2]')
@@ -1413,6 +1572,131 @@ print(f'cumulated {PC_START.date()} .. {PC_CUM.index[-1].date()}: new position $
 record('replay_vs_desk', window=[str(PC_START.date()), str(PC_END.date())], wins_found=float(_rw['matched'].mean()), bids_explained=float(_wb['matched'].mean()), yield_within_01bp=float((_dy.abs() <= 0.1).mean()),
        monthly=flat_records(PC_MONTHLY), by_type=flat_records(PC_BY_TYPE), inventory={k: float(v) for k, v in PC_INV.items()}, pnl_monthly=flat_records(PC_PNL_M), cumulative={k: float(v) for k, v in _last.items()}, seconds=time.perf_counter() - _pc_t0)
 print(f'[7] {time.perf_counter() - _pc_t0:.0f}s')
+
+# %% [markdown]
+# **Three checks on the replay's inputs (v1.0.2).**
+#
+# (a) *The price of our quote.* Everything above is scored in yield; price enters through DV01. On production's logged wins, three prices are
+# compared: the pricing service's price at our logged quote yield and the settle date sent, the bid price production logged (`our_bid_price`),
+# and the WFTrade fill price on the matched pairs, with the service's price at the WFTrade yield beside it. Differences are in cents per 100 par
+# and in bp through the service DV01, split by call structure and by where the settle date came from. A gap here is a convention gap (settle date,
+# yield to worst on callables, rounding), not a scoring error; it says how far a yield-space result carries into dollars, and it is why the win rule
+# anchors on production's own price rather than on the service's.
+#
+# (b) *The linearisation.* The price-anchored thresholds move along the DV01 tangent at our quote. On a fixed sample of lost requests the service
+# prices the bond at the print's anchored yield and the result is compared with the print's logged price, so the error of the tangent at exactly
+# the crossing distance is measured, by distance and by call structure; the same on a sample of cover wins at the cover's anchored yield.
+#
+# (c) *The requests we lost.* The win rule takes the matched MSRB print of a lost request as the winning bid and the replay reproduces the loss by
+# construction, so the print itself is what needs checking: by month, the share of requests with a matched print and our share of the printed ones;
+# for the lost printed requests, the print type (a dealer's winning bid on a customer sell prints as P), the print's par against the request's, the
+# time from the request to the print as logged, and how far our bid was behind the print.
+
+# %%
+CELL_T('7. Replay against the desk: the price of our quote, the linearisation, the requests we lost [2]')
+_rc_t0 = time.perf_counter()
+# ---- (a) price: the service at our logged yield and the settle date sent, our logged bid price, the WFTrade fill on the matched pairs
+_rc_rows = np.flatnonzero((BT['won_logged'] & BT['date'].between(PC_START, PC_END)).to_numpy())
+_rc_q = pd.DataFrame({'_i': _rc_rows, 'cusip': BT['cusip'].astype(str).to_numpy()[_rc_rows], 'value': BT['finalquoteyield'].to_numpy(float)[_rc_rows].round(6), 'settle': BT['settle'].to_numpy()[_rc_rows]})
+_rc_r = bt_pricing('yield2price', _rc_q[['cusip', 'value', 'settle']])
+_rc_q = _rc_q.merge(_rc_r[['cusip', 'value', 'settle', 'price', 'dv01']], on=['cusip', 'value', 'settle'], how='left')
+_rc_i = _rc_q['_i'].to_numpy()
+PX = pd.DataFrame({'bt_row': _rc_i, 'cusip': _rc_q['cusip'].to_numpy(), 'date': BT['date'].to_numpy()[_rc_i], 'call structure': BT['call_structure'].to_numpy()[_rc_i], 'settle source': BT['settle_source'].to_numpy()[_rc_i],
+                   'logged yield': _rc_q['value'].to_numpy(), 'logged bid price': BT['our_px'].to_numpy(float)[_rc_i],
+                   'service price at logged yield': pd.to_numeric(_rc_q['price'], errors='coerce').to_numpy(float), 'dv01': pd.to_numeric(_rc_q['dv01'], errors='coerce').to_numpy(float)})
+_rc_wf = WF_FILLS[['trade_number', 'price', 'yield', 'exec_date_ny']].drop_duplicates('trade_number', keep='last').rename(columns={'price': 'WFTrade price', 'yield': 'WFTrade yield'})
+PX = PX.merge(PC_MATCH[['win_id', 'trade_number']].rename(columns={'win_id': 'bt_row'}).merge(_rc_wf, on='trade_number', how='left'), on='bt_row', how='left')
+_rc_m = (pd.to_numeric(PX['WFTrade yield'], errors='coerce').notna() & PX['exec_date_ny'].notna()).to_numpy()
+_rc_q2 = pd.DataFrame({'_i': np.flatnonzero(_rc_m), 'cusip': PX['cusip'].astype(str).to_numpy()[_rc_m], 'value': pd.to_numeric(PX['WFTrade yield'], errors='coerce').to_numpy(float)[_rc_m].round(6), 'settle': BT['settle'].to_numpy()[PX['bt_row'].to_numpy()[_rc_m]]})
+_rc_r2 = bt_pricing('yield2price', _rc_q2[['cusip', 'value', 'settle']])
+_rc_q2 = _rc_q2.merge(_rc_r2[['cusip', 'value', 'settle', 'price']], on=['cusip', 'value', 'settle'], how='left')
+PX['service price at WFTrade yield'] = np.nan; PX.loc[PX.index[_rc_q2['_i'].to_numpy()], 'service price at WFTrade yield'] = pd.to_numeric(_rc_q2['price'], errors='coerce').to_numpy(float)
+
+
+def _px_cmp(name: str, a: pd.Series, b: pd.Series) -> dict:
+    a = pd.to_numeric(a, errors='coerce').to_numpy(float); b = pd.to_numeric(b, errors='coerce').to_numpy(float); dv = PX['dv01'].to_numpy(float)
+    d = a - b; ok = np.isfinite(d); bp = np.abs(d) / np.where(dv > 0, dv, np.nan); okb = ok & np.isfinite(bp)
+    if not ok.any():
+        return {'comparison': name, 'pairs': 0}
+    return {'comparison': name, 'pairs': int(ok.sum()), 'share of wins': float(ok.mean()), 'median diff (price)': float(np.median(d[ok])), 'median |diff| (cents per 100 par)': float(np.median(np.abs(d[ok])) * 100.0),
+            'within 0.1 cent': float((np.abs(d[ok]) <= 0.001 + 1e-9).mean()), 'within 1 cent': float((np.abs(d[ok]) <= 0.01 + 1e-9).mean()),
+            'within 0.1 bp (via DV01)': float((bp[okb] <= 0.1).mean()) if okb.any() else np.nan, 'p99 |diff| (bp via DV01)': float(np.quantile(bp[okb], 0.99)) if okb.any() else np.nan}
+
+
+PX_CHECK = pd.DataFrame([_px_cmp('service at our logged yield vs our logged bid price', PX['service price at logged yield'], PX['logged bid price']),
+                         _px_cmp('our logged bid price vs the WFTrade fill price', PX['logged bid price'], PX['WFTrade price']),
+                         _px_cmp('service at the WFTrade yield vs the WFTrade fill price', PX['service price at WFTrade yield'], PX['WFTrade price'])]).set_index('comparison')
+print(f'Price checks on production\'s logged wins {PC_START.date()} .. {PC_END.date()} ({len(PX):,} wins; differences in price points per 100 par, bp through the service DV01):'); display(PX_CHECK.round(4))
+PX['|diff| bp, service vs logged'] = (PX['service price at logged yield'] - PX['logged bid price']).abs() / PX['dv01'].where(PX['dv01'] > 0)
+
+
+def _px_by(col: str) -> pd.DataFrame:
+    return PX.groupby(col).agg(wins=('bt_row', 'size'), **{'priced': ('|diff| bp, service vs logged', lambda s: s.notna().mean()), 'median |diff| (bp)': ('|diff| bp, service vs logged', 'median'),
+                                                           'within 0.1 bp': ('|diff| bp, service vs logged', lambda s: (s.dropna() <= 0.1).mean()), 'p99 |diff| (bp)': ('|diff| bp, service vs logged', lambda s: s.quantile(0.99))})
+
+
+PX_BY_CALL, PX_BY_SETTLE = _px_by('call structure'), _px_by('settle source')
+print('Service at our logged yield vs our logged bid price, by call structure (a yield-to-worst convention gap shows up on the callables):'); display(PX_BY_CALL.round(4))
+print('... by where the settle date came from (a gap only on the T+2 rows means the settle date, not the yield, is what differs):'); display(PX_BY_SETTLE.round(4))
+print('The ten largest gaps:'); display(PX.sort_values('|diff| bp, service vs logged', ascending=False).head(10)[['cusip', 'date', 'call structure', 'settle source', 'logged yield', 'logged bid price', 'service price at logged yield', 'WFTrade price', 'dv01', '|diff| bp, service vs logged']].round(4))
+# ---- (b) the linearisation: the service at the anchored yield of the print (lost requests) and of the cover (cover wins) against their logged prices, on a fixed sample
+_lin_rng = np.random.default_rng(CFG.seed)
+_lin_rows = []
+for what, msk, y_col, px_col in (('print of a lost request', (BT['group'] == 'lost, printed') & BT['print_y_px'].notna() & BT['msrb_px'].notna(), 'print_y_px', 'msrb_px'),
+                                 ('cover of a won request', (BT['group'] == 'won, cover') & BT['cover_y'].notna() & BT['cover_px'].notna(), 'cover_y', 'cover_px')):
+    idx = np.flatnonzero((msk & BT['date'].between(PC_START, PC_END)).to_numpy())
+    if not len(idx):
+        continue
+    idx = _lin_rng.choice(idx, min(CFG.px_check_sample // 2, len(idx)), replace=False)
+    q = pd.DataFrame({'cusip': BT['cusip'].astype(str).to_numpy()[idx], 'value': BT[y_col].to_numpy(float)[idx].round(6), 'settle': BT['settle'].to_numpy()[idx]})
+    r = q.merge(bt_pricing('yield2price', q)[['cusip', 'value', 'settle', 'price']], on=['cusip', 'value', 'settle'], how='left')
+    dv = BT['dv01'].to_numpy(float)[idx]; err = (pd.to_numeric(r['price'], errors='coerce').to_numpy(float) - BT[px_col].to_numpy(float)[idx]) / np.where(dv > 0, dv, np.nan)
+    _lin_rows.append(pd.DataFrame({'what': what, 'call structure': BT['call_structure'].to_numpy()[idx], 'move (bp)': 100.0 * np.abs(BT[y_col].to_numpy(float)[idx] - BT['finalquoteyield'].to_numpy(float)[idx]), 'error (bp)': err}))
+LIN = pd.concat(_lin_rows, ignore_index=True) if _lin_rows else pd.DataFrame(columns=['what', 'call structure', 'move (bp)', 'error (bp)'])
+if len(LIN):
+    LIN['move bucket'] = LIN.groupby('what')['move (bp)'].transform(lambda s: pd.qcut(s.rank(method='first'), min(5, max(int(s.notna().sum() // 20), 1)), labels=False)).astype('Int64')
+    LIN_BY_MOVE = LIN.groupby(['what', 'move bucket']).agg(**{'pairs': ('error (bp)', 'size'), 'priced': ('error (bp)', lambda s: s.notna().mean()), 'move median (bp)': ('move (bp)', 'median'), 'move max (bp)': ('move (bp)', 'max'),
+                                                              'error median (bp)': ('error (bp)', 'median'), '|error| median (bp)': ('error (bp)', lambda s: s.abs().median()), '|error| p95 (bp)': ('error (bp)', lambda s: s.abs().quantile(0.95))})
+    LIN_BY_CALL = LIN.groupby(['what', 'call structure']).agg(**{'pairs': ('error (bp)', 'size'), '|error| median (bp)': ('error (bp)', lambda s: s.abs().median()), '|error| p95 (bp)': ('error (bp)', lambda s: s.abs().quantile(0.95))})
+    print(f'The DV01 tangent at the crossing distance ({len(LIN):,} sampled pairs): service price at the anchored yield minus the logged price, in bp through DV01 (0 = the tangent is exact); by the size of the move:'); display(LIN_BY_MOVE.round(4))
+    print('... by call structure (a yield-to-worst switch between our quote and the print shows up here):'); display(LIN_BY_CALL.round(4))
+else:
+    LIN_BY_MOVE = LIN_BY_CALL = pd.DataFrame()
+# ---- (c) the requests we lost: is the matched print the winning bid?
+_rc_w = BT['date'].between(PC_START, PC_END).to_numpy()
+_rc_f = pd.DataFrame({'month': BT['month'].to_numpy()[_rc_w], 'group': BT['group'].astype(str).to_numpy()[_rc_w], 'printed': pd.to_numeric(BT['msrb_yield'], errors='coerce').notna().to_numpy()[_rc_w]})
+LOST_M = pd.crosstab(_rc_f['month'], _rc_f['group']).reindex(columns=BT_GROUPS, fill_value=0)
+LOST_M.insert(0, 'requests', LOST_M[BT_GROUPS].sum(axis=1)); LOST_M.insert(1, 'with a matched print', _rc_f.groupby('month')['printed'].mean())
+_rc_won = LOST_M['won, cover'] + LOST_M['won, no cover']
+LOST_M['win rate'] = _rc_won / LOST_M['requests']; LOST_M['our share of the printed requests'] = _rc_won / (_rc_won + LOST_M['lost, printed'] + LOST_M['lost, print not winner'])
+print('Every request by month and outcome group (a request is winnable if we won it or a print richer than our bid matched it):'); display(LOST_M.round(4))
+_lp = np.flatnonzero((BT['group'].eq('lost, printed') & BT['date'].between(PC_START, PC_END)).to_numpy())
+_lp_gap = ((to_ns(BT['msrb_tradetime']) - to_ns(BT['rfq_received_time'])).dt.total_seconds() / 60.0).to_numpy(float)
+_lp_f = pd.DataFrame({'cusip': BT['cusip'].astype(str).str.strip().to_numpy()[_lp], 'ts': to_ns(BT['msrb_tradetime']).to_numpy()[_lp], 'y': pd.to_numeric(BT['msrb_yield'], errors='coerce').round(4).to_numpy()[_lp],
+                      'print type': BT['print_type'].astype(str).str[0].to_numpy()[_lp], 'request par': pd.to_numeric(BT['quantity'], errors='coerce').to_numpy(float)[_lp],
+                      'minutes from request to print': _lp_gap[_lp], 'bp short of the print': -bt_outcomes(BT, BT['y_vanilla'])['d_bp'].to_numpy(float)[_lp]})
+_lp_tape = msrb_raw.loc[msrb_raw['cusip'].astype(str).str.strip().isin(set(_lp_f['cusip'])), ['cusip', 'tradetime', 'yield', 'quantity']]
+_lp_tape = pd.DataFrame({'cusip': _lp_tape['cusip'].astype(str).str.strip().to_numpy(), 'ts': to_ns(_lp_tape['tradetime']).to_numpy(), 'y': pd.to_numeric(_lp_tape['yield'], errors='coerce').round(4).to_numpy(),
+                         'print par': pd.to_numeric(_lp_tape['quantity'], errors='coerce').to_numpy(float)}).drop_duplicates(['cusip', 'ts', 'y'])
+_lp_f = _lp_f.merge(_lp_tape, on=['cusip', 'ts', 'y'], how='left'); _lp_f['par ratio'] = _lp_f['print par'] / _lp_f['request par']
+LOST_PRINTS = pd.concat([_lp_f, _lp_f.assign(**{'print type': 'all'})]).groupby('print type').agg(requests=('cusip', 'size'), **{
+    'print found on the tape': ('print par', lambda s: s.notna().mean()), 'same par as the request': ('par ratio', lambda s: (np.abs(s - 1.0) < 1e-9).mean()), 'par within 25%': ('par ratio', lambda s: (np.abs(s - 1.0) <= 0.25).mean()),
+    'minutes to the print, median': ('minutes from request to print', 'median'), 'print within 60 minutes': ('minutes from request to print', lambda s: (s.abs() <= 60).mean()),
+    'bp short of the print, median': ('bp short of the print', 'median'), 'bp short, 90th pct': ('bp short of the print', lambda s: s.quantile(0.9))})
+print('The lost printed requests, by the matched print\'s type (P = a dealer bought from a customer, the side a winning bid prints on; times as logged, the two clocks may differ by a time zone):'); display(LOST_PRINTS.round(3))
+fig, ax = plt.subplots(1, 4, figsize=(24, 4.6))
+_bpd = PX['|diff| bp, service vs logged'].dropna(); ax[0].hist(_bpd.clip(0, 2), bins=80, color=C_BLUE); ax[0].set_xlabel('|service price - logged bid price| in bp via DV01 (clipped at 2)'); ax[0].set_title('The price of our quote, recomputed from its yield', fontsize=10)
+if len(LIN):
+    for what, col in zip(LIN['what'].unique(), (C_RED, C_GREEN)):
+        l_ = LIN[LIN['what'] == what].dropna(subset=['error (bp)']); ax[1].scatter(l_['move (bp)'].clip(0, 80), l_['error (bp)'].clip(-5, 5), s=5, alpha=0.4, color=col, label=what)
+    ax[1].axhline(0, color='k', lw=0.6); ax[1].legend(fontsize=8); ax[1].set_xlabel('move from our quote (bp, clipped at 80)'); ax[1].set_ylabel('tangent error (bp, clipped at 5)'); ax[1].set_title('The DV01 tangent against the service at the crossing distance', fontsize=10)
+ax[2].hist(_lp_f['minutes from request to print'].clip(-240, 480).dropna(), bins=90, color=C_GREEN); ax[2].set_xlabel('minutes from the request to the matched print (clipped)'); ax[2].set_title('Lost printed requests: when the winning print came', fontsize=10)
+ax[3].hist(_lp_f['bp short of the print'].clip(0, 60).dropna(), bins=60, color=C_RED); ax[3].set_xlabel('bp our bid was behind the print (clipped at 60)'); ax[3].set_title('Lost printed requests: how far we were behind', fontsize=10)
+savefig('07b_replay_checks')
+record('replay_checks', price=flat_records(PX_CHECK), price_by_call=flat_records(PX_BY_CALL), price_by_settle=flat_records(PX_BY_SETTLE), linearisation_by_move=flat_records(LIN_BY_MOVE) if len(LIN_BY_MOVE) else [],
+       linearisation_by_call=flat_records(LIN_BY_CALL) if len(LIN_BY_CALL) else [], outcomes_by_month=flat_records(LOST_M), lost_prints=flat_records(LOST_PRINTS), seconds=time.perf_counter() - _rc_t0)
+print(f'[7-2] {time.perf_counter() - _rc_t0:.0f}s')
+
 # %% [markdown]
 # ## 8. The width charge
 #
@@ -1441,7 +1725,7 @@ BT_MONTHS = sorted(BT['month'].unique())
 _month = BT['month'].to_numpy(); _winable = BT['winnable'].to_numpy(bool); _thr = BT['threshold_y'].to_numpy(float); _grp = BT['group'].astype(str).to_numpy()
 _m_sig, _adj, _ch = BT['signalyield'].to_numpy(float), BT['adj_yield'].to_numpy(float), BT['charges_level'].to_numpy(float)
 _man, _liq, _rsk = (BT[c].to_numpy(float) for c in ('manualcharges', 'liquiditycharge', 'riskcharge')); _c_base = -(_liq + _rsk)
-_y_tr = BT['y_trade'].to_numpy(float); _usd = BT['usd_per_bp'].to_numpy(float); _keys = BT['pfill_key'].astype(str).to_numpy(); _files = BT['pfill_file'].astype(str).to_numpy()
+_y_tr = BT['y_trade_px'].to_numpy(float); _usd = BT['usd_per_bp'].to_numpy(float); _keys = BT['pfill_key'].astype(str).to_numpy(); _files = BT['pfill_file'].astype(str).to_numpy()   # the price term of a win is against the traded level in our quote's convention (v1.0.2)
 _xlog = BT['optimalQuantileBp'].to_numpy(float); _wlog = BT['won_logged'].to_numpy(bool); _y_van = BT['y_vanilla'].to_numpy(float)
 _M_REC, _M_OTHER, _M_COMMON, _M_REAL = (BT[c].to_numpy(float) for c in ('M_rec', 'M_other', 'M_common', 'M_real'))
 _all = np.arange(N)
@@ -1548,7 +1832,7 @@ def _width_design(rows: np.ndarray) -> np.ndarray:
 
 
 def requote_const(b: np.ndarray, label: str, fam: str, setting: str, gamma: float) -> dict:
-    """A per-request charge b_i (<= 0), quoted as argmax (x + c + b_i) p(x) with the manual charge kept (yM) and removed (y0) on the test winnable rows; b = 0 where missing."""
+    """A per-request charge b_i (any sign: negative widens, positive tightens), quoted as argmax (x + c + b_i) p(x) with the manual charge kept (yM) and removed (y0) on the test winnable rows; b = 0 where missing."""
     bb = np.nan_to_num(b); yM, y0 = np.full(N, np.nan), np.full(N, np.nan)
     yM[_tm_rows] = requote(_tm_rows, _ch[_tm_rows] + bb[_tm_rows]); y0[_tm_rows] = requote(_tm_rows, _c_base[_tm_rows] + bb[_tm_rows])
     return {'family': fam, 'setting': setting, 'yM': bt_final(yM), 'y0': bt_final(y0), 'b': b, 'gamma': gamma, 'coverage': float(np.isfinite(b[_tmw]).mean())}
@@ -1610,6 +1894,60 @@ ax[2].set_xlabel('W: half-width of the 80% band over the holding period (bp, cli
 savefig('08_width_charge')
 record('width_charge', settings=list(VARIANTS), table=flat_records(_chg), extension=flat_records(WC_EXT) if len(WC_EXT) else [], candidate=CANDIDATE, seconds=time.perf_counter() - _wq_t0)
 print(f'[8-2] {len(VARIANTS)} settings quoted | {time.perf_counter() - _wq_t0:.0f}s')
+
+# %% [markdown]
+# **The two-sided variations (v1.0.2).** The one-sided charge only widens, so a request production lost stays lost and the new-win term of the scorecard is
+# empty by construction. The two-sided charge is centred: `charge_i = gamma (W_i - centre)`, with the same `gamma = k / median W` as the one-sided charge and
+# the centre the median `W` of the winnable requests over the previous 20 request days, strictly before the request date (so nothing after the close enters).
+# Two signs are run. *Two-sided*: a bond with a band tighter than the centre gets a negative charge, a tighter bid, and can cross the MSRB print of a request
+# production lost; a wider one pays more (the v1.0.2 draft). *Two-sided, reversed*: the opposite, a tighter bid on the bonds with the widest bands, after the
+# draft run showed the street's winning trades richen most on wide bands and least on tight ones. `k` in {1, 2}, the location-scale band on the residual, the
+# manual charge kept; scored in Section 9 like every other setting and split by outcome term in Section 10. The table reports how much each tightens and
+# widens, and the raw wins it takes from the requests production lost.
+
+# %%
+CELL_T('8. The width charge: the two-sided variations [3]')
+_ts_t0 = time.perf_counter()
+WC_K_TWO_SIDED, WC_CENTER_DAYS = tuple(CFG.wc_k_two_sided), int(CFG.wc_center_days)
+# the centre: median W of the winnable requests over the previous WC_CENTER_DAYS request days, strictly before the request date
+_ts_dn = pd.Series(BT['date'].dt.normalize().to_numpy())
+_ts_idx = np.flatnonzero(_winable & np.isfinite(_W0)); _ts_key = _ts_dn.to_numpy()[_ts_idx]
+_ts_by = {pd.Timestamp(k): _ts_idx[_ts_key == k] for k in np.unique(_ts_key)}
+_ts_days = sorted(pd.Timestamp(d) for d in _ts_dn[_tm].unique())
+_ts_center_d = {}
+for _i, _d in enumerate(_ts_days):
+    _prev = [_ts_by[p] for p in _ts_days[max(0, _i - WC_CENTER_DAYS):_i] if p in _ts_by]
+    _ts_center_d[_d] = float(np.median(_W0[np.concatenate(_prev)])) if _prev else np.nan
+W_CENTER = np.full(N, np.nan); W_CENTER[_tm] = _ts_dn[_tm].map(_ts_center_d).to_numpy(float)
+_ts_w_med = float(np.nanmedian(_W0[(_month == TEST_M[0]) & _tmw]))
+
+
+def _two_sided() -> dict:
+    out = {}
+    for k in WC_K_TWO_SIDED:
+        g_ = k / _ts_w_med
+        for sign, tag, fam in ((-1.0, 'two-sided', 'width charge, two-sided'), (1.0, 'two-sided, reversed', 'width charge, two-sided, reversed')):
+            nm = f'width k={k:g} | residual | ls | {tag}'
+            out[nm] = requote_const(sign * g_ * (_W0 - W_CENTER), nm, fam, f'k={k:g}, ls, {tag}', g_)   # sign -1: tighten when W < centre; +1: tighten when W > centre
+    return out
+
+
+_ts_v = cached('width_charge_two_sided', _two_sided, deps=[STAGE_KEYS['width_charge_quotes'], float(np.nansum(W_CENTER)), list(WC_K_TWO_SIDED), WC_CENTER_DAYS], code=[requote, requote_const, bt_optimize], cfg=('wc_k_two_sided', 'wc_center_days'))
+VARIANTS.update(_ts_v)
+_lost_rows = _tm_rows[_grp[_tm_rows] == 'lost, printed']
+_ts_rows = []
+for nm, v_ in _ts_v.items():
+    b_ = v_['b'][_tmw]; up, dn = b_ > 0, b_ < 0
+    _ts_rows.append({'setting': nm, 'gamma': v_['gamma'], 'covered': v_['coverage'], 'with a centre': float(np.isfinite(W_CENTER[_tmw]).mean()), 'tightened share': float(up.mean()), 'widened share': float(dn.mean()),
+                     'median tightening (bp)': float(np.median(b_[up])) if up.any() else np.nan, 'median widening (bp)': float(np.median(-b_[dn])) if dn.any() else np.nan, 'max tightening (bp)': float(b_[up].max()) if up.any() else np.nan,
+                     'raw win rate': float(bt_win_fast(_tm_rows, v_['yM'][_tm_rows]).mean()), 'production win rate': float(_w_van_all[_tm_rows].mean()),
+                     'new wins on lost requests': int(bt_win_fast(_lost_rows, v_['yM'][_lost_rows]).sum()), 'lost requests': int(len(_lost_rows))})
+TWO_SIDED = pd.DataFrame(_ts_rows).set_index('setting')
+_ts_cm = pd.DataFrame({'centre W, median over the month (bp)': pd.Series(W_CENTER[_tmw]).groupby(_month[_tmw]).median(), 'W, median over the month (bp)': pd.Series(_W0[_tmw]).groupby(_month[_tmw]).median()})
+print('The centre of the two-sided charge by test month (trailing, so it lags the month\'s own median):'); display(_ts_cm.round(3))
+print('The two-sided settings, manual charge kept (positive b = the bid is tighter than production\'s):'); display(TWO_SIDED.round(4))
+record('two_sided', settings=list(_ts_v), table=flat_records(TWO_SIDED), centre_by_month=flat_records(_ts_cm), center_days=WC_CENTER_DAYS, seconds=time.perf_counter() - _ts_t0)
+print(f'[8-3] {time.perf_counter() - _ts_t0:.0f}s')
 
 # %% [markdown]
 # ## 9. The backtest
@@ -1839,8 +2177,8 @@ print(f'[9-2] {len(VM)} scorecard rows | {time.perf_counter() - _x_t0:.0f}s')
 # %%
 CELL_T('9. The backtest: the pictures [3]')
 _p_t0 = time.perf_counter()
-_fam_c = {'width charge': C_BLUE, 'width charge, total move': C_ORANGE, 'width charge, every request': C_PURPLE}
-_short = {nm: nm.replace('width ', '').replace(' | residual', '').replace(' | every request', ', ext') for nm in VARIANTS}
+_fam_c = {'width charge': C_BLUE, 'width charge, total move': C_ORANGE, 'width charge, every request': C_PURPLE, 'width charge, two-sided': C_GREEN, 'width charge, two-sided, reversed': C_BROWN}
+_short = {nm: nm.replace('width ', '').replace(' | residual', '').replace(' | every request', ', ext').replace(' | two-sided, reversed', ', 2s rev').replace(' | two-sided', ', 2s') for nm in VARIANTS}
 # (1) the variant points on production's own width frontier, pair A, one panel per test month
 fig, axes = plt.subplots(2, int(np.ceil(len(TEST_M) / 2)), figsize=(6 * int(np.ceil(len(TEST_M) / 2)), 9)); axes = np.atleast_1d(axes).ravel()
 for a_, m in zip(axes, TEST_M):
@@ -1936,6 +2274,127 @@ record('edge', by_width=flat_records(BY_W), by_key=flat_records(BY_KEY), attribu
 print(f'[10] {time.perf_counter() - _dc_t0:.0f}s')
 
 # %% [markdown]
+# **The scorecard by outcome term, and what crossing would have taken (v1.0.2).** The pooled scorecard mixes requests the desk won with requests it lost, so a
+# result can come from either side without showing which. Here pair A against production at about the same win rate is split by the request's logged
+# outcome, each term with its own numbers and never pooled:
+#
+# - *won, with a logged cover*: kept and given up, the bp left on the table against the cover, the P&L of the term;
+# - *won, no cover*: kept and given up, the P&L of the term (no cover to measure against);
+# - *lost, MSRB print richer than our bid*: the print is the potential cover. How far production was behind it, the new wins (a quote richer than the
+#   print's price) and how much richer than the print they paid, the comparator's own new wins, the street winner's markout, the P&L of the term;
+# - *not winnable* (no print, or a print at or cheaper than our bid): counted only.
+#
+# For every term the delta per request in the term and the term's contribution to the pooled delta of Section 9 (the contributions add up to it). Then
+# the lost requests on their own: by decile of how far production was behind the print, the count, how rich the print was against our model mid, and what
+# the street's winning trade was then worth under each exit; and the same by band width. This is the table a crossing rule has to be sized from: the
+# tightening needed is the distance behind the print, and the value of getting there is the markout of the print, net of what is paid over it.
+
+# %%
+CELL_T('10. The scorecard by outcome term, what crossing would have taken [2]')
+_tt_t0 = time.perf_counter()
+TERMS = {'1. won, with a logged cover': 'won, cover', '2. won, no cover': 'won, no cover', '3. lost, MSRB print richer than our bid (the potential cover)': 'lost, printed'}
+TERM_VARIANTS = [nm for nm in VARIANTS if nm.endswith('| residual | ls') or '| two-sided' in nm]
+TERM_KEYS = ('record', 'common markout', 'other side', 'realised')
+_D_PROD = bt_outcomes(BT, BT['y_vanilla'])['d_bp'].to_numpy(float)
+
+
+def score_terms(nm: str, yv: np.ndarray) -> list[dict]:
+    """Pair A against production at about the same win rate, split by the request's logged outcome; the term contributions add up to the pooled delta."""
+    rows = np.flatnonzero(_tmw & np.isfinite(yv)); yf, wd, mm = match_frontier(yv, 'M', rows); rows = rows[np.isfinite(yf[rows])]
+    v, b = yv[rows], yf[rows]; wv, wb = bt_win_fast(rows, v), bt_win_fast(rows, b); g = _grp[rows]; dv, db = 100.0 * (_thr[rows] - v), 100.0 * (_thr[rows] - b)
+    pxv, pxb = 100.0 * (v - _y_tr[rows]), 100.0 * (b - _y_tr[rows]); new_all = wv & ~wb; n_mo = max(len(set(_month[rows])), 1); D, SN = {}, {}
+    for key, Mv, Mb in (('record', _M_REC[rows], _M_REC[rows]), ('common markout', np.where(new_all, _M_COMMON[rows], _M_REC[rows]), _M_REC[rows]),
+                        ('other side', _M_OTHER[rows], _M_OTHER[rows]), ('realised', _M_REAL[rows], _M_REAL[rows])):
+        pv = np.where(wv, pxv + Mv, 0.0); pb = np.where(wb, pxb + Mb, 0.0); S = np.isfinite(pv) & np.isfinite(pb) & ~((wv & ~np.isfinite(Mv)) | (wb & ~np.isfinite(Mb)))
+        if key == 'realised':
+            S &= np.isfinite(Mv) & np.isfinite(Mb)          # production's own fills that were sold: terms 1 and 2 only
+        D[key] = np.where(S, pv - pb, np.nan); SN[key] = max(int(S.sum()), 1)
+    out = []
+    for term, gname in TERMS.items():
+        t = g == gname; kept, new, gone = t & wv & wb, t & wv & ~wb, t & wb & ~wv
+        r = {'variant': nm, 'term': term, 'requests': int(t.sum()), 'comparator shift (bp, + = more aggressive)': float(np.mean(list(wd.values()))) if wd else 0.0,
+             'win rate mismatch (pp)': 100.0 * float(np.mean(np.abs(list(mm.values())))) if mm else 0.0,
+             'comparator wins': int((t & wb).sum()), 'variant wins': int((t & wv).sum()), 'kept': int(kept.sum()), 'given up': int(gone.sum()), 'new wins': int(new.sum())}
+        if gname == 'won, cover':
+            r['bp left on the cover, variant'] = float(dv[t & wv].mean()) if (t & wv).any() else np.nan
+            r['bp left on the cover, comparator'] = float(db[t & wb].mean()) if (t & wb).any() else np.nan
+            r['cover change (bp)'] = r['bp left on the cover, variant'] - r['bp left on the cover, comparator']
+        if gname == 'lost, printed':
+            r['production behind the print, median (bp)'] = float(np.median(-_D_PROD[rows][t])) if t.any() else np.nan
+            r['variant richer than the print on its wins (bp)'] = float(dv[t & wv].mean()) if (t & wv).any() else np.nan
+            r['comparator richer than the print on its wins (bp)'] = float(db[t & wb].mean()) if (t & wb).any() else np.nan
+            r["street winner's markout, record (bp)"] = float(np.nanmean(_M_REC[rows][t])) if np.isfinite(_M_REC[rows][t]).any() else np.nan
+        for key in TERM_KEYS:
+            dk = np.where(t, D[key], np.nan)
+            r[f'delta per request in the term | {key} (bp)'] = float(np.nanmean(dk)) if np.isfinite(dk).any() else np.nan
+            if key != 'realised':
+                r[f'contribution to the pooled delta | {key} (bp)'] = float(np.nansum(dk) / SN[key])
+        dk = np.where(t, D['record'], np.nan)
+        r['NW t | record'] = cluster_t(dk, _wk_code[rows], len(_wk_levels)); r['$k per month, trimmed | record'] = float(np.nansum(dk * _usd_trim[rows]) / 1e3 / n_mo)
+        out.append(r)
+    return out
+
+
+TERM_SCORES = pd.DataFrame([r for nm in TERM_VARIANTS for r in score_terms(nm, VARIANTS[nm]['yM'])])
+_tt_head = ['requests', 'comparator shift (bp, + = more aggressive)', 'win rate mismatch (pp)', 'comparator wins', 'variant wins', 'kept', 'given up', 'new wins']
+_tt_pnl = [c for c in TERM_SCORES.columns if c.startswith(('delta per request', 'contribution', 'NW t', '$k'))]
+for term in TERMS:
+    t_ = TERM_SCORES[TERM_SCORES['term'] == term].set_index('variant')
+    extra = [c for c in t_.columns if c not in _tt_head + _tt_pnl + ['term'] and t_[c].notna().any()]
+    print(f'\nTERM {term} (pair A, manual charge kept, against production at about the same win rate):'); display(t_[_tt_head + extra + _tt_pnl].round(4))
+_tt_nw = pd.Series({'no print (not winnable at any price)': int((_tm & (_grp == 'no print')).sum()), 'print at or cheaper than our bid (not the winner)': int((_tm & (_grp == 'lost, print not winner')).sum())}, name='test requests')
+print('\nTERM 4. not winnable, counted only:'); display(_tt_nw.to_frame())
+_tt_check = TERM_SCORES.groupby('variant')[['contribution to the pooled delta | record (bp)']].sum().rename(columns={'contribution to the pooled delta | record (bp)': 'sum of the terms (bp)'})
+_tt_check['pooled, Section 9 (bp)'] = VM[(VM['pair'] == 'A') & (VM['mode'] == 'vs frontier at equal win rate') & (VM['period'] == 'all')].set_index('variant')['delta | record (bp)'].reindex(_tt_check.index)
+print('The terms add up to the pooled delta of record (pair A at about the same win rate):'); display(_tt_check.round(4))
+assert np.allclose(_tt_check['sum of the terms (bp)'], _tt_check['pooled, Section 9 (bp)'], atol=1e-6, equal_nan=True), 'the outcome terms do not add up to the pooled delta'
+# ---- what crossing would have taken: the lost printed requests of the test months by decile of how far production was behind the print
+_lpm = _tmw & (_grp == 'lost, printed'); _wnm = _tmw & _w_van_all
+_behind = -_D_PROD; _mid_gap = 100.0 * (_m_sig - BT['msrb_yield'].to_numpy(float))   # the print's yield below our model mid: how far above our mid the street paid
+_lx = pd.DataFrame({'behind (bp)': _behind[_lpm], 'print above our mid (bp)': _mid_gap[_lpm], 'rec': _M_REC[_lpm], 'cm': _M_COMMON[_lpm], 'oth': _M_OTHER[_lpm], 'usd': _usd_trim[_lpm], 'W quintile': _wq[_lpm], 'key group': _kgrp[_lpm].astype(str)})
+_lx['behind decile'] = pd.qcut(_lx['behind (bp)'].rank(method='first'), 10, labels=False)
+_cross_agg = {'lost printed requests': ('behind (bp)', 'size'), 'behind the print, median (bp)': ('behind (bp)', 'median'), 'behind, max (bp)': ('behind (bp)', 'max'), 'print above our mid, median (bp)': ('print above our mid (bp)', 'median'),
+              "street winner's markout, record (bp)": ('rec', 'mean'), 'common markout (bp)': ('cm', 'mean'), "street winner's markout, other side (bp)": ('oth', 'mean'), 'other-side exit exists': ('oth', lambda s: s.notna().mean()),
+              'record markout > 0': ('rec', lambda s: (s.dropna() > 0).mean()), '$k at the record markout, over the window': ('rec', lambda s: float(np.nansum(s * _lx.loc[s.index, 'usd']) / 1e3))}
+CROSS_BY_BEHIND = _lx.groupby('behind decile').agg(**_cross_agg)
+print('\nWhat crossing would have taken: the lost printed requests of the test months by decile of how far production was behind the print (the tightening needed), with what the street\'s winning trade was then worth:'); display(CROSS_BY_BEHIND.round(3))
+CROSS_BY_W = _lx.groupby('W quintile').agg(**_cross_agg)
+print('... by band width (the one-sided charge widens most where the street earned most):'); display(CROSS_BY_W.round(3))
+_lx['behind tercile'] = pd.qcut(_lx['behind (bp)'].rank(method='first'), 3, labels=['near (lowest third)', 'middle', 'far (highest third)'])
+CROSS_W_X_BEHIND = _lx.pivot_table(index='W quintile', columns='behind tercile', values='oth', aggfunc='mean', observed=True)
+print('... the street winner\'s other-side markout (bp), band width x distance behind the print:'); display(CROSS_W_X_BEHIND.round(2))
+# ---- the street against us by band width: the winner's markout from the print on the lost requests, ours on production's wins
+_street = _lx.groupby('W quintile').agg(**{'lost printed requests': ('behind (bp)', 'size'), 'production behind the print, median (bp)': ('behind (bp)', 'median'), "street winner's markout, record (bp)": ('rec', 'mean'), "street winner's markout, other side (bp)": ('oth', 'mean')})
+_ours = pd.DataFrame({'W quintile': _wq[_wnm], 'rec': _M_REC[_wnm], 'oth': _M_OTHER[_wnm], 'real': _M_REAL[_wnm]}).groupby('W quintile').agg(
+    **{'production wins': ('rec', 'size'), 'our markout, record (bp)': ('rec', 'mean'), 'our markout, other side (bp)': ('oth', 'mean'), 'our realised round trip (bp)': ('real', 'mean')})
+STREET_VS_OURS = _street.join(_ours, how='outer')
+print('By band width: what the street\'s winning trades were worth on the requests we lost, and what ours were worth on the ones we won (positive = the bond richened after the trade):'); display(STREET_VS_OURS.round(3))
+fig, ax = plt.subplots(1, 4, figsize=(26, 5))
+_q_ = STREET_VS_OURS.index.tolist(); _x = np.arange(len(_q_))
+ax[0].bar(_x - 0.2, STREET_VS_OURS["street winner's markout, record (bp)"], 0.4, color=C_GREY, label='the street, on requests we lost'); ax[0].bar(_x + 0.2, STREET_VS_OURS['our markout, record (bp)'], 0.4, color=C_BLUE, label='us, on requests we won')
+ax[0].axhline(0, color='k', lw=0.6); ax[0].set_xticks(_x); ax[0].set_xticklabels(_q_, fontsize=8); ax[0].legend(fontsize=8); ax[0].set_title('The winner\'s markout by band width (bp, record exit)', fontsize=10)
+_xb = np.arange(len(CROSS_BY_BEHIND))
+ax[1].bar(_xb - 0.2, CROSS_BY_BEHIND["street winner's markout, record (bp)"], 0.4, color=C_GREY, label='record'); ax[1].bar(_xb + 0.2, CROSS_BY_BEHIND["street winner's markout, other side (bp)"], 0.4, color=C_PURPLE, label='other side')
+ax[1].plot(_xb, CROSS_BY_BEHIND['behind the print, median (bp)'], 'k.-', lw=1.0, label='bp behind the print (median)'); ax[1].axhline(0, color='k', lw=0.6); ax[1].set_xticks(_xb); ax[1].set_xticklabels([f'D{i + 1}' for i in _xb], fontsize=8); ax[1].legend(fontsize=8)
+ax[1].set_title('Lost requests by distance behind the print: what the street\'s trade was worth, and how far we were', fontsize=9)
+_tt_show = [n for n in [CANDIDATE] + [n_ for n_ in TERM_VARIANTS if '| two-sided' in n_ and 'k=2' in n_] if n in TERM_VARIANTS]; _tl = list(TERMS)
+for j_, n_ in enumerate(_tt_show):
+    _c = TERM_SCORES[TERM_SCORES['variant'] == n_].set_index('term').reindex(_tl)['contribution to the pooled delta | record (bp)']
+    ax[2].bar(np.arange(len(_tl)) + (j_ - (len(_tt_show) - 1) / 2) * 0.8 / max(len(_tt_show), 1), _c.to_numpy(float), 0.8 / max(len(_tt_show), 1), color=[C_BLUE, C_PURPLE, C_ORANGE, C_GREEN][j_ % 4], label=n_)
+ax[2].axhline(0, color='k', lw=0.6); ax[2].set_xticks(np.arange(len(_tl))); ax[2].set_xticklabels([t.split(' (')[0] for t in _tl], fontsize=8); ax[2].legend(fontsize=7); ax[2].set_title('Contribution of each term to the pooled delta (bp per request)', fontsize=10)
+_hm = CROSS_W_X_BEHIND.to_numpy(float); _lim = np.nanmax(np.abs(_hm)) if np.isfinite(_hm).any() else 1.0
+im = ax[3].imshow(_hm, cmap='RdYlGn', vmin=-_lim, vmax=_lim, aspect='auto'); ax[3].set_xticks(range(_hm.shape[1])); ax[3].set_xticklabels(CROSS_W_X_BEHIND.columns.astype(str), fontsize=8); ax[3].set_yticks(range(_hm.shape[0])); ax[3].set_yticklabels(CROSS_W_X_BEHIND.index.astype(str), fontsize=8); ax[3].grid(False)
+for r_ in range(_hm.shape[0]):
+    for c_ in range(_hm.shape[1]):
+        if np.isfinite(_hm[r_, c_]):
+            ax[3].text(c_, r_, f'{_hm[r_, c_]:+.1f}', ha='center', va='center', fontsize=8)
+ax[3].set_title('Street winner\'s other-side markout (bp): band width x distance behind the print', fontsize=9); plt.colorbar(im, ax=ax[3], fraction=0.04)
+savefig('10b_terms')
+record('terms', table=TERM_SCORES.round(6).to_dict(orient='records'), not_winnable={k: int(v) for k, v in _tt_nw.items()}, check=flat_records(_tt_check), street_vs_ours=flat_records(STREET_VS_OURS),
+       cross_by_behind=flat_records(CROSS_BY_BEHIND), cross_by_w=flat_records(CROSS_BY_W), cross_w_x_behind=flat_records(CROSS_W_X_BEHIND), seconds=time.perf_counter() - _tt_t0)
+print(f'[10-2] {time.perf_counter() - _tt_t0:.0f}s')
+
+# %% [markdown]
 # ## 11. Summary
 #
 # The candidate in one table, read every way; then what the variations say; then the registry and the runtimes.
@@ -1955,8 +2414,20 @@ SUMMARY = (f'{CANDIDATE} with the manual charge kept, against production at the 
            f'gross DV01 {_rA["gross DV01 vs base"]:+.1%}; months with a positive sceptical delta {int((_mA["min delta, sceptical (bp)"] > 0).sum())} of {len(_mA)}. Without the manual charge on either side (pair C): '
            f'{_rC["min delta, sceptical (bp)"]:+.3f} bp, cover {_rC["cover change (bp)"]:+.2f} bp, {_rC["delta $ per month, trimmed | record ($k)"]:+,.0f} thousand a month. Readings: A {_rA["reading"]}; C {_rC["reading"]}. '
            f'Replay reproduced production on every request; the replay\'s wins are {REGISTRY["replay_vs_desk"]["wins_found"]:.1%} found in WFTrade and explain {REGISTRY["replay_vs_desk"]["bids_explained"]:.1%} of the desk\'s customer bids.')
+_ts_names = [n for n in VARIANTS if '| two-sided' in n]
+if _ts_names:
+    _t3 = TERM_SCORES[TERM_SCORES['term'].str.startswith('3.')].set_index('variant').reindex(_ts_names)
+    _tA = VM[(VM['mode'] == 'vs frontier at equal win rate') & (VM['period'] == 'all') & (VM['pair'] == 'A')].set_index('variant').reindex(_ts_names)
+    CROSSING = pd.DataFrame({'raw win rate': TWO_SIDED['raw win rate'].reindex(_ts_names), 'new wins on lost requests': TWO_SIDED['new wins on lost requests'].reindex(_ts_names), 'median tightening (bp)': TWO_SIDED['median tightening (bp)'].reindex(_ts_names),
+                             'richer than the print on new wins (bp)': _t3['variant richer than the print on its wins (bp)'], 'lost-term delta, record (bp)': _t3['delta per request in the term | record (bp)'],
+                             'lost-term delta, other side (bp)': _t3['delta per request in the term | other side (bp)'], 'pooled min sceptical delta (bp)': _tA['min delta, sceptical (bp)'], 'pooled $k per month': _tA['delta $ per month, trimmed | record ($k)']})
+    print('\nThe two-sided settings: what crossing the print bought (pair A at equal win rate; the lost term on its own):'); display(CROSSING.round(4))
+    _best = CROSSING['pooled min sceptical delta (bp)'].astype(float).idxmax()
+    SUMMARY += (f' Two-sided: the best setting ({_best}) wins {int(CROSSING.loc[_best, "new wins on lost requests"])} of the requests production lost by tightening {CROSSING.loc[_best, "median tightening (bp)"]:.2f} bp at the median, '
+                f'for {CROSSING.loc[_best, "pooled min sceptical delta (bp)"]:+.3f} bp per request pooled; production was {np.median(-_D_PROD[_tmw & (_grp == "lost, printed")]):.1f} bp behind the print at the median of the lost requests.')
 print('\nSUMMARY:', SUMMARY)
-record('summary', text=SUMMARY, candidate=flat_records(_sc.reset_index()), variations=flat_records(_vs), candidate_monthly=flat_records(_mA))
+_aud = {'settle': REGISTRY['replay'].get('settle'), 'cover': REGISTRY['replay'].get('cover'), 'print_rule': REGISTRY['replay'].get('print_rule'), 'carry': REGISTRY.get('carry'), 'price_checks': REGISTRY.get('replay_checks', {}).get('price')}
+record('summary', text=SUMMARY, candidate=flat_records(_sc.reset_index()), variations=flat_records(_vs), candidate_monthly=flat_records(_mA), crossing=flat_records(CROSSING) if _ts_names else [], audits=_aud)
 CELL_T('end')
 ct = pd.DataFrame(CELL_LOG); ct['share'] = ct['seconds'] / ct['seconds'].sum()
 if CACHE_LOG:
