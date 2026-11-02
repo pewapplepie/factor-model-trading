@@ -943,6 +943,7 @@ print(f'[5-1] replay {"PASS" if BT_REPLAY_PASS else "FAIL"} | {time.perf_counter
 CELL_T('5. The replay: outcomes and the win rule [2]')
 from pandas.tseries.holiday import AbstractHolidayCalendar, GoodFriday, USFederalHolidayCalendar  # noqa: E402
 BT_PRICING_HOST = 'http://3kmu-r-app-s01:8080'; BT_PRICING_CACHE = ARTIFACTS / 'pricing_cache.parquet'; BT_PRICING_BATCH = 250
+BT_PRICING_CACHES_RO = [ROOT / 'artifacts_ipca_lab' / 'pricing_cache.parquet']   # the lab's cache, read before the service is called: the same (cusip, value, settle) inputs
 BT_EPS_BP = 1e-6; BT_GROUPS = ['won, cover', 'won, no cover', 'lost, printed', 'lost, print not winner', 'no print']; BT_WINNABLE = ['won, cover', 'won, no cover', 'lost, printed']
 
 
@@ -985,16 +986,26 @@ def bt_pricing(endpoint: str, req: pd.DataFrame) -> pd.DataFrame:
     req = req.assign(cusip=req['cusip'].astype(str), value=pd.to_numeric(req['value'], errors='coerce').round(6)).dropna(subset=['value']).drop_duplicates(['cusip', 'value', 'settle'])
     if callable(globals().get('PRICING_OVERRIDE')):
         return globals()['PRICING_OVERRIDE'](endpoint, req)
-    cache = pd.read_parquet(BT_PRICING_CACHE) if BT_PRICING_CACHE.exists() else pd.DataFrame(columns=['endpoint', 'cusip', 'value', 'settle', 'price', 'yield', 'dv01', 'status'])
+    cols = ['endpoint', 'cusip', 'value', 'settle', 'price', 'yield', 'dv01', 'status']
+    cache = pd.concat([pd.read_parquet(p_) for p_ in [BT_PRICING_CACHE] + BT_PRICING_CACHES_RO if p_.exists()] or [pd.DataFrame(columns=cols)], ignore_index=True)
+    if len(cache):
+        cache = cache[cache['status'] == 'ok'].drop_duplicates(['endpoint', 'cusip', 'value', 'settle'], keep='first')   # a failed row is retried, never served
     have = cache.loc[cache['endpoint'] == endpoint, ['cusip', 'value', 'settle']]
     todo = req.merge(have, on=['cusip', 'value', 'settle'], how='left', indicator=True); todo = todo[todo['_merge'] == 'left_only'].drop(columns='_merge')
     if len(todo):
         import requests  # noqa: E402
-        t0 = time.perf_counter(); sess = requests.Session(); sess.trust_env = False; rows = []; todo = todo.assign(_k=todo.groupby('cusip').cumcount())
+        t0 = time.perf_counter(); sess = requests.Session(); sess.trust_env = False; rows = []; todo = todo.assign(_k=todo.groupby('cusip').cumcount()); down = None
         for _, g in todo.groupby('_k'):
             for s in range(0, len(g), BT_PRICING_BATCH):
                 rows += _bt_post(sess, endpoint, g.iloc[s:s + BT_PRICING_BATCH])
-        cache = pd.concat([cache, pd.DataFrame(rows)], ignore_index=True); cache.to_parquet(BT_PRICING_CACHE, index=False)
+                if len(rows) >= BT_PRICING_BATCH and all(r['status'] != 'ok' for r in rows):   # the service is not answering: stop after the first full batch, say why, leave the rest unpriced
+                    down = rows[0]['status']; break
+            if down is not None:
+                break
+        if down is not None:
+            print(f'  PRICING SERVICE DOWN ({endpoint}): every input of the first batch failed ({down[:120]}); {len(todo) - len(rows):,} inputs left unpriced. Rerun when {BT_PRICING_HOST} answers, or with the lab cache in place')
+        if rows:
+            cache = pd.concat([cache, pd.DataFrame(rows)], ignore_index=True); cache[cache['status'] == 'ok'].to_parquet(BT_PRICING_CACHE, index=False)
         print(f'  pricing service {endpoint}: {len(rows):,} new inputs in {time.perf_counter() - t0:.0f}s, {sum(r["status"] != "ok" for r in rows):,} failed')
     return req.merge(cache[cache['endpoint'] == endpoint].drop(columns='endpoint'), on=['cusip', 'value', 'settle'], how='left')
 
@@ -1028,6 +1039,10 @@ _sum = _ov.assign(manual=BT['manual']).groupby('group').agg(requests=('win', 'si
 print('The requests by outcome group (d = threshold yield - our final yield in bp: on cover wins the bp left on the table, on lost printed requests the bp short of the print):'); display(_sum.round(3))
 print(f'the replayed quote reproduces the logged win / loss on every request: {BT_VANILLA_PASS} | winnable requests {BT["winnable"].mean():.1%} | logged win rate {BT["won_logged"].mean():.2%} | manual requests {BT["manual"].mean():.1%}')
 assert BT_REPLAY_PASS and BT_VANILLA_PASS, 'production not reproduced: nothing below is comparable'
+_cov_priced = float(np.isfinite(BT['cover_y'].to_numpy(float))[BT['won_cover'].to_numpy(bool)].mean()) if BT['won_cover'].any() else np.nan
+print(f'cover yields priced on {_cov_priced:.1%} of the wins with a cover price')
+assert not (np.isfinite(_cov_priced) and _cov_priced < 0.5), ('the cover yields did not price (the pricing service did not answer): without them every win is scored against our own quote and any '
+                                                                 'widening loses it, so the backtest is not meaningful. Rerun when the service answers, or with the lab pricing cache in place')
 _ch_m = BT[BT['winnable']].groupby('month').agg(**{'manual (median bp)': ('manualcharges', 'median'), 'manual (mean bp)': ('manualcharges', 'mean'), 'liquidity (median bp)': ('liquiditycharge', 'median'), 'risk (median bp)': ('riskcharge', 'median'),
                                                    'win rate': ('won_logged', 'mean'), 'concession x* (median bp)': ('optimalQuantileBp', 'median')})
 print('The charges production applied, by month (winnable requests), with the win rate and the median optimal concession:'); display(_ch_m.round(3))
@@ -1103,8 +1118,11 @@ _dq = BT.loc[BT['winnable'], ['cusip', 'settle', 'finalquoteyield']].astype({'cu
 _dv = bt_pricing('yield2price', _dq); _dv = _dq.assign(value=_dq['value'].round(6)).merge(_dv[['cusip', 'value', 'settle', 'dv01']], on=['cusip', 'value', 'settle'], how='left')
 BT['dv01'] = pd.to_numeric(BT[['cusip', 'settle']].astype({'cusip': str}).merge(_dv[['cusip', 'settle', 'dv01']], on=['cusip', 'settle'], how='left')['dv01'], errors='coerce').to_numpy()
 BT['usd_per_bp'] = pd.to_numeric(BT['quantity'], errors='coerce') / 100.0 * BT['dv01']
+_dv_cov = float(BT.loc[BT['winnable'], 'usd_per_bp'].notna().mean())
 print(f'print tape {len(BT_TAPE):,} prints | own other-side exit within {BT_H_RECORD} business days on {BT.loc[BT["winnable"], "M_other"].notna().mean():.1%} of winnable requests | '
-      f'DV01 priced on {BT.loc[BT["winnable"], "usd_per_bp"].notna().mean():.1%}; $ per bp of a fill: median {BT.loc[BT["winnable"], "usd_per_bp"].median():.2f} | {time.perf_counter() - _e_t0:.0f}s')
+      f'DV01 priced on {_dv_cov:.1%}; $ per bp of a fill: median {BT.loc[BT["winnable"], "usd_per_bp"].median():.2f} | {time.perf_counter() - _e_t0:.0f}s')
+if _dv_cov < 0.5:
+    print('WARNING: DV01 is missing on most winnable requests, so every dollar and gross-DV01 column below is empty; the bp-per-request columns stand')
 
 # %%
 CELL_T('6. Exits: the comparable-bond exit of record, the common markout [2]')
@@ -1419,15 +1437,14 @@ print(f'[7] {time.perf_counter() - _pc_t0:.0f}s')
 # %%
 CELL_T('8. The width charge: the band at the request, calibrated to the holding period [1]')
 _wc_t0 = time.perf_counter()
-BT_MONTHS = sorted(BT['month'].unique()); _n_first = BT.loc[BT['month'] == BT_MONTHS[0], 'date'].nunique()
-TEST_M = BT_MONTHS[2:] if _n_first < 10 and len(BT_MONTHS) > 2 else BT_MONTHS[1:]
+BT_MONTHS = sorted(BT['month'].unique())
 _month = BT['month'].to_numpy(); _winable = BT['winnable'].to_numpy(bool); _thr = BT['threshold_y'].to_numpy(float); _grp = BT['group'].astype(str).to_numpy()
 _m_sig, _adj, _ch = BT['signalyield'].to_numpy(float), BT['adj_yield'].to_numpy(float), BT['charges_level'].to_numpy(float)
 _man, _liq, _rsk = (BT[c].to_numpy(float) for c in ('manualcharges', 'liquiditycharge', 'riskcharge')); _c_base = -(_liq + _rsk)
 _y_tr = BT['y_trade'].to_numpy(float); _usd = BT['usd_per_bp'].to_numpy(float); _keys = BT['pfill_key'].astype(str).to_numpy(); _files = BT['pfill_file'].astype(str).to_numpy()
 _xlog = BT['optimalQuantileBp'].to_numpy(float); _wlog = BT['won_logged'].to_numpy(bool); _y_van = BT['y_vanilla'].to_numpy(float)
 _M_REC, _M_OTHER, _M_COMMON, _M_REAL = (BT[c].to_numpy(float) for c in ('M_rec', 'M_other', 'M_common', 'M_real'))
-_tm = np.isin(_month, TEST_M); _tmw = _tm & _winable; _tm_rows = np.flatnonzero(_tmw); _all = np.arange(N)
+_all = np.arange(N)
 _wk_code, _wk_levels = pd.factorize(pd.Series(BT['week'].to_numpy()), sort=True); _mo_code, _mo_levels = pd.factorize(pd.Series(_month), sort=True)
 _kgrp = np.array([(k.split('_')[0] if k.startswith('cpn3') else '_'.join(k.split('_')[:2])) for k in _keys], dtype=object)
 _man_r = np.round(_man * 2.0) / 2.0; _man_mode = {m: float(pd.Series(_man_r[(_month == m) & _winable]).mode().iloc[0]) for m in BT_MONTHS}; _man_modal = np.abs(_man_r - pd.Series(_month).map(_man_mode).to_numpy(float)) < 0.25
@@ -1463,7 +1480,15 @@ _qr = pd.DataFrame({'bt_row': np.arange(N), 'cusip': BT['cusip'].astype(str).to_
 QREQ = pd.merge_asof(_qr, _qb, on='date', by='cusip', direction='backward', allow_exact_matches=False).sort_values('bt_row')[_qcols].reset_index(drop=True)
 _rsd = resid[['cusip', 'date', 'resid_sd']].assign(cusip=lambda d: d['cusip'].astype(str), date=lambda d: to_ns(d['date'])).sort_values('date', kind='stable')
 IDV = pd.merge_asof(_qr, _rsd, on='date', by='cusip', direction='backward', allow_exact_matches=False).sort_values('bt_row')['resid_sd'].to_numpy(float)
-print(f'test months {TEST_M[0]}..{TEST_M[-1]} ({len(TEST_M)}): {_tm.sum():,} requests, {_tmw.sum():,} winnable | a band exists on {np.isfinite(QREQ["q_residual_ls_50"].to_numpy(float))[_tmw].mean():.1%} of test winnable requests, '
+# the test months: every month whose calibration (production's wins with a band and a markout of record in the earlier months) has at least min_fit_rows behind it. The first band
+# month has none, so it is calibration only. (The variant notebook scored that month with a scale ratio of 1, so its gamma was set on an uncalibrated median width.)
+_q_has = np.isfinite(QREQ['q_residual_ls_50'].to_numpy(float)) if 'q_residual_ls_50' in QREQ else np.zeros(N, bool)
+_cal_n = {m: int(((_month < m) & _wlog & np.isfinite(_M_REC) & _q_has).sum()) for m in BT_MONTHS}
+TEST_M = [m for m in BT_MONTHS if _cal_n[m] >= CFG.min_fit_rows and (_q_has & (_month == m)).any()]
+assert TEST_M, 'no month has a calibrated band: the quantile models need more history'
+_tm = np.isin(_month, TEST_M); _tmw = _tm & _winable; _tm_rows = np.flatnonzero(_tmw)
+print(f'calibration wins (a band and a markout of record, earlier months) behind each month: {_cal_n}')
+print(f'test months {TEST_M[0]}..{TEST_M[-1]} ({len(TEST_M)}): {_tm.sum():,} requests, {_tmw.sum():,} winnable | a band exists on {_q_has[_tmw].mean():.1%} of test winnable requests, '
       f'the trailing residual sd on {np.isfinite(IDV[_tmw]).mean():.1%}')
 _lo_j, _hi_j = {0.80: (1, 5), 0.90: (0, 6)}[CFG.wc_band]; QG_TAUS = (5, 10, 25, 50, 75, 90, 95)
 
@@ -1536,7 +1561,7 @@ def _charge_family() -> dict:
             W = WIDTH[(tgt, mdl)]
             if not np.isfinite(W).any():
                 continue
-            w_med = float(np.nanmedian(W[(_month == TEST_M[0]) & _tmw]))
+            w_med = float(np.nanmedian(W[(_month == TEST_M[0]) & _tmw])); assert np.isfinite(w_med) and w_med > 0, f'no calibrated width in the first test month for {tgt} | {mdl}'
             for k in (CFG.wc_k_grid if tgt == 'residual' else CFG.wc_k_total):
                 t0 = time.perf_counter(); g_ = k / w_med if w_med > 0 else 0.0; nm = f'width k={k:g} | {tgt} | {mdl}'
                 out[nm] = requote_const(-g_ * W, nm, 'width charge' if tgt == 'residual' else 'width charge, total move', f'k={k:g}, {mdl}', g_); print(f'  {nm}: gamma {g_:.3f} per bp of width, covered {out[nm]["coverage"]:.1%} | {time.perf_counter() - t0:.0f}s')

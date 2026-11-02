@@ -23,7 +23,8 @@
 - **The exit of record** is the comparable-bond bucket exit (characteristics only), not the IPCA-peer exit of lab 14f. The peer exit needs the Section 11 baskets; the bucket was its circularity guard and the two sat within a bp of MAE against the own print. The sceptical set is therefore the bucket exit, the common markout and the own other-side print; the hedged valuation is not here (no request-level covariance). The realised WFTrade round trip is reported beside, on the fills the desk actually sold.
 - **The risk axis** is the book's gross DV01 over the holding window, not the ex-ante sd under the lab's covariance.
 - **The extended charge** rescales gamma on the extended population's own median width (the v1.3 run scaled it on the covered bonds and over-widened).
-- **The test months** are the replay months after the first full one, so every calibration has at least a month of production's wins behind it.
+- **The test months** are the months whose calibration has at least `min_fit_rows` of production's wins with a band and a markout of record behind it; the first band month is calibration only. The variant notebook scored that month with a scale ratio of 1, so its `gamma = k / median W` was set on an uncalibrated median width (about 2.4 bp) and then applied to calibrated widths of 10 to 16 bp: its "k = 2" charge was 8 to 13 bp at the median, not 2. Here gamma is set on the first calibrated month, so k means what it says.
+- **The pricing service** is read through the lab's cache first (`artifacts_ipca_lab/pricing_cache.parquet`, the same inputs), stops after one fully failed batch and says so, and the notebook refuses to score when the cover yields did not price: without them every win is scored against our own quote and any widening loses it.
 
 ## Running it
 
