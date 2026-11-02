@@ -1,0 +1,1942 @@
+# muni_width_charge_research.py: width charge v1.0. One notebook from the data to the backtest for the one quoting change the variant programme found worth
+# putting live: a per-bond risk charge sized to the dispersion of the bond's own residual move (the "quantile width charge"). Self-contained: the factor
+# model, the residual's conditional distribution, the production optimizer replay, the exits, the WFTrade reconciliation and the paired scorecard are all
+# here, with the code of the lab notebooks copied where it is the same. Percent format; regenerate the .ipynb with the converter in docs/width_charge_notes.md.
+
+# %% [markdown]
+# # The width charge: a bond-specific risk charge for the RFQ bid optimizer, from the factor model to the backtest
+#
+# **The question.** Production bids every bond through the same objective, `argmax over x of (x + c) p(x)`: the concession `x` (bp of yield above the
+# model mid) times the fill probability `p(x)` of the bond's key, with one charge `c = -(manual + liquidity + risk)` that is the same for every bond of a
+# key on a day. Bonds differ in how predictable their own move is after the trade. This notebook builds a per-bond measure of that, the half-width of the
+# 80% band of the bond's residual move over the holding period, turns it into a second risk charge `-gamma W_i`, and replays production's own optimizer
+# with it on every bid request the desk received. The win on each request is decided by the logged cover or the winning print, so the only thing that
+# moves is the quote.
+#
+# **Why this candidate.** Across the three variant runs (v1.1 to v1.3 of `muni_rfq_factor_variants`) it is the only change that beats production with the
+# traders' manual charge still in: +0.03 bp per request at equal win rate under every sceptical valuation, about 120 thousand dollars a month, reproduced
+# across runs. It changes which bonds the desk wins, not the price on the ones it keeps; it only ever widens a quote; and it needs one number per bond
+# from the model, computed at the last close.
+#
+# **What a reader gets, in order.**
+#
+# | Section | Content | The plot to look at |
+# |---|---|---|
+# | 1 | Setup: config, cache, helpers | |
+# | 2 | Data: the evaluation panel, the MMD curve, the print tape, the desk's requests, the production fill curves, WFTrade | coverage and request counts by month |
+# | 3 | The factor model: IPCA on bond characteristics, refitted monthly, the point-in-time residual | Gamma, out-of-sample fit by month |
+# | 4 | The residual's conditional distribution: quantiles of the next-day residual by beta space and state | calibration, width against coverage |
+# | 5 | The desk's requests through production's optimizer: the replay reproduced bit for bit, the win rule, the cover | win rate and cover by month |
+# | 6 | What a win is worth: the exits (comparable-bond and own-print), DV01, the realised round trips from WFTrade | exits against the realised sale |
+# | 7 | Replay against the desk: the replay's wins are the WFTrade fills; inventory and the book's P&L since April | match rates, inventory, cumulative P&L |
+# | 8 | The width charge: the band at the request, calibrated to the holding period; the charge; a worked example | the charge by bond, the two-bond example |
+# | 9 | The backtest: the charge against production at equal win rate, with and without the manual charge, pooled and by month | points on the frontier, heatmaps, cumulative dollars |
+# | 10 | Where the edge comes from: by width quintile, key group and month; the adverse-selection table | realised round trip by width quintile |
+# | 11 | Summary, registry, runtimes | |
+#
+# **Conventions.** Yields in percent, moves and concessions in bp. A request is a bid; the markout of a win is `100 (y_trade - y_exit)`, positive when the
+# bond richened after the desk bought it. "Production" is the logged quote reproduced by the optimizer replay (checked). Every comparison is paired on
+# identical requests. There is no threshold anywhere: every number is a change against a comparator with its t beside it.
+
+# %%
+from __future__ import annotations
+
+import hashlib
+import inspect
+import json
+import os
+import pickle
+import re
+import sys
+import time
+import warnings
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+warnings.filterwarnings('ignore')
+pd.set_option('display.max_columns', None); pd.set_option('display.width', 250); pd.options.display.float_format = '{:.4f}'.format
+try:
+    from IPython.display import display  # noqa: F401
+    get_ipython()  # type: ignore[name-defined]  # noqa: F821
+    _INTERACTIVE = True
+except Exception:  # noqa: BLE001
+    _INTERACTIVE = False
+
+    def display(obj):  # noqa: D103
+        with pd.option_context('display.width', 250, 'display.max_columns', 60, 'display.max_rows', 120):
+            print(obj.to_string() if hasattr(obj, 'to_string') else obj)
+import matplotlib
+if not _INTERACTIVE:
+    matplotlib.use('Agg')
+import matplotlib.pyplot as plt  # noqa: E402
+
+plt.rcParams.update({'figure.figsize': (10, 4.5), 'axes.grid': True, 'grid.alpha': 0.3, 'axes.spines.top': False, 'axes.spines.right': False})
+C_BLUE, C_RED, C_GREEN, C_ORANGE, C_PURPLE, C_GREY, C_BROWN = '#4C72B0', '#C44E52', '#55A868', '#DD8452', '#8172B3', '#8C8C8C', '#937860'
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    spec_version: str = 'width_charge_v1_0'
+    # ---- window
+    start_date: str = '2026-01-01'
+    end_date: str = '2026-10-23'
+    train_start: str = '2026-01-02'
+    first_oos_date: str = '2026-04-01'
+    # ---- the factor model (the lab's record spec ipca_v3_k3_xmmd, unchanged)
+    selected_k: int = 3
+    target_mode: str = 'excess_mmd'
+    max_iter: int = 50; tol: float = 1e-5; ridge: float = 1e-10
+    min_obs_per_bond: int = 5; max_lag_days: int = 7; target_clip_bp: float = 250.0; yield_mad_k: float = 6.0
+    min_bonds_per_date: int = 1000; zero_duration_cut: float = 0.25; duration_instrument: str = 'ratio'
+    date_weighting: str = 'inverse_var'; date_weight_cap: float = 4.0
+    dispersion_bp: float = 10.0; dispersion_share_cut: float = 0.10; common_move_bp: float = 10.0; exclude_dispersion_from_fit: bool = True; partial_day_ratio: float = 0.6
+    refit_days: int = 30                      # monthly refit, the lab's record cadence
+    trade_size_halflife_days: float = 30.0; industry_dummies: int = 5
+    activity_window: int = 20; level_signal_window: int = 20; n_clusters: int = 8
+    # ---- the residual's conditional distribution (lab Section 10)
+    grid_taus: tuple[float, ...] = (0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95)
+    grid_shrink_k: float = 500.0
+    qr_max_train: int = 150_000
+    qr_min_train: int = 20_000
+    # ---- the replay (lab Section 14)
+    pfill_schedule: tuple[tuple[str, str | None], ...] = (('20260326', '2026-06-02'), ('20260602', '2026-08-04'), ('20260804', '2026-09-10'), ('20260910', '2026-10-08'), ('20261008', None))
+    settle_lag: int = 2
+    h_record: int = 5                          # the holding horizon of the exits (business days); the realised holding time is measured in Section 6
+    # ---- the width charge (Section 8)
+    wc_targets: tuple[str, ...] = ('residual', 'total')          # the next-day residual (the band the desk cannot hedge) is the candidate; the total move is the variation
+    wc_models: tuple[str, ...] = ('ls', 'grid')                   # location-scale on beta space + state; the lookup grid by beta cluster x activity
+    wc_k_grid: tuple[float, ...] = (0.5, 1.0, 2.0, 3.0)           # k bp of charge at the median width (the candidate is k = 2 on the residual, ls)
+    wc_k_total: tuple[float, ...] = (2.0,)                        # the total-move variation at the candidate's k only
+    wc_k_extended: tuple[float, ...] = (1.0, 2.0)                 # the charge on every request through the width model, gamma rescaled on the extended population
+    wc_band: float = 0.80                                          # the band whose half-width is the charge's measure
+    min_fit_rows: int = 200
+    # ---- the backtest (Section 9)
+    frontier_widths: tuple[float, ...] = tuple(sorted(set([w / 2.0 for w in range(-20, 21)] + [float(w) for w in range(-25, 26)])))
+    level_range_bp: float = 40.0; level_iters: int = 16
+    dv01_trim_q: float = 0.99
+    monthly_top: int = 6
+    seed: int = 20260921
+
+
+CFG = RunConfig(**{k: (tuple(v) if isinstance(v, list) else v) for k, v in json.loads(os.environ.get('MUNI_WC_CFG', '{}')).items()})   # MUNI_WC_CFG: JSON overrides for a smoke run
+ROOT = Path(os.environ.get('MUNI_LAB_ROOT', '.')).resolve()
+PIPELINE_ROOT = ROOT / 'data_pipeline'
+ARTIFACTS = ROOT / 'artifacts_width_charge'; FIGURES = ARTIFACTS / 'figures'; CACHE_DIR = ARTIFACTS / 'cache'
+for _p in (FIGURES, CACHE_DIR):
+    _p.mkdir(parents=True, exist_ok=True)
+if str(PIPELINE_ROOT) not in sys.path:
+    sys.path.insert(0, str(PIPELINE_ROOT))
+import importlib  # noqa: E402
+import muni_data_pipeline as mdp  # noqa: E402
+mdp = importlib.reload(mdp)
+PIPE = mdp.Config(root=PIPELINE_ROOT, start_date=CFG.start_date, end_date=CFG.end_date)
+RNG = np.random.default_rng(CFG.seed)
+REGISTRY: dict = {'spec_version': CFG.spec_version, 'config': asdict(CFG), 'run_at': pd.Timestamp.now('UTC').isoformat()}
+STAGE_KEYS: dict[str, str] = {}; CACHE_LOG: list[dict] = []; CELL_LOG: list[dict] = []
+_RUN_T0 = time.perf_counter(); _CELL_STATE = {'t0': _RUN_T0, 'label': '1. Setup [1]'}
+
+
+def CELL_T(label: str) -> None:
+    now = time.perf_counter(); CELL_LOG.append({'cell': _CELL_STATE['label'], 'seconds': now - _CELL_STATE['t0']}); _CELL_STATE.update(t0=now, label=label)
+    print(f'\n=== {label} | elapsed {(now - _RUN_T0) / 60:.1f} min ===')
+
+
+def to_ns(series: pd.Series) -> pd.Series:
+    """Coerce any datetime-like column to tz-naive datetime64[ns] so merge keys always match."""
+    out = pd.to_datetime(series, errors='coerce')
+    try:
+        if getattr(out.dt, 'tz', None) is not None:
+            out = out.dt.tz_convert(None)
+    except (AttributeError, TypeError):
+        pass
+    return out.astype('datetime64[ns]')
+
+
+def savefig(name: str) -> None:
+    plt.tight_layout(); plt.savefig(FIGURES / f'{name}.png', dpi=120)
+    if _INTERACTIVE:
+        plt.show()
+    plt.close('all')
+
+
+def record(section: str, **values) -> None:
+    REGISTRY.setdefault(section, {}).update({k: (v.item() if hasattr(v, 'item') else v) for k, v in values.items()})
+    json.dumps(REGISTRY[section], default=str)
+
+
+def flat_records(frame: pd.DataFrame, digits: int = 4) -> list[dict]:
+    f = frame.copy()
+    if isinstance(f.columns, pd.MultiIndex):
+        f.columns = [' | '.join(str(x) for x in c if str(x) != '') for c in f.columns]
+    return f.round(digits).reset_index().to_dict(orient='records')
+
+
+def nw_t(x, lags: int | None = None) -> float:
+    """Newey-West (Bartlett kernel) t statistic of the mean; lags default floor(4 (n / 100)^(2/9))."""
+    x = np.asarray(x, float); x = x[np.isfinite(x)]; n = len(x)
+    if n < 4:
+        return np.nan
+    L = int(np.floor(4.0 * (n / 100.0) ** (2.0 / 9.0))) if lags is None else int(lags)
+    u = x - x.mean(); v = float(u @ u) / n
+    for l in range(1, min(L, n - 1) + 1):
+        v += 2.0 * (1.0 - l / (L + 1.0)) * float(u[l:] @ u[:-l]) / n
+    return float(x.mean() / np.sqrt(v / n)) if v > 0 else np.nan
+
+
+def cluster_t(d: np.ndarray, codes: np.ndarray, n_levels: int) -> float:
+    """t of the pooled mean of d with week-clustered Newey-West standard errors (Bartlett kernel over the weekly sums of the deviations, in week order)."""
+    ok = np.isfinite(d); n = int(ok.sum())
+    if n < 4:
+        return np.nan
+    mu = float(d[ok].mean()); u = np.bincount(codes[ok], weights=d[ok] - mu, minlength=n_levels); has = np.bincount(codes[ok], minlength=n_levels) > 0; u = u[has]; W = len(u)
+    if W < 2:
+        return np.nan
+    L = int(np.floor(4.0 * (W / 100.0) ** (2.0 / 9.0))); v = float(u @ u)
+    for l in range(1, min(L, W - 1) + 1):
+        v += 2.0 * (1.0 - l / (L + 1.0)) * float(u[l:] @ u[:-l])
+    return float(mu * n / np.sqrt(v)) if v > 0 else np.nan
+
+
+def _jsonable(x):
+    if isinstance(x, dict):
+        return {str(k): _jsonable(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_jsonable(v) for v in x]
+    if isinstance(x, np.ndarray):
+        return {'shape': list(x.shape), 'sum': float(np.nansum(x.astype(float))) if x.dtype.kind in 'fiub' else str(x[:5])}
+    if hasattr(x, 'item'):
+        return x.item()
+    return x
+
+
+def _code_fp(code) -> str:
+    """Stable fingerprint of a code object: bytecode, names and constants, nested code objects recursively; no memory addresses."""
+    consts = [(_code_fp(c) if hasattr(c, 'co_code') else repr(c)) for c in code.co_consts]
+    return hashlib.sha1((code.co_code.hex() + repr(code.co_names) + repr(code.co_varnames) + repr(consts)).encode()).hexdigest()
+
+
+def _stage_source(obj) -> str:
+    try:
+        return inspect.getsource(obj)
+    except (OSError, TypeError):
+        return _code_fp(obj.__code__) if hasattr(obj, '__code__') else repr(obj)
+
+
+def _fingerprint(payload) -> str:
+    return hashlib.sha1(json.dumps(_jsonable(payload), sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def frame_fingerprint(frame: pd.DataFrame, cols: list[str] | None = None) -> str:
+    f = frame if cols is None else frame[[c for c in cols if c in frame.columns]]
+    h = pd.util.hash_pandas_object(f, index=True).to_numpy(np.uint64)
+    return _fingerprint({'shape': f.shape, 'columns': list(f.columns), 'xor': int(np.bitwise_xor.reduce(h)) if len(h) else 0, 'sum': int(h.sum())})
+
+
+def _stage_files(name: str) -> list[Path]:
+    pat = re.compile(rf'^{re.escape(name)}_[0-9a-f]{{16}}\.(pkl|parquet)$')
+    return [p for p in CACHE_DIR.glob(f'{name}_*') if pat.match(p.name)]
+
+
+def cached(name: str, fn, deps=(), code=(), cfg: tuple[str, ...] = (), force: bool = False):
+    """Run or load a stage. The key binds the spec, only the config fields the stage reads, its data dependencies and its source (bytecode when the
+    source is not on disk), so a change to a field another stage reads does not rebuild this one. DataFrames go to parquet, else pickle."""
+    sub = {k: getattr(CFG, k) for k in cfg}
+    key = _fingerprint({'spec': CFG.spec_version, 'cfg': sub, 'deps': deps, 'code': [_stage_source(fn)] + [_stage_source(x) for x in code]})
+    STAGE_KEYS[name] = key
+    path_pq, path_pk = CACHE_DIR / f'{name}_{key}.parquet', CACHE_DIR / f'{name}_{key}.pkl'
+    path = path_pq if path_pq.exists() else path_pk; t0 = time.perf_counter(); status = 'computed'; out = None
+    if path.exists() and not force:
+        try:
+            out = pd.read_parquet(path) if path.suffix == '.parquet' else pd.read_pickle(path); status = 'reused'
+        except (EOFError, pickle.UnpicklingError, OSError, ValueError, AttributeError, ModuleNotFoundError) as exc:
+            print(f'{name}: cache file {path.name} unreadable ({type(exc).__name__}); rebuilding'); path.unlink(missing_ok=True)
+    if status != 'reused':
+        out = fn()
+        if isinstance(out, pd.DataFrame):
+            tmp = path_pq.with_name(f'{path_pq.name}.tmp{os.getpid()}')
+            try:
+                out.to_parquet(tmp); os.replace(tmp, path_pq); path = path_pq
+            except Exception as exc:  # noqa: BLE001
+                tmp.unlink(missing_ok=True); print(f'  parquet failed ({type(exc).__name__}); stored as pickle'); tmp = path_pk.with_name(f'{path_pk.name}.tmp{os.getpid()}'); pd.to_pickle(out, tmp); os.replace(tmp, path_pk); path = path_pk
+        else:
+            tmp = path_pk.with_name(f'{path_pk.name}.tmp{os.getpid()}'); pd.to_pickle(out, tmp); os.replace(tmp, path_pk); path = path_pk
+        for old in _stage_files(name):
+            if old != path:
+                old.unlink(missing_ok=True)
+    dt = time.perf_counter() - t0
+    CACHE_LOG.append({'stage': name, 'key': key, 'status': status, 'seconds': dt, 'file': path.name, 'cell': _CELL_STATE['label']})
+    print(f'{name}: {"cache" if status == "reused" else status} {dt:.1f}s [{key}] ({path.stat().st_size / 1e6:,.0f} MB)')
+    return out
+
+
+for _tmp in CACHE_DIR.glob('*.tmp*'):
+    _tmp.unlink(missing_ok=True)
+
+# Desk quantity bins (upper edges in par) and their labels
+QTY_EDGES = [5_000, 10_000, 15_000, 25_000, 50_000, 100_000, 250_000]
+QTY_LABELS = ['0-5K', '5K-10K', '10K-15K', '15K-25K', '25K-50K', '50K-100K', '100K-250K', '>250K']
+
+
+def qty_group(q: pd.Series) -> pd.Series:
+    v = pd.to_numeric(q, errors='coerce')
+    return pd.cut(v, bins=[-np.inf] + QTY_EDGES + [np.inf], labels=QTY_LABELS, right=True).astype(str).replace('nan', 'NA')
+
+
+def group_decayed_sums(frame: pd.DataFrame, keys: list[str], cols: list[str], halflife_days: float, date_col: str = 'trade_date') -> pd.DataFrame:
+    """Per key group, running sums of cols decayed by 0.5^(gap_days / halflife) between the group's successive dates (value up to and including each date)."""
+    f = frame.sort_values(keys + [date_col], kind='stable').reset_index(drop=True)
+    lam = 0.5 ** (1.0 / halflife_days)
+    gid = f.groupby(keys, observed=True, sort=False).ngroup().to_numpy(); ng = int(gid.max()) + 1 if len(f) else 0
+    step = f.groupby(keys, observed=True, sort=False).cumcount().to_numpy()
+    gap = f.groupby(keys, observed=True, sort=False)[date_col].diff().dt.days.fillna(0).to_numpy(float)
+    order = np.argsort(step, kind='stable'); ks = step[order]; st = np.searchsorted(ks, np.arange(ks.max() + 2)) if len(f) else np.array([0, 0])
+    acc = {c: np.zeros(ng) for c in cols}; out = {c: np.empty(len(f)) for c in cols}; vals = {c: f[c].to_numpy(float) for c in cols}
+    for k in range(len(st) - 1):
+        rows = order[st[k]:st[k + 1]]; g = gid[rows]; w = lam ** gap[rows]
+        for c in cols:
+            acc[c][g] = acc[c][g] * w + vals[c][rows]; out[c][rows] = acc[c][g]
+    for c in cols:
+        f[f'{c}_ewm'] = out[c]
+    return f
+
+
+PRE_REGISTERED = {
+    'width_charge_v10': ('fixed 2026-11-01 before this notebook ran. The candidate: production\'s objective with the charge c - gamma W_i, W_i the half-width of the 80% band of '
+                         'the bond\'s next-day residual move from the location-scale model of lab Section 10 at the last close before the request, brought to the holding horizon by a '
+                         'walk-forward scale ratio on production\'s wins in the earlier months, gamma = k / median W on the first test month, k = 2; the manual charge kept. '
+                         'Variations: k in {0.5, 1, 2, 3}; the lookup grid in place of the location-scale model; the total move in place of the residual at k = 2; the charge on every '
+                         'request through a width model with gamma rescaled on the extended population. Comparator of record: production widened through its own optimizer to the '
+                         'variant\'s win rate month by month; readings also raw and levelled. Valuations: the comparable-bond exit (coupon bin x call structure x rating group x tenor '
+                         'bucket, mark-to-P, h = 5), the own other-side print exit, the common markout (new wins valued at the day\'s median), and the realised WFTrade round trip on '
+                         'matched fills. No threshold: every cell is a change against the comparator with a week-clustered t. The reading is the sign on cover, on P&L under the '
+                         'sceptical valuations and on DV01-trimmed dollars'),
+}
+print('ROOT', ROOT, '| pipeline manifest:', (PIPELINE_ROOT / 'data_pipeline_manifest.json').exists())
+print(f'spec {CFG.spec_version} | window {CFG.start_date} -> {CFG.end_date} | first OOS {CFG.first_oos_date} | K {CFG.selected_k} | dependent variable {CFG.target_mode} | candidate: residual, ls, k = 2, manual charge kept')
+
+# %% [markdown]
+# ## 2. Data
+#
+# Five sources, all from the desk's data pipeline (`muni_data_pipeline`): the **evaluation panel** (one row per bond-day with the closing mark, its
+# change, the lagged characteristics); the **MMD benchmark curve** (the rates hedge); the **MSRB print tape** (the trades of the street, the exits and
+# the trade-size characteristic); the **desk's RFQ log** (`strategy_output` joined to `track_rfq`: the quote, the charges, the fill key, the outcome,
+# the cover); the **production fill curves** (the pfill snapshots the optimizer used on each date); and **WFTrade** (the desk's own fills and its
+# inventory book). Nothing here is modelled; the plots say what the sample looks like.
+
+# %%
+CELL_T('2. Data [1]')
+_d_t0 = time.perf_counter()
+step3_path = PIPE.path('research_panel_step3_yield.parquet')
+if not step3_path.exists():
+    raise FileNotFoundError(f'{step3_path} missing: run mdp.build(PIPE) in the pipeline kernel first.')
+raw_panel = pd.read_parquet(step3_path)
+raw_panel['date'] = to_ns(raw_panel['date']).dt.normalize(); raw_panel['cusip'] = raw_panel['cusip'].astype('string')
+raw_panel = raw_panel[(raw_panel['date'] >= CFG.start_date) & (raw_panel['date'] <= CFG.end_date)].reset_index(drop=True)
+STEP3_FP = f'{step3_path.name}:{step3_path.stat().st_size}:{int(step3_path.stat().st_mtime)}'
+print(f'evaluation panel: {len(raw_panel):,} bond-days | {raw_panel["cusip"].nunique():,} CUSIPs | {raw_panel["date"].min().date()} -> {raw_panel["date"].max().date()}')
+
+benchmark_curve = mdp.load_benchmark_curve(PIPE, CFG.start_date, CFG.end_date)
+if benchmark_curve.empty:
+    raise FileNotFoundError('No benchmark_curve partitions found. Run mdp.pull_benchmark_curve(PIPE) first.')
+BENCHMARK_FP = hashlib.sha1(pd.util.hash_pandas_object(benchmark_curve[['curve_timestamp', 'tenor_years', 'forward_month', 'benchmark_yield']], index=False).values.tobytes()).hexdigest()
+print(f'MMD curve: {len(benchmark_curve):,} rows | {benchmark_curve["tenor"].nunique()} tenors | {pd.to_datetime(benchmark_curve["date"]).min().date()} -> {pd.to_datetime(benchmark_curve["date"]).max().date()}')
+
+msrb_raw = PIPE.store('msrb').read(columns=['date', 'cusip', 'quantity', 'tradetime', 'tradetype', 'side', 'yield', 'price'], categorical=False)
+assert msrb_raw is not None and len(msrb_raw), 'the MSRB store is empty: the exits and the trade-size characteristic need it'
+print(f'MSRB tape: {len(msrb_raw):,} prints | by type {msrb_raw["tradetype"].astype(str).str.upper().str[0].value_counts().to_dict()}')
+
+
+def trade_size_features(prints: pd.DataFrame, panel_rows: pd.DataFrame, halflife_days: float) -> pd.DataFrame:
+    """Per bond-day: decayed mean log trade size and decayed print count over prints STRICTLY before the date."""
+    p = prints.dropna(subset=['cusip', 'tradetime', 'quantity']).copy()
+    p['cusip'] = p['cusip'].astype('string'); p['trade_date'] = to_ns(p['tradetime']).dt.normalize()
+    p['lq'] = np.log(pd.to_numeric(p['quantity'], errors='coerce').clip(lower=1_000.0, upper=1e8))
+    p = p.dropna(subset=['lq', 'trade_date'])
+    daily = p.groupby(['cusip', 'trade_date'], observed=True).agg(S=('lq', 'sum'), N=('lq', 'size')).reset_index()
+    dec = group_decayed_sums(daily, ['cusip'], ['S', 'N'], halflife_days, 'trade_date').rename(columns={'trade_date': 'print_date'}).sort_values('print_date')
+    q = panel_rows[['cusip', 'date']].copy(); q['cusip'] = q['cusip'].astype('string'); q['_i'] = np.arange(len(q)); q = q.sort_values('date')
+    j = pd.merge_asof(q, dec[['cusip', 'print_date', 'S_ewm', 'N_ewm']], left_on='date', right_on='print_date', by='cusip', direction='backward', allow_exact_matches=False)
+    w = (0.5 ** (1.0 / halflife_days)) ** (j['date'] - j['print_date']).dt.days.astype(float)
+    j['print_freq_lag'] = (j['N_ewm'] * w).fillna(0.0)
+    j['trade_size_lag'] = np.where(j['print_freq_lag'] > 0.05, (j['S_ewm'] * w) / j['print_freq_lag'].replace(0, np.nan), np.nan)
+    return j.sort_values('_i')[['trade_size_lag', 'print_freq_lag']].reset_index(drop=True)
+
+
+_ts = trade_size_features(msrb_raw[['cusip', 'tradetime', 'quantity']], raw_panel, CFG.trade_size_halflife_days)
+raw_panel['trade_size_lag'] = _ts['trade_size_lag'].to_numpy(); raw_panel['print_freq_lag'] = _ts['print_freq_lag'].to_numpy()
+_ts_dir = PIPE.path(PIPE.data_dir, 'track_static') if hasattr(PIPE, 'data_dir') else None
+track_static = PIPE.store('track_static').read(categorical=False) if _ts_dir is not None and _ts_dir.exists() and any(_ts_dir.glob('*.parquet')) else None
+HAS_INDUSTRY = track_static is not None and 'issuer_industry' in track_static.columns
+if HAS_INDUSTRY:
+    _ind = track_static[['cusip', 'issuer_industry']].copy(); _ind['cusip'] = _ind['cusip'].astype('string'); _ind = _ind.dropna(subset=['cusip']).drop_duplicates('cusip', keep='last')
+    raw_panel = raw_panel.merge(_ind, on='cusip', how='left')
+print(f'trade-size characteristic on {raw_panel["trade_size_lag"].notna().mean():.1%} of bond-days | issuer industry {"present" if HAS_INDUSTRY else "absent (instruments skipped)"} | {time.perf_counter() - _d_t0:.0f}s')
+
+# ---- the desk's requests: strategy_output (the quote and its inputs) joined to track_rfq (the outcome)
+BT_SO_COLS = ['date', 'ecnreqid', 'cusip', 'side', 'quantity', 'signalyield', 'optimalyield', 'optimalQuantileBp', 'pfill', 'pfillKey', 'liquiditycharge', 'riskcharge', 'manualcharges', 'finalquoteyield']
+BT_TR_COLS = ['date', 'strategy_ecn_req_id', 'cusip', 'rfq_received_time', 'is_final', 'quoted', 'strategy_is_pricing_error', 'manual_takeover', 'is_manual_mode', 'msrb_yield', 'msrb_price', 'msrb_tradetype',
+              'msrb_tradetime', 'algo_won', 'cover', 'cover_price_value', 'cover_price_value_backup', 'effective_cover_price', 'our_bid_price', 'tenor_bucket', 'qty_bucket', 'call_bucket', 'coupon_bucket', 'final_comp_rating']
+
+
+def bt_flag(v: pd.Series) -> np.ndarray:
+    if v.dtype == object or str(v.dtype).startswith(('string', 'bool', 'category')):
+        return v.astype('string').str.lower().isin(['true', '1', 'y', 'yes', 't']).to_numpy(bool)
+    return (pd.to_numeric(v, errors='coerce').fillna(0) > 0).to_numpy(bool)
+
+
+_so = PIPE.store('strategy_output').read(columns=BT_SO_COLS, categorical=False)
+_tr = PIPE.store('track_rfq').read(columns=BT_TR_COLS, categorical=False)
+if _so is None or _tr is None:
+    raise RuntimeError('strategy_output or track_rfq is not pulled under the pipeline root')
+for _f in (_so, _tr):
+    _f['date'] = pd.to_datetime(_f['date']).dt.normalize()
+_so['ecnreqid'] = _so['ecnreqid'].astype('string'); _tr['ecnreqid'] = _tr['strategy_ecn_req_id'].astype('string')
+_n_so, _n_tr = len(_so), len(_tr); _keep = np.ones(len(_tr), bool)
+if 'is_final' in _tr and bt_flag(_tr['is_final']).any():
+    _keep &= bt_flag(_tr['is_final'])
+if 'quoted' in _tr:
+    _keep &= bt_flag(_tr['quoted'])
+if 'strategy_is_pricing_error' in _tr:
+    _keep &= ~bt_flag(_tr['strategy_is_pricing_error'])
+_tr = _tr[_keep].drop_duplicates(['date', 'ecnreqid'], keep='last')
+BT0 = _so.merge(_tr.drop(columns=['strategy_ecn_req_id']), on=['date', 'ecnreqid'], how='inner', suffixes=('', '_trk'))
+_n_join = len(BT0)
+BT0 = BT0[(BT0['side'].astype(str) == 'B') & (BT0['optimalyield'] > 0) & (BT0['signalyield'] > 0)].copy(); BT0['pfill_key'] = BT0['pfillKey'].astype('string')
+print(f'requests: strategy_output {_n_so:,} | track_rfq {_n_tr:,} -> {len(_tr):,} final, quoted, no pricing error | joined {_n_join:,} | bid side with an optimal yield {len(BT0):,}')
+del _so, _tr
+
+# ---- WFTrade: the desk's own fills, lifecycle-resolved, and the average-cost inventory book
+WF_FILLS, WF_AUDIT = mdp.load_wftrade(PIPE, exec_end=CFG.end_date)
+assert len(WF_FILLS), 'no WFTrade fills under the pipeline root'
+WF_BOOK = mdp.build_inventory_book(WF_FILLS, uncovered='skip'); WF_BOOK['cusip'] = WF_BOOK['cusip'].astype(str); WF_BOOK['date'] = to_ns(WF_BOOK['exec_date_ny']).dt.normalize()
+print(f'WFTrade: {len(WF_FILLS):,} fills ({(WF_FILLS["side"] == "BID").mean():.0%} buys) {to_ns(WF_FILLS["exec_date_ny"]).min().date()} -> {to_ns(WF_FILLS["exec_date_ny"]).max().date()} | book {len(WF_BOOK):,} rows')
+
+cov = raw_panel.assign(month=raw_panel['date'].dt.to_period('M').astype(str)).groupby('month').agg(cusips=('cusip', 'nunique'), bond_days=('cusip', 'size'))
+_rq_m = BT0.assign(month=BT0['date'].dt.to_period('M').astype(str)).groupby('month').agg(requests=('ecnreqid', 'size'), won=('algo_won', lambda s: bt_flag(s).mean()))
+fig, ax = plt.subplots(1, 3, figsize=(19, 4.2))
+cov['cusips'].plot.bar(ax=ax[0], color=C_BLUE); ax[0].set_title('Evaluated CUSIPs per month (the factor model\'s universe)', fontsize=10); ax[0].set_xlabel('')
+_rq_m['requests'].plot.bar(ax=ax[1], color=C_GREEN); ax[1].set_title('Bid requests the desk quoted, per month', fontsize=10); ax[1].set_xlabel('')
+_rq_m['won'].plot.bar(ax=ax[2], color=C_RED); ax[2].set_title('Logged win rate by month', fontsize=10); ax[2].set_xlabel('')
+savefig('02_data')
+record('data', panel_rows=len(raw_panel), panel_cusips=raw_panel['cusip'].nunique(), requests=len(BT0), wftrade_fills=len(WF_FILLS), seconds=time.perf_counter() - _d_t0)
+
+# %% [markdown]
+# ## 3. The factor model: IPCA on bond characteristics, the point-in-time residual
+#
+# The factor model is the lab's record spec, lifted unchanged: $r_{i,t} - \Delta\text{MMD}_t(\tau_i) = z_{i,t-1}'\Gamma f_t + \varepsilon_{i,t}$,
+# with $r$ the daily closing-yield change in bp, the MMD move at the bond's own tenor removed first (the rates hedge with loading one), $z$ the
+# bond's lagged characteristics ranked within the date (duration ratio, premium, yield level, years to worst, extension, rating, liquidity, curve
+# level and spread, trade size and print frequency, flags and dummies) and $\Gamma$ a $L \times K$ loading matrix estimated by alternating least
+# squares on per-date cross-products, $K = 3$. Out of sample, $\Gamma$ is refitted monthly on an expanding window and applied to the next month;
+# the day's factor realisation $f_t$ is solved from that day's cross-section, so the residual $\varepsilon_{i,t}$ is point in time: the part of the
+# bond's move that neither the curve nor its characteristics explain. Everything downstream uses that residual.
+
+# %%
+CELL_T('3. The factor model [1]')
+_f_t0 = time.perf_counter()
+RATING_SCALE = {'AAA': 21, 'AA+': 20, 'AA': 19, 'AA-': 18, 'A+': 17, 'A': 16, 'A-': 15, 'BBB+': 14, 'BBB': 13, 'BBB-': 12, 'BB+': 11, 'BB': 10, 'BB-': 9, 'B+': 8, 'B': 7, 'B-': 6, 'CCC+': 5, 'CCC': 4, 'CCC-': 3, 'CC': 2, 'C': 1, 'D': 0}
+BLANKS = {'', 'NAN', 'NONE', 'NULL', '<NA>', 'NR', 'N/A', 'WR'}
+STATE_DUMMIES = ['CA', 'NY', 'TX', 'FL']; TARGET = 'closing_yield_change_bp'
+
+
+def clean_rating(series: pd.Series) -> pd.Series:
+    s = series.astype('string').str.strip().str.upper()
+    return s.where(s.notna() & ~s.isin(BLANKS))
+
+
+def rating_with_fallback(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
+    final = clean_rating(frame['final_comp_rating']) if 'final_comp_rating' in frame else pd.Series(pd.NA, index=frame.index, dtype='string')
+    comp = clean_rating(frame['comp_rating']) if 'comp_rating' in frame else pd.Series(pd.NA, index=frame.index, dtype='string')
+    rating = final.fillna(comp)
+    source = pd.Series(np.where(final.notna(), 'final', np.where(comp.notna(), 'comp_fallback', 'NR')), index=frame.index)
+    return rating, rating.map(RATING_SCALE).astype('float64'), source
+
+
+def flag_extreme_by_date(frame: pd.DataFrame, col: str, k: float) -> pd.Series:
+    g = frame.groupby('date', observed=True)[col]; med = g.transform('median')
+    mad = (frame[col] - med).abs().groupby(frame['date'], observed=True).transform('median') * 1.4826; mad = mad.where(mad > 1e-6, 1e-6)
+    return ((frame[col] - med).abs() > k * mad) | ~np.isfinite(frame[col])
+
+
+raw_panel['extreme_yield'] = (flag_extreme_by_date(raw_panel, 'closing_yield', CFG.yield_mad_k) | flag_extreme_by_date(raw_panel, 'closing_yield_lag1', CFG.yield_mad_k)).astype(int)
+
+
+def rank_normalize(frame: pd.DataFrame, cols: list[str], prefix: str = 'z') -> tuple[pd.DataFrame, list[str]]:
+    out = frame; zcols = []
+    for c in cols:
+        r = out.groupby('date', observed=True)[c].rank(method='average', pct=True); out[f'{prefix}_{c}'] = (r - 0.5).fillna(0.0); zcols.append(f'{prefix}_{c}')
+    return out, zcols
+
+
+def term_characteristics(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
+    date = frame['date']; mat_num = pd.to_numeric(frame['maturity'], errors='coerce'); mat = pd.to_datetime(mat_num, unit='ms', errors='coerce')
+    if mat.isna().mean() > 0.5:
+        mat = pd.to_datetime(frame['maturity'], errors='coerce')
+    call = pd.to_datetime(frame['nxt_call_dt'], errors='coerce'); cpn = pd.to_numeric(frame['cpn'], errors='coerce')
+    is_call = frame['callable'].astype('string').str.upper().isin(['Y', 'YES', 'TRUE', '1']); cur_y = pd.to_numeric(frame['closing_yield_lag1'], errors='coerce')
+    priced_to_call = is_call & call.notna() & (call > date) & (cpn > cur_y); worst = mat.where(~priced_to_call, call)
+    yrs_to_mat = (mat - date).dt.days / 365.25; yrs_to_worst = (worst - date).dt.days / 365.25
+    return yrs_to_worst, (yrs_to_mat - yrs_to_worst).clip(lower=0), worst
+
+
+def build_model_panel(panel: pd.DataFrame, cfg: RunConfig) -> tuple[pd.DataFrame, list[str]]:
+    """The lab's Section 3, verbatim: the instruments, the excess-over-MMD target, the data rules on rows."""
+    yp = panel.copy(); yp = yp[yp['extreme_yield'] == 0]; yp = yp[yp['closing_lag_days'].fillna(1.0) <= cfg.max_lag_days]
+    yp['premium_discount_lag1'] = pd.to_numeric(yp['closing_price_lag1'], errors='coerce') - 100.0
+    yp['years_to_worst'], yp['extension'], yp['worst_date'] = term_characteristics(yp); yp['worst_month'] = yp['worst_date'].dt.month
+    yp, benchmark_audit = mdp.add_benchmark_curve_features(yp, PIPE, tenor_col='years_to_worst', forward_month_col='worst_month', date_col='date', yield_col='closing_yield_lag1', max_age_days=7)
+    if benchmark_audit['feature_coverage'] < 0.95:
+        raise ValueError(f'Benchmark curve feature coverage is only {benchmark_audit["feature_coverage"]:.1%}; aborting factor training.')
+    yp['prev_close_date'] = yp['date'] - pd.to_timedelta(pd.to_numeric(yp['closing_lag_days'], errors='coerce'), unit='D')
+    yp, move_audit = mdp.add_benchmark_curve_move(yp, PIPE, tenor_col='years_to_worst', forward_month_col='worst_month', prev_date_col='prev_close_date', date_col='date', max_age_days=7)
+    yp = yp.rename(columns={'benchmark_move_bp': 'mmd_move_bp'})
+    _mat = pd.to_datetime(pd.to_numeric(yp['maturity'], errors='coerce'), unit='ms', errors='coerce')
+    if _mat.isna().mean() > 0.5:
+        _mat = pd.to_datetime(yp['maturity'], errors='coerce')
+    yp['maturity_year'] = _mat.dt.year
+    yp['is_callable'] = yp['callable'].astype('string').str.upper().isin(['Y', 'YES', 'TRUE', '1']).astype(float)
+    yp['call_structure'] = np.where(yp['is_callable'] == 0, 'bullet', np.where(yp['extension'] > 0.5, 'priced-to-call', 'callable, to maturity'))
+    zero_dur = (pd.to_numeric(yp['modified_duration_lag1'], errors='coerce') < cfg.zero_duration_cut) & (yp['years_to_worst'] > 1.0); yp = yp[~zero_dur]
+    yp['rating'], yp['rating_score'], yp['rating_source'] = rating_with_fallback(yp); yp['nr_flag'] = yp['rating_score'].isna().astype(float)
+    state = yp['state_code'].astype('string').str.strip().str.upper(); state = state.where(state.notna() & ~state.isin(['', 'NAN', 'NONE', 'NULL', '<NA>']), 'OTHER')
+    yp['state_bucket'] = state.where(state.isin(STATE_DUMMIES), 'OTHER')
+    for s in STATE_DUMMIES:
+        yp[f'state_{s}'] = (state == s).astype(float)
+    yp = yp.sort_values(['cusip', 'date'], kind='stable')
+    chg = (yp.groupby('cusip', observed=True)['closing_price'].diff().abs() > 0).astype(float)
+    yp['liquidity_20'] = chg.groupby(yp['cusip'], observed=True).transform(lambda s: s.rolling(20, min_periods=5).mean().shift(1))
+    yp['duration_ratio'] = (pd.to_numeric(yp['modified_duration_lag1'], errors='coerce') / yp['years_to_worst'].clip(lower=0.25)).clip(0, 1.5)
+    dur_instr = 'duration_ratio' if cfg.duration_instrument == 'ratio' else 'modified_duration_lag1'
+    base = [dur_instr, 'premium_discount_lag1', 'closing_yield_lag1']
+    cont = base + ['years_to_worst', 'extension', 'rating_score', 'liquidity_20', 'benchmark_yield_lag1', 'benchmark_spread_lag1']
+    size_cols = [c for c in ['trade_size_lag', 'print_freq_lag'] if c in yp.columns and yp[c].notna().mean() > 0.2]
+    if 'trade_size_lag' in yp.columns:
+        yp['no_print_flag'] = yp['trade_size_lag'].isna().astype(float)
+    cont = cont + size_cols
+    yp = yp.dropna(subset=base + [TARGET, 'mmd_move_bp']).copy()
+    yp['target_bp_raw'] = yp[TARGET]; yp[TARGET] = yp[TARGET].clip(-cfg.target_clip_bp, cfg.target_clip_bp); yp['excess_mmd_bp'] = yp[TARGET] - yp['mmd_move_bp']
+    yp['mark_unchanged'] = (yp['target_bp_raw'] == 0).astype(float)
+    _moved = (yp['mark_unchanged'] == 0).groupby(yp['cusip'], observed=True).cumsum(); yp['days_since_mark_move'] = yp['mark_unchanged'].groupby([yp['cusip'], _moved], observed=True).cumsum()
+    yp, zcols = rank_normalize(yp, cont); yp['market_fv'] = 1.0
+    ind_cols = []
+    if 'issuer_industry' in yp.columns:
+        ind = yp['issuer_industry'].astype('string').str.strip().str.upper(); ind = ind.where(ind.notna() & ~ind.isin(['', 'NAN', 'NONE', 'NULL', '<NA>']), 'UNKNOWN')
+        top_ind = ind[ind != 'UNKNOWN'].value_counts().head(cfg.industry_dummies).index.tolist()
+        for k in top_ind:
+            col = 'ind_' + re.sub(r'[^A-Za-z0-9]+', '_', str(k)).strip('_')[:20]; yp[col] = (ind == k).astype(float); ind_cols.append(col)
+    chars = ['market_fv'] + zcols + ['nr_flag'] + (['no_print_flag'] if 'no_print_flag' in yp.columns else []) + [f'state_{s}' for s in STATE_DUMMIES] + ind_cols
+    cnt = yp.groupby('cusip', observed=True)[TARGET].transform('count'); yp = yp[cnt >= cfg.min_obs_per_bond].copy()
+    per_date = yp.groupby('date', observed=True)['cusip'].transform('size'); sparse = per_date < cfg.min_bonds_per_date
+    if sparse.any():
+        print(f'sparse dates dropped (< {cfg.min_bonds_per_date} bonds): {sorted(yp.loc[sparse, "date"].dt.date.unique())}'); yp = yp[~sparse].copy()
+    keep = ['cusip', 'date', TARGET, 'target_bp_raw', 'mark_unchanged', 'days_since_mark_move', 'closing_lag_days', 'closing_yield', 'closing_yield_lag1', 'closing_price', 'modified_duration_lag1', 'duration_ratio',
+            'years_to_worst', 'extension', 'rating', 'rating_score', 'cpn', 'state_bucket', 'maturity_year', 'is_callable', 'call_structure', 'trade_size_lag', 'print_freq_lag', 'benchmark_yield_lag1',
+            'benchmark_spread_lag1', 'mmd_move_bp', 'excess_mmd_bp'] + chars
+    keep = [c for c in dict.fromkeys(keep) if c in yp.columns]
+    return yp[keep].sort_values(['cusip', 'date'], kind='stable').reset_index(drop=True), chars
+
+
+model, CHARS = build_model_panel(raw_panel, CFG)
+FIT_TARGET = 'excess_mmd_bp' if CFG.target_mode == 'excess_mmd' else TARGET
+# the two data rules on dates: partial-mark days dropped, dispersion days zero-weighted in the fit
+_cnt = model.groupby('date', observed=True).size(); _ref = _cnt.rolling(20, min_periods=5).median().shift(1).bfill()
+PARTIAL_DAYS = set(pd.DatetimeIndex(_cnt.index[_cnt < CFG.partial_day_ratio * _ref]))
+if PARTIAL_DAYS:
+    model = model[~model['date'].isin(PARTIAL_DAYS)].reset_index(drop=True)
+_med = model.groupby('date', observed=True)['target_bp_raw'].transform('median'); _disp_share = ((model['target_bp_raw'] - _med).abs() > CFG.dispersion_bp).groupby(model['date'], observed=True).mean()
+_common = model.groupby('date', observed=True)['target_bp_raw'].median()
+DISPERSION_DAYS = set(pd.DatetimeIndex(_disp_share.index[_disp_share > CFG.dispersion_share_cut])); COMMON_MOVE_DAYS = set(pd.DatetimeIndex(_common.index[_common.abs() > CFG.common_move_bp]))
+print(f'model panel: {len(model):,} bond-days | {model["cusip"].nunique():,} CUSIPs | {model["date"].nunique()} dates | L = {len(CHARS)} instruments | fitted on {FIT_TARGET} | '
+      f'partial days dropped {len(PARTIAL_DAYS)}, dispersion days zero-weighted {len(DISPERSION_DAYS)}, common-move days kept {len(COMMON_MOVE_DAYS)} | {time.perf_counter() - _f_t0:.0f}s')
+print('instruments:', CHARS)
+
+
+def date_weights(dates: pd.DatetimeIndex, rr: np.ndarray, nobs: np.ndarray, cfg: RunConfig, repricing: set) -> np.ndarray:
+    w = np.ones(len(dates))
+    if cfg.date_weighting == 'inverse_var':
+        ms = rr / np.maximum(nobs, 1); w = np.clip(np.median(ms[ms > 0]) / np.maximum(ms, 1e-12), 0.0, cfg.date_weight_cap)
+    if cfg.exclude_dispersion_from_fit and repricing:
+        w = np.where(dates.isin(list(repricing)), 0.0, w)
+    return w
+
+
+def precompute_moments(frame: pd.DataFrame, chars: list[str], target: str, weighted: bool = True) -> dict:
+    dates = pd.DatetimeIndex(sorted(frame['date'].unique())); L = len(chars)
+    A = np.zeros((len(dates), L, L)); b = np.zeros((len(dates), L)); rr = np.zeros(len(dates)); nobs = np.zeros(len(dates), dtype=np.int64); pos = {d: i for i, d in enumerate(dates)}
+    for d, g in frame.groupby('date', sort=True, observed=True):
+        i = pos[pd.Timestamp(d)]; Z = g[chars].to_numpy(float); r = g[target].to_numpy(float)
+        A[i] = Z.T @ Z; b[i] = Z.T @ r; rr[i] = float(r @ r); nobs[i] = len(g)
+    w = date_weights(dates, rr, nobs, CFG, DISPERSION_DAYS) if weighted else np.ones(len(dates))
+    return {'dates': dates, 'A': A * w[:, None, None], 'b': b * w[:, None], 'rr': rr * w, 'nobs': nobs, 'chars': list(chars), 'w': w, 'rr_unweighted': rr}
+
+
+class MomentIPCA:
+    """IPCA by alternating least squares on per-date moments (Kelly, Pruitt, Su 2019), latent factors only. Identification: Gamma'Gamma = I, factors
+    ordered by variance, non-negative factor means."""
+
+    def __init__(self, n_factors: int, max_iter: int = 50, tol: float = 1e-5, ridge: float = 1e-10, seed: int = 0):
+        self.K = int(n_factors); self.max_iter = max_iter; self.tol = tol; self.ridge = ridge; self.seed = seed; self.Gamma = None; self.Factors = None; self.loss_history: list[float] = []
+
+    def _initial_gamma(self, m, gamma_init=None):
+        L = m['A'].shape[1]
+        if gamma_init is not None and np.shape(gamma_init) == (L, self.K):
+            return np.asarray(gamma_init, float)
+        managed = m['b'] / np.maximum(m['nobs'][:, None], 1); u, _, _ = np.linalg.svd(managed.T @ managed); return u[:, :self.K]
+
+    def _solve_factors(self, Gamma, m):
+        A, b, nobs = m['A'], m['b'], m['nobs']; F = np.zeros((A.shape[0], self.K)); eye = np.eye(self.K)
+        for t in range(A.shape[0]):
+            if nobs[t] >= self.K:
+                F[t] = np.linalg.solve(Gamma.T @ A[t] @ Gamma + self.ridge * eye, Gamma.T @ b[t])
+        return F
+
+    def _identify(self, G, F):
+        Q, R = np.linalg.qr(G); s = np.sign(np.diag(R)); s[s == 0] = 1; Q = Q @ np.diag(s); R = Q.T @ G; F = F @ R.T
+        vals, vecs = np.linalg.eigh(F.T @ F / max(F.shape[0], 1)); W = vecs[:, np.argsort(vals)[::-1]]; G = Q @ W; F = F @ W
+        s = np.sign(F.mean(axis=0)); s[s == 0] = 1
+        return G * s, F * s
+
+    def _loss(self, G, F, m):
+        A, b, rr, nobs = m['A'], m['b'], m['rr'], m['nobs']
+        tot = sum(rr[t] - 2.0 * F[t] @ G.T @ b[t] + F[t] @ (G.T @ A[t] @ G) @ F[t] for t in range(A.shape[0])); return tot / max(int(nobs.sum()), 1)
+
+    def fit(self, m, gamma_init=None):
+        A, b = m['A'], m['b']; L = A.shape[1]; K = self.K
+        G = self._initial_gamma(m, gamma_init); F = self._solve_factors(G, m); G, F = self._identify(G, F); eye = np.eye(L * K); self.loss_history = []
+        for it in range(self.max_iter):
+            Ft = self._solve_factors(G, m); lhs = np.zeros((L * K, L * K)); rhs = np.zeros(L * K)
+            for t in range(A.shape[0]):
+                ft = Ft[t]; lhs += np.kron(np.outer(ft, ft), A[t]); rhs += np.kron(ft, b[t])
+            Gt = np.linalg.solve(lhs + self.ridge * eye, rhs).reshape((L, K), order='F'); G, F = self._identify(Gt, Ft)
+            loss = self._loss(G, F, m); self.loss_history.append(loss)
+            if it > 0 and abs(self.loss_history[-2] - loss) / max(abs(self.loss_history[-2]), 1e-12) < self.tol:
+                break
+        self.Gamma, self.Factors = G, F; return self
+
+    def variance_explained(self, m) -> float:
+        sse = self._loss(self.Gamma, self.Factors, m) * max(int(m['nobs'].sum()), 1); return 1.0 - sse / max(float(m['rr'].sum()), 1e-12)
+
+
+def make_folds(dates: pd.DatetimeIndex, train_start: str, first_oos: str, test_days: int) -> list[dict]:
+    dates = pd.DatetimeIndex(dates).sort_values(); ts, start = pd.Timestamp(train_start), pd.Timestamp(first_oos); folds, k = [], 1
+    while start <= dates.max():
+        end = start + pd.Timedelta(days=test_days); tr = dates[(dates >= ts) & (dates < start)]; te = dates[(dates >= start) & (dates < end)]
+        if len(tr) and len(te):
+            folds.append({'fold': k, 'train_dates': tr, 'test_dates': te, 'train_end': tr[-1], 'test_start': te[0], 'test_end': te[-1]}); k += 1
+        start = end
+    return folds
+
+
+def procrustes_align(G: np.ndarray, G_ref: np.ndarray) -> np.ndarray:
+    U, _, Vt = np.linalg.svd(G.T @ G_ref); return G @ (U @ Vt)
+
+
+def walk_forward_residuals(frame: pd.DataFrame, chars: list[str], folds: list[dict], cfg: RunConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Gamma on the training dates of each fold (Procrustes-aligned across folds), the test day's factors solved from its own cross-section after the
+    MMD move is removed; fitted and residual mapped back to yield-change space. Returns (residual frame, aligned Gammas)."""
+    parts, gammas = [], []; fit_col = 'excess_mmd_bp' if cfg.target_mode == 'excess_mmd' else TARGET; init = None; ref = None
+    by_date = {d: g for d, g in frame.groupby('date', sort=True, observed=True)}; eye = np.eye(cfg.selected_k); fcols = [f'factor{i + 1}' for i in range(cfg.selected_k)]
+    for fo in folds:
+        t0 = time.perf_counter(); train = frame[frame['date'].isin(fo['train_dates'])]
+        if train['date'].nunique() < 10:
+            continue
+        mk = MomentIPCA(cfg.selected_k, cfg.max_iter, cfg.tol, cfg.ridge, cfg.seed).fit(precompute_moments(train, chars, fit_col), gamma_init=init); init = mk.Gamma
+        G_al = mk.Gamma if ref is None else procrustes_align(mk.Gamma, ref); ref = G_al
+        gammas.append(pd.DataFrame(G_al, index=chars, columns=fcols).assign(gamma_version=pd.Timestamp(fo['train_end']), fold=fo['fold']))
+        for d in fo['test_dates']:
+            g = by_date.get(d)
+            if g is None:
+                continue
+            Z = g[chars].to_numpy(float); r = g[TARGET].to_numpy(float); B = Z @ G_al; mv = g['mmd_move_bp'].to_numpy(float); off = mv if fit_col == 'excess_mmd_bp' else np.zeros(len(r))
+            f = np.linalg.solve(B.T @ B + cfg.ridge * eye, B.T @ (r - off))
+            out = g[['cusip', 'date']].copy(); out['gamma_version'] = pd.Timestamp(fo['train_end']); out['fold'] = fo['fold']; out['target_bp'] = r; out['mmd_move_bp'] = mv; out['curve_offset_bp'] = off
+            out['fitted_bp'] = B @ f + off; out['pit_residual'] = r - out['fitted_bp']
+            for j in range(cfg.selected_k):
+                out[f'beta{j + 1}'] = B[:, j]; out[f'f{j + 1}'] = f[j]
+            parts.append(out)
+        print(f'  fold {fo["fold"]:02d} | train ->{fo["train_end"].date()} | test {fo["test_start"].date()}..{fo["test_end"].date()} | {time.perf_counter() - t0:.1f}s')
+    return pd.concat(parts, ignore_index=True), pd.concat(gammas)
+
+
+PANEL_FP = frame_fingerprint(model, [TARGET, 'mmd_move_bp', 'z_duration_ratio', 'z_closing_yield_lag1']) + f'|chars:{CHARS}|disp:{sorted(str(d) for d in DISPERSION_DAYS)}'
+_dates_all = pd.DatetimeIndex(sorted(model['date'].unique()))
+
+
+def _walk_forward() -> dict:
+    folds_ = make_folds(_dates_all, CFG.train_start, CFG.first_oos_date, CFG.refit_days)
+    res_, gam_ = walk_forward_residuals(model, CHARS, folds_, CFG)
+    return {'resid': res_, 'gammas': gam_, 'folds': [{k: (v if not isinstance(v, pd.DatetimeIndex) else list(v)) for k, v in fo.items()} for fo in folds_]}
+
+
+_wf = cached('walk_forward', _walk_forward, deps=[STEP3_FP, PANEL_FP, BENCHMARK_FP], code=[walk_forward_residuals, make_folds, procrustes_align, MomentIPCA, precompute_moments, date_weights],
+             cfg=('selected_k', 'target_mode', 'max_iter', 'tol', 'ridge', 'refit_days', 'train_start', 'first_oos_date', 'date_weighting', 'date_weight_cap', 'exclude_dispersion_from_fit'))
+resid, gamma_versions, folds = _wf['resid'], _wf['gammas'], _wf['folds']
+beta_cols = [f'beta{j + 1}' for j in range(CFG.selected_k)]
+oos_var_expl = 1.0 - resid['pit_residual'].var() / resid['target_bp'].var()
+rm = resid.assign(month=resid['date'].dt.to_period('M').astype(str)).groupby('month').apply(
+    lambda g: pd.Series({'OOS variance explained': 1 - g['pit_residual'].var() / g['target_bp'].var(), 'residual sd (bp)': g['pit_residual'].std(), 'target sd (bp)': g['target_bp'].std(), 'bond-days': len(g)}), include_groups=False)
+print(f'residuals of record: {len(resid):,} bond-days | {resid["cusip"].nunique():,} CUSIPs | {resid["gamma_version"].nunique()} Gamma versions | OOS variance explained {oos_var_expl:.3f} | residual sd {resid["pit_residual"].std():.2f} bp')
+display(rm.round(3))
+gamma_last = gamma_versions[gamma_versions['gamma_version'] == gamma_versions['gamma_version'].max()].drop(columns=['gamma_version', 'fold'])
+fig, ax = plt.subplots(1, 3, figsize=(20, 5.5), gridspec_kw={'width_ratios': [1.1, 1, 1]})
+im = ax[0].imshow(gamma_last.values, cmap='RdBu_r', vmin=-1, vmax=1, aspect='auto'); ax[0].set_yticks(range(len(gamma_last))); ax[0].set_yticklabels([c.replace('z_', '').replace('_lag1', '') for c in gamma_last.index], fontsize=8)
+ax[0].set_xticks(range(CFG.selected_k)); ax[0].set_xticklabels(gamma_last.columns)
+for i in range(gamma_last.shape[0]):
+    for j in range(gamma_last.shape[1]):
+        ax[0].text(j, i, f'{gamma_last.values[i, j]:+.2f}', ha='center', va='center', fontsize=7)
+ax[0].set_title(f'Gamma, the last refit: how each characteristic loads on the {CFG.selected_k} factors', fontsize=10); ax[0].grid(False)
+rm['OOS variance explained'].plot.bar(ax=ax[1], color=C_BLUE); ax[1].set_title('Out-of-sample variance of the daily yield change explained, by month', fontsize=10); ax[1].set_xlabel('')
+rm[['target sd (bp)', 'residual sd (bp)']].plot(ax=ax[2], marker='o', color=[C_GREY, C_RED]); ax[2].set_title('Cross-sectional sd of the move and of the residual (bp)', fontsize=10); ax[2].set_xlabel('')
+savefig('03_factor_model')
+record('factor_model', instruments=CHARS, folds=len(folds), residual_rows=len(resid), oos_variance_explained=float(oos_var_expl), residual_sd_bp=float(resid['pit_residual'].std()), monthly=flat_records(rm), seconds=time.perf_counter() - _f_t0)
+print(f'[3] {time.perf_counter() - _f_t0:.0f}s')
+
+# %% [markdown]
+# ## 4. The residual's conditional distribution
+#
+# The width charge needs, for each bond at each close, a distribution of its next-day residual: not a point forecast (the residual has little
+# predictable mean) but how wide it is. Two models from lab Section 10, trained walk-forward on the months before the month being scored:
+#
+# - **the lookup grid**: the empirical quantiles of the residual in the bond's cell of beta-space cluster (8 k-means clusters on the standardised
+#   betas, fitted on the first out-of-sample month and applied forward) x activity bucket (quintile of the bond's trailing 20-day volatility),
+#   shrunk to the pooled quantiles;
+# - **the location-scale model**: least squares of the residual on the bond's betas, beta norm and cluster (cross section) and on the day's
+#   dispersion, its own trailing residual sd, the trailing MMD vol, mark staleness and the systematic sd (time series); the scale from a second
+#   regression of the absolute deviation; quantiles of the standardised deviation on the training rows.
+#
+# Both are scored out of sample on the quantile (pinball) loss and on calibration (the share of outcomes below each predicted quantile should read the
+# quantile). The location-scale model is the candidate's input; the grid is the variation.
+
+# %%
+CELL_T('4. The residual\'s conditional distribution [1]')
+_q_t0 = time.perf_counter()
+from sklearn.cluster import KMeans  # noqa: E402
+QR_TAUS = np.array(CFG.grid_taus, float)
+resid = resid.sort_values(['cusip', 'date'], kind='stable').reset_index(drop=True); grp = resid.groupby('cusip', observed=True)
+resid['resid_sd'] = grp['pit_residual'].transform(lambda s: s.rolling(CFG.level_signal_window, min_periods=max(5, CFG.level_signal_window // 4)).std())
+resid['next_residual'] = grp['pit_residual'].shift(-1); resid['next_date'] = grp['date'].shift(-1); resid['next_total'] = grp['target_bp'].shift(-1)
+_m = model.sort_values(['cusip', 'date'], kind='stable')
+_m['target_abs_vol'] = _m.groupby('cusip', observed=True)[TARGET].transform(lambda s: s.rolling(CFG.activity_window, min_periods=max(5, CFG.activity_window // 2)).std().shift(1))
+_m['activity_bucket'] = _m.groupby('date', observed=True)['target_abs_vol'].transform(lambda s: pd.qcut(s.rank(method='first'), 5, labels=[f'L{i}' for i in range(1, 6)]).astype(str) if s.notna().sum() >= 50 else pd.Series('UNKNOWN', index=s.index))
+_m.loc[_m['target_abs_vol'].isna(), 'activity_bucket'] = 'UNKNOWN'
+resid = resid.merge(_m[['cusip', 'date', 'activity_bucket', 'target_abs_vol', 'days_since_mark_move']], on=['cusip', 'date'], how='left'); resid['activity_bucket'] = resid['activity_bucket'].fillna('UNKNOWN')
+_first_m = resid['date'].dt.to_period('M').min(); _fit = resid[resid['date'].dt.to_period('M') == _first_m]
+_mu_b, _sd_b = _fit[beta_cols].mean(), _fit[beta_cols].std().replace(0, 1.0)
+km_pit = KMeans(n_clusters=CFG.n_clusters, n_init=10, random_state=CFG.seed).fit(((_fit[beta_cols] - _mu_b) / _sd_b).to_numpy(float))
+resid['beta_cluster'] = km_pit.predict(((resid[beta_cols] - _mu_b) / _sd_b).to_numpy(float))
+DATE_DISP = model.groupby('date', observed=True)[TARGET].std().sort_index()
+qf = resid[['cusip', 'date', 'next_date', 'target_bp', 'next_residual', 'next_total', 'curve_offset_bp', 'beta_cluster', 'activity_bucket', 'target_abs_vol', 'resid_sd', 'days_since_mark_move'] + beta_cols].copy()
+qf = qf.sort_values(['cusip', 'date'], kind='stable').reset_index(drop=True)
+qf['mmd_vol_20'] = qf.groupby('cusip', observed=True)['curve_offset_bp'].rolling(20, min_periods=5).std().reset_index(level=0, drop=True)
+qf['date_disp'] = qf['date'].map(DATE_DISP); qf['date_disp_5d'] = qf['date'].map(DATE_DISP.rolling(5, min_periods=1).mean()); qf['beta_norm'] = np.sqrt((qf[beta_cols] ** 2).sum(axis=1))
+_fac = resid.groupby('date')[[f'f{j + 1}' for j in range(CFG.selected_k)]].first().sort_index(); _Fv = _fac.to_numpy(float); _Bq = qf[beta_cols].to_numpy(float); _sys = np.full(len(qf), np.nan)
+for d_, ix in qf.groupby('date').indices.items():
+    i_ = _fac.index.get_loc(pd.Timestamp(d_)); w_ = _Fv[max(0, i_ - 59): i_ + 1]
+    if len(w_) >= 10:
+        _sys[ix] = np.sqrt(np.einsum('ij,jk,ik->i', _Bq[ix], np.cov(w_.T), _Bq[ix]))
+qf['sys_sd'] = _sys; qf['beta_cluster'] = qf['beta_cluster'].astype(int); qf['target_month'] = qf['next_date'].dt.to_period('M'); qf['month'] = qf['date'].dt.to_period('M')
+QR_XS = beta_cols + ['beta_norm', 'beta_cluster']; QR_TS = ['date_disp', 'date_disp_5d', 'target_abs_vol', 'resid_sd', 'mmd_vol_20', 'days_since_mark_move']
+QR_FEATS = QR_XS + QR_TS + ['sys_sd']; QR_TARGETS = {'residual': 'next_residual', 'total': 'next_total'}
+print(f'conditioning frame: {len(qf):,} bond-days | next residual observed {qf["next_residual"].notna().mean():.1%} | clusters {CFG.n_clusters} fitted on {_first_m} | activity buckets {qf["activity_bucket"].value_counts(normalize=True).round(2).to_dict()}')
+
+
+def _design(tr: pd.DataFrame, te: pd.DataFrame, feats: list[str]) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    num = [f for f in feats if f != 'beta_cluster']; med = tr[num].median()
+    A = tr[num].fillna(med).fillna(0.0).to_numpy(float); Bm = te[num].fillna(med).fillna(0.0).to_numpy(float); mu, sd = A.mean(0), A.std(0); sd = np.where(sd > 1e-12, sd, 1.0)
+    A = np.clip((A - mu) / sd, -5, 5); Bm = np.clip((Bm - mu) / sd, -5, 5); names = list(num)
+    if 'beta_cluster' in feats:
+        lv = list(range(1, CFG.n_clusters)); A = np.column_stack([A] + [(tr['beta_cluster'].to_numpy() == c).astype(float) for c in lv]); Bm = np.column_stack([Bm] + [(te['beta_cluster'].to_numpy() == c).astype(float) for c in lv]); names += [f'cluster C{c}' for c in lv]
+    return A, Bm, names
+
+
+def _ls_quantiles(tr: pd.DataFrame, te: pd.DataFrame, feats: list[str], y: str, lo: float, hi: float) -> tuple[np.ndarray, pd.Series]:
+    """Location-scale: mu(x) by least squares on the winsorised target, sigma(x) by least squares of |y - mu|, quantiles of the standardised deviation on the training rows."""
+    A, Bm, names = _design(tr, te, feats); Xa = np.column_stack([np.ones(len(A)), A]); Xb = np.column_stack([np.ones(len(Bm)), Bm])
+    yv = tr[y].to_numpy(float); yc = np.clip(yv, lo, hi); b_mu = np.linalg.lstsq(Xa, yc, rcond=None)[0]; dev = yc - Xa @ b_mu; b_s = np.linalg.lstsq(Xa, np.abs(dev), rcond=None)[0]; floor = 0.25
+    u = (yv - Xa @ b_mu) / np.maximum(Xa @ b_s, floor); qu = np.quantile(u, QR_TAUS)
+    return (Xb @ b_mu)[:, None] + np.maximum(Xb @ b_s, floor)[:, None] * qu[None, :], pd.Series(b_s[1:], index=names)
+
+
+def _grid_quantiles(tr: pd.DataFrame, te: pd.DataFrame, y: str, cells: tuple[str, ...] = ('beta_cluster', 'activity_bucket')) -> np.ndarray:
+    cells = list(cells); pooled = np.quantile(tr[y], QR_TAUS); cq = tr.groupby(cells, observed=True)[y].quantile(QR_TAUS).unstack()
+    n = tr.groupby(cells, observed=True).size().reindex(cq.index).to_numpy(float); w = (n / (n + CFG.grid_shrink_k))[:, None]
+    cq = pd.DataFrame(w * cq.to_numpy(float) + (1.0 - w) * pooled[None, :], index=cq.index)
+    Q = cq.reindex(pd.MultiIndex.from_frame(te[cells])).to_numpy(dtype=float, copy=True); miss = ~np.isfinite(Q).all(axis=1); Q[miss] = pooled; return Q
+
+
+def _q_stats(y: np.ndarray, Q: np.ndarray, dates: np.ndarray) -> pd.DataFrame:
+    ok = np.isfinite(y) & np.isfinite(Q).all(axis=1); y, Q, dates = y[ok], Q[ok], dates[ok]; d = y[:, None] - Q
+    f = pd.DataFrame({'date': dates, 'n': 1, 'pinball': np.maximum(QR_TAUS * d, (QR_TAUS - 1.0) * d).mean(axis=1), 'in80': (y >= Q[:, 1]) & (y <= Q[:, -2]), 'w80': Q[:, -2] - Q[:, 1]})
+    for j, t in enumerate(QR_TAUS):
+        f[f'below {t:.2f}'] = y <= Q[:, j]
+    return f.groupby('date').agg({'n': 'sum', 'pinball': 'mean', 'in80': 'mean', 'w80': 'mean', **{f'below {t:.2f}': 'mean' for t in QR_TAUS}})
+
+
+def _conditional_quantiles() -> dict:
+    """Out-of-sample quantiles per test month (trained strictly on earlier target months) for both models and both targets, with the scores and the
+    bond-day quantiles themselves (the inputs of Section 8)."""
+    stats_rows, qrows = [], []; months_q = sorted(qf['target_month'].dropna().unique())
+    for m in months_q[1:]:
+        t0 = time.perf_counter(); te = qf[qf['target_month'] == m]
+        if te.empty:
+            continue
+        qm = te[['cusip', 'date']].reset_index(drop=True).set_index(['cusip', 'date'])
+        for tgt, ycol in QR_TARGETS.items():
+            tr = qf[(qf['target_month'] < m) & qf[ycol].notna()]
+            if len(tr) < CFG.qr_min_train:
+                continue
+            trs = tr.sample(min(len(tr), CFG.qr_max_train), random_state=CFG.seed); lo, hi = np.quantile(tr[ycol], [0.005, 0.995]); yt = te[ycol].to_numpy(float); dts = te['date'].to_numpy()
+            Qs = {'unconditional': np.tile(np.quantile(tr[ycol], QR_TAUS), (len(te), 1)), 'grid': _grid_quantiles(tr, te, ycol)}
+            Qs['ls'], _ = _ls_quantiles(trs, te, QR_FEATS, ycol, lo, hi)
+            for name, Q in Qs.items():
+                st = _q_stats(yt, Q, dts).reset_index(); st['target'] = tgt; st['model'] = name; st['month'] = str(m); stats_rows.append(st)
+                if name != 'unconditional':
+                    for j, t in enumerate(QR_TAUS):
+                        qm[f'q_{tgt}_{name}_{int(round(100 * t)):02d}'] = Q[:, j]
+        qrows.append(qm)
+        print(f'  test month {m}: {len(te):,} bond-days | {time.perf_counter() - t0:.0f}s')
+    Qall = pd.concat(qrows).reset_index() if qrows else pd.DataFrame()
+    return {'stats': pd.concat(stats_rows, ignore_index=True), 'quantiles': Qall}
+
+
+QR = cached('conditional_quantiles', _conditional_quantiles, deps=[STAGE_KEYS['walk_forward'], frame_fingerprint(qf, ['next_residual', 'next_total', 'sys_sd', 'resid_sd'])],
+            code=[_q_stats, _design, _ls_quantiles, _grid_quantiles], cfg=('grid_taus', 'grid_shrink_k', 'qr_max_train', 'qr_min_train', 'n_clusters'))
+qs, QBD = QR['stats'], QR['quantiles']
+_bel = [f'below {t:.2f}' for t in QR_TAUS]
+
+
+def _qagg(g: pd.DataFrame) -> pd.Series:
+    w = g['n'].to_numpy(float)
+    out = {'bond-days': int(w.sum()), 'pinball (bp)': np.average(g['pinball'], weights=w), 'coverage 80%': np.average(g['in80'], weights=w), 'width 80% (bp)': np.average(g['w80'], weights=w)}
+    out['calibration error'] = float(np.mean([abs(np.average(g[b], weights=w) - t) for b, t in zip(_bel, QR_TAUS)])); return pd.Series(out)
+
+
+qr_tab = qs.groupby(['target', 'model'], sort=False).apply(_qagg, include_groups=False)
+for tgt in qr_tab.index.get_level_values(0).unique():
+    base_ = qr_tab.loc[(tgt, 'unconditional'), 'pinball (bp)']
+    for name in qr_tab.loc[tgt].index:
+        qr_tab.loc[(tgt, name), 'skill vs unconditional (%)'] = 100 * (1 - qr_tab.loc[(tgt, name), 'pinball (bp)'] / base_)
+print('The next-day distribution out of sample (pinball averaged over the 7 quantiles; skill = % reduction against the unconditional quantiles; a calibrated model has calibration error near 0):'); display(qr_tab.round(3))
+_cal = qs.groupby(['target', 'model'], sort=False).apply(lambda g: pd.Series({t: np.average(g[b], weights=g['n']) for b, t in zip(_bel, QR_TAUS)}), include_groups=False)
+print('Calibration: share of outcomes below each predicted quantile (reads the column header when calibrated):'); display(_cal.round(3))
+_pm = qs[qs['target'] == 'residual'].groupby(['month', 'model']).apply(lambda g: np.average(g['pinball'], weights=g['n']), include_groups=False).unstack('model')
+fig, ax = plt.subplots(1, 3, figsize=(19, 4.8))
+for name, c_ in (('unconditional', C_GREY), ('grid', C_BLUE), ('ls', C_GREEN)):
+    if ('residual', name) in _cal.index:
+        ax[0].plot(QR_TAUS, _cal.loc[('residual', name)].to_numpy(float), marker='o', color=c_, label=name)
+ax[0].plot([0, 1], [0, 1], 'k--', lw=0.8); ax[0].set_xlabel('nominal quantile'); ax[0].set_ylabel('realised share below'); ax[0].set_title('Calibration out of sample, next-day residual', fontsize=10); ax[0].legend(fontsize=8)
+(100 * (1 - _pm.div(_pm['unconditional'], axis=0))).drop(columns=['unconditional']).plot(ax=ax[1], marker='o', color=[C_BLUE, C_GREEN]); ax[1].axhline(0, color='k', lw=0.6); ax[1].set_title('Monthly pinball skill vs unconditional (%), residual', fontsize=10); ax[1].set_xlabel('')
+if len(QBD):
+    _wq = QBD.assign(month=QBD['date'].dt.to_period('M').astype(str))
+    for name, c_ in (('grid', C_BLUE), ('ls', C_GREEN)):
+        w_ = (_wq[f'q_residual_{name}_90'] - _wq[f'q_residual_{name}_10']) / 2.0
+        ax[2].plot(_wq.groupby('month').size().index, w_.groupby(_wq['month']).quantile([0.1, 0.5, 0.9]).unstack().to_numpy(), color=c_, lw=[0.8, 1.8, 0.8][0], alpha=0.9)
+        ax[2].plot([], [], color=c_, label=f'{name}: 10th, median, 90th percentile across bonds')
+    ax[2].set_title('Half-width of the 80% band of the next-day residual, by month (bp)', fontsize=10); ax[2].legend(fontsize=8); ax[2].tick_params(axis='x', labelsize=8)
+savefig('04_conditional_quantiles')
+record('conditional_quantiles', table=flat_records(qr_tab), calibration=flat_records(_cal), seconds=time.perf_counter() - _q_t0)
+print(f'[4] bond-day quantiles on {len(QBD):,} rows | {time.perf_counter() - _q_t0:.0f}s')
+# %% [markdown]
+# ## 5. The desk's requests through production's optimizer
+#
+# Production's bid on a request is `y = m + x* / 100 + adj`: the model mid `m` (signal yield), the optimal concession `x*` from the optimizer, and the
+# logged loading `adj` production applied after the optimizer (final quote yield minus optimal yield, zero on most requests). The optimizer is
+# `x* = argmax over the key's grid of (x + c) p(x)`, with `p(x)` the production pfill curve of the request's key in force on its date and
+# `c = -(manual + liquidity + risk)`. It is rebuilt here from the logged inputs and must reproduce the logged optimal concession and fill probability on
+# at least 95% of requests in every month; and the replayed quote must reproduce every logged win and loss under the win rule. Nothing is scored
+# otherwise.
+#
+# **The win rule** (lab Section 14, fixed before any variant was scored). A request belongs to one of five groups by its logged outcome, and the
+# threshold a quote must beat is fixed by the logs, independent of any variant: won with a cover price (threshold = the cover yield, a quote wins iff
+# its yield is at or below it; `d = 100 (threshold - y)` is the bp left on the table); won without a cover (threshold = our logged yield); lost with a
+# matched print richer than our quote (the print is the winner; a quote wins iff strictly richer than it); lost with the print at or cheaper than our
+# quote (no fill); no matched print (no fill). The first three groups are "winnable" and every comparison runs on them.
+
+# %%
+CELL_T('5. The replay [1]')
+_r_t0 = time.perf_counter()
+BT_PFILL_DIR = ROOT / 'prod_pfills'; BT_PFILL_SCHEDULE = [tuple(x) for x in CFG.pfill_schedule]; BT_WIDTH = 0.0; BT_TOL_BP, BT_TOL_PF, BT_GATE = 0.25, 0.01, 0.95; BT_MAX_CELLS = 20_000_000
+
+
+def bt_load_pfills(directory: Path, labels: list[str]) -> dict[str, dict[str, tuple[np.ndarray, np.ndarray]]]:
+    """Production pfill snapshots as (quantile_bp, probabilities) per key, built exactly as production builds the curve."""
+    out = {}
+    for lab in labels:
+        path = Path(directory) / f'pfills_{lab}.json'
+        if not path.exists():
+            raise FileNotFoundError(f'{path} not found: copy the production pfill snapshots to {directory}')
+        raw = json.loads(path.read_text())
+        out[lab] = {k: ((np.asarray(v['quantiles'], dtype=float) * v['stdev'] + v['mean']) * 100, np.asarray(v['probabilities'], dtype=float)) for k, v in raw.items()}
+    return out
+
+
+def bt_file_label(dates: pd.Series, schedule=None) -> np.ndarray:
+    schedule = schedule or BT_PFILL_SCHEDULE; d = pd.to_datetime(dates).dt.normalize(); lab = np.full(len(d), schedule[-1][0], dtype=object)
+    for f, last in reversed(schedule[:-1]):
+        lab[(d <= pd.Timestamp(last)).to_numpy()] = f
+    return lab
+
+
+def bt_optimize(qbp: np.ndarray, p: np.ndarray, charges_level: np.ndarray, width: float = 0.0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Production argmax of (quantile_bp + width + charges) x p for each request, solved once per distinct charge level. Verbatim from the lab."""
+    c = np.asarray(charges_level, dtype=float); ok = np.isfinite(c)
+    ob, op, ou = np.full(len(c), np.nan), np.full(len(c), np.nan), np.full(len(c), np.nan)
+    if not ok.any():
+        return ob, op, ou
+    uc, inv = np.unique(c[ok], return_inverse=True)
+    base = qbp + width; step = max(1, BT_MAX_CELLS // max(len(qbp), 1)); best = np.empty(len(uc), dtype=np.int64)
+    for s in range(0, len(uc), step):
+        best[s:s + step] = np.argmax((base[None, :] + uc[s:s + step, None]) * p[None, :], axis=1)
+    bi = best[inv]
+    ob[ok], op[ok], ou[ok] = qbp[bi], p[bi], (base[bi] + c[ok]) * p[bi]
+    return ob, op, ou
+
+
+def bt_replay(frame: pd.DataFrame, curves: dict, width: float = 0.0, charges_col: str = 'charges_level') -> pd.DataFrame:
+    out = np.full((len(frame), 3), np.nan); ch = frame[charges_col].to_numpy(float)
+    groups = pd.DataFrame({'f': frame['pfill_file'].to_numpy(), 'k': frame['pfill_key'].to_numpy()}).groupby(['f', 'k'], sort=False).indices
+    for (lab, key), rows in groups.items():
+        cur = curves.get(lab, {}).get(key)
+        if cur is not None:
+            out[rows] = np.column_stack(bt_optimize(cur[0], cur[1], ch[rows], width))
+    return pd.DataFrame(out, index=frame.index, columns=['bt_opt_bp', 'bt_pfill', 'bt_util'])
+
+
+def bt_gate(frame: pd.DataFrame, by: str = 'month') -> pd.DataFrame:
+    d_bp = (frame['bt_opt_bp'] - frame['optimalQuantileBp']).abs(); d_pf = (frame['bt_pfill'] - frame['pfill']).abs()
+    g = pd.DataFrame({by: frame[by].to_numpy(), 'key_found': frame['bt_opt_bp'].notna().to_numpy(), 'bp_ok': (d_bp <= BT_TOL_BP).to_numpy(), 'pf_ok': (d_pf <= BT_TOL_PF).to_numpy(), 'd_bp': d_bp.to_numpy()})
+    g['both_ok'] = g['bp_ok'] & g['pf_ok']
+    t = g.groupby(by).agg(requests=('both_ok', 'size'), key_found=('key_found', 'mean'), bp_match=('bp_ok', 'mean'), pfill_match=('pf_ok', 'mean'), both_match=('both_ok', 'mean'), median_abs_d_bp=('d_bp', 'median'))
+    t['passes'] = t['both_match'] >= BT_GATE; return t
+
+
+# ---- the switch to the call-structure pfill keys: first date from which every non-cpn3 key carries a call token
+_nc = BT0[~BT0['pfill_key'].str.startswith('cpn3')]
+_share = _nc.groupby('date')['pfill_key'].apply(lambda s: float(s.str.contains('call').mean()))
+_ok = (_share >= 0.99).astype(int)[::-1].cummin()[::-1].astype(bool)
+BT_START = pd.Timestamp(globals().get('BT_START_OVERRIDE') or (_ok[_ok].index.min() if _ok.any() else CFG.first_oos_date))
+BT = BT0[BT0['date'] >= BT_START].reset_index(drop=True)
+BT['pfill_file'] = bt_file_label(BT['date']); BT['charges_level'] = -(BT['manualcharges'] + BT['liquiditycharge'] + BT['riskcharge']); BT['month'] = BT['date'].dt.to_period('M').astype(str)
+BT['week'] = BT['date'].dt.to_period('W').dt.start_time
+BT_CURVES = bt_load_pfills(BT_PFILL_DIR, [f for f, _ in BT_PFILL_SCHEDULE])
+print(f'replay window {BT_START.date()} .. {BT["date"].max().date()}: {len(BT):,} requests | by pfill file {BT["pfill_file"].value_counts().sort_index().to_dict()}')
+_pf_sig = {f: (BT_PFILL_DIR / f'pfills_{f}.json').stat().st_size for f, _ in BT_PFILL_SCHEDULE}
+_rep = cached('rfq_replay', lambda: bt_replay(BT, BT_CURVES), deps=[frame_fingerprint(BT, ['signalyield', 'optimalQuantileBp', 'charges_level', 'pfill']), str(BT_START.date()), BT_PFILL_SCHEDULE, _pf_sig], code=[bt_optimize, bt_replay, bt_load_pfills, bt_file_label])
+BT[['bt_opt_bp', 'bt_pfill', 'bt_util']] = _rep[['bt_opt_bp', 'bt_pfill', 'bt_util']].to_numpy()
+BT['bt_optyield'] = BT['signalyield'] + BT['bt_opt_bp'] / 100.0; BT['adj_yield'] = BT['finalquoteyield'] - BT['optimalyield']
+bt_gate_month = bt_gate(BT, 'month'); BT_REPLAY_PASS = bool(bt_gate_month['passes'].all())
+print(f'Replay gate (|d optimal concession| <= {BT_TOL_BP} bp and |d pfill| <= {BT_TOL_PF} on >= {BT_GATE:.0%} of requests), by month:'); display(bt_gate_month.round(4))
+BT['cover_px'] = pd.to_numeric(BT['cover_price_value'], errors='coerce').fillna(pd.to_numeric(BT['effective_cover_price'], errors='coerce'))
+BT['won_cover'] = BT['cover_px'].notna(); BT['won_logged'] = bt_flag(BT['algo_won']); BT['manual'] = np.zeros(len(BT), bool)
+for _c in ('manual_takeover', 'is_manual_mode'):
+    if _c in BT:
+        BT['manual'] |= bt_flag(BT[_c])
+BT['print_type'] = BT['msrb_tradetype'].astype('string').str.upper().fillna('none')
+record('replay', start=str(BT_START.date()), requests=int(len(BT)), passes=BT_REPLAY_PASS, gate=flat_records(bt_gate_month))
+print(f'[5-1] replay {"PASS" if BT_REPLAY_PASS else "FAIL"} | {time.perf_counter() - _r_t0:.0f}s')
+
+# %%
+CELL_T('5. The replay: outcomes and the win rule [2]')
+from pandas.tseries.holiday import AbstractHolidayCalendar, GoodFriday, USFederalHolidayCalendar  # noqa: E402
+BT_PRICING_HOST = 'http://3kmu-r-app-s01:8080'; BT_PRICING_CACHE = ARTIFACTS / 'pricing_cache.parquet'; BT_PRICING_BATCH = 250
+BT_EPS_BP = 1e-6; BT_GROUPS = ['won, cover', 'won, no cover', 'lost, printed', 'lost, print not winner', 'no print']; BT_WINNABLE = ['won, cover', 'won, no cover', 'lost, printed']
+
+
+class _BondCalendar(AbstractHolidayCalendar):
+    rules = USFederalHolidayCalendar.rules + [GoodFriday]
+
+
+BT_BDAY = pd.offsets.CustomBusinessDay(calendar=_BondCalendar())
+
+
+def bt_settle(dates: pd.Series, lag: int = CFG.settle_lag) -> pd.Series:
+    d = pd.to_datetime(dates).dt.normalize(); u = pd.Series(pd.DatetimeIndex(d.unique())); return d.map(dict(zip(u, u + BT_BDAY * lag))).dt.strftime('%Y-%m-%d')
+
+
+def _bt_post(sess, endpoint: str, chunk: pd.DataFrame) -> list[dict]:
+    import requests  # noqa: F401  (the desk's network only)
+
+    def _call(rows: pd.DataFrame) -> dict:
+        r = sess.post(f'{BT_PRICING_HOST}/{endpoint}', json={'pricingInputs': [{'cusip': c, 'inputValue': float(v), 'settleDate': s} for c, v, s in zip(rows['cusip'], rows['value'], rows['settle'])]}, timeout=60)
+        r.raise_for_status(); d = r.json()
+        if not d.get('pricingStatus'):
+            raise RuntimeError(d.get('pricingFailureReason') or 'pricingStatus false')
+        return d.get('pricingResponse') or {}
+    try:
+        resp = _call(chunk)
+    except Exception:  # noqa: BLE001
+        resp = {}
+        for _, row in chunk.iterrows():
+            try:
+                resp.update(_call(row.to_frame().T))
+            except Exception as exc:  # noqa: BLE001
+                resp[row['cusip']] = {'_error': str(exc)[:200]}
+    return [{'endpoint': endpoint, 'cusip': c, 'value': v, 'settle': s, 'price': x.get('price'), 'yield': x.get('yield'), 'dv01': x.get('dv01'), 'status': x.get('_error', 'ok')}
+            for c, v, s in zip(chunk['cusip'], chunk['value'], chunk['settle']) for x in [resp.get(c, {'_error': 'missing from response'})]]
+
+
+def bt_pricing(endpoint: str, req: pd.DataFrame) -> pd.DataFrame:
+    """price2yield / yield2price for (cusip, value, settle) through the desk's pricing service, cached on disk. A PRICING_OVERRIDE global (a function with the
+    same signature) replaces the service, for a run away from the desk's network."""
+    req = req.assign(cusip=req['cusip'].astype(str), value=pd.to_numeric(req['value'], errors='coerce').round(6)).dropna(subset=['value']).drop_duplicates(['cusip', 'value', 'settle'])
+    if callable(globals().get('PRICING_OVERRIDE')):
+        return globals()['PRICING_OVERRIDE'](endpoint, req)
+    cache = pd.read_parquet(BT_PRICING_CACHE) if BT_PRICING_CACHE.exists() else pd.DataFrame(columns=['endpoint', 'cusip', 'value', 'settle', 'price', 'yield', 'dv01', 'status'])
+    have = cache.loc[cache['endpoint'] == endpoint, ['cusip', 'value', 'settle']]
+    todo = req.merge(have, on=['cusip', 'value', 'settle'], how='left', indicator=True); todo = todo[todo['_merge'] == 'left_only'].drop(columns='_merge')
+    if len(todo):
+        import requests  # noqa: E402
+        t0 = time.perf_counter(); sess = requests.Session(); sess.trust_env = False; rows = []; todo = todo.assign(_k=todo.groupby('cusip').cumcount())
+        for _, g in todo.groupby('_k'):
+            for s in range(0, len(g), BT_PRICING_BATCH):
+                rows += _bt_post(sess, endpoint, g.iloc[s:s + BT_PRICING_BATCH])
+        cache = pd.concat([cache, pd.DataFrame(rows)], ignore_index=True); cache.to_parquet(BT_PRICING_CACHE, index=False)
+        print(f'  pricing service {endpoint}: {len(rows):,} new inputs in {time.perf_counter() - t0:.0f}s, {sum(r["status"] != "ok" for r in rows):,} failed')
+    return req.merge(cache[cache['endpoint'] == endpoint].drop(columns='endpoint'), on=['cusip', 'value', 'settle'], how='left')
+
+
+def bt_price_to_yield(frame: pd.DataFrame, price_col: str, mask: pd.Series) -> np.ndarray:
+    q = frame.loc[mask, ['cusip', price_col, 'settle']].rename(columns={price_col: 'value'}).astype({'cusip': str}); q['value'] = pd.to_numeric(q['value'], errors='coerce').round(6)
+    r = bt_pricing('price2yield', q.dropna(subset=['value'])); out = np.full(len(frame), np.nan)
+    out[np.flatnonzero(mask.to_numpy())] = q.merge(r[['cusip', 'value', 'settle', 'yield']], on=['cusip', 'value', 'settle'], how='left')['yield'].to_numpy(float); return out
+
+
+def bt_thresholds(frame: pd.DataFrame) -> pd.DataFrame:
+    """Each request's group and street threshold yield; fixed by the logged outcome, independent of any variant."""
+    yl = frame['finalquoteyield'].to_numpy(float); yc = frame['cover_y'].to_numpy(float); ym = frame['msrb_yield'].to_numpy(float)
+    won = frame['won_logged'].to_numpy(bool); has_cover = won & np.isfinite(yc); printed = ~won & np.isfinite(ym)
+    grp = np.select([has_cover, won, printed & (ym < yl), printed], BT_GROUPS[:4], BT_GROUPS[4]); thr = np.select([has_cover, won, printed & (ym < yl)], [np.maximum(yc, yl), yl, ym], np.nan)
+    return pd.DataFrame({'group': grp, 'threshold_y': thr}, index=frame.index)
+
+
+def bt_outcomes(frame: pd.DataFrame, y_final) -> pd.DataFrame:
+    y = np.asarray(y_final, dtype=float); grp = frame['group'].to_numpy(); d_bp = 100.0 * (frame['threshold_y'].to_numpy(float) - y)
+    win = np.where(grp == 'lost, printed', d_bp > BT_EPS_BP, d_bp >= -BT_EPS_BP) & np.isfinite(d_bp)
+    return pd.DataFrame({'group': grp, 'win': win, 'd_bp': d_bp, 'shift_bp': 100.0 * (y - frame['finalquoteyield'].to_numpy(float))}, index=frame.index)
+
+
+BT['settle'] = bt_settle(BT['date'])
+BT['cover_y'] = bt_price_to_yield(BT, 'cover_px', BT['won_cover']); BT = BT.join(bt_thresholds(BT))
+BT['y_vanilla'] = BT['bt_optyield'] + BT['adj_yield']; _ov = bt_outcomes(BT, BT['y_vanilla']); _won_rule = _ov['group'].isin(['won, cover', 'won, no cover'])
+BT_VANILLA_PASS = bool((_ov['win'] == _won_rule).all() and (_won_rule == BT['won_logged']).all())
+BT['winnable'] = BT['group'].isin(BT_WINNABLE); BT['y_trade'] = np.where(_won_rule, BT['finalquoteyield'], np.where(BT['group'] == 'lost, printed', BT['msrb_yield'], np.nan))
+_sum = _ov.assign(manual=BT['manual']).groupby('group').agg(requests=('win', 'size'), share=('win', lambda s: len(s) / len(_ov)), wins=('win', 'mean'), manual=('manual', 'mean'), d_bp_median=('d_bp', 'median'), d_bp_p90=('d_bp', lambda s: s.quantile(0.9)))
+print('The requests by outcome group (d = threshold yield - our final yield in bp: on cover wins the bp left on the table, on lost printed requests the bp short of the print):'); display(_sum.round(3))
+print(f'the replayed quote reproduces the logged win / loss on every request: {BT_VANILLA_PASS} | winnable requests {BT["winnable"].mean():.1%} | logged win rate {BT["won_logged"].mean():.2%} | manual requests {BT["manual"].mean():.1%}')
+assert BT_REPLAY_PASS and BT_VANILLA_PASS, 'production not reproduced: nothing below is comparable'
+_ch_m = BT[BT['winnable']].groupby('month').agg(**{'manual (median bp)': ('manualcharges', 'median'), 'manual (mean bp)': ('manualcharges', 'mean'), 'liquidity (median bp)': ('liquiditycharge', 'median'), 'risk (median bp)': ('riskcharge', 'median'),
+                                                   'win rate': ('won_logged', 'mean'), 'concession x* (median bp)': ('optimalQuantileBp', 'median')})
+print('The charges production applied, by month (winnable requests), with the win rate and the median optimal concession:'); display(_ch_m.round(3))
+fig, ax = plt.subplots(1, 3, figsize=(19, 4.5))
+_ch_m[['manual (median bp)', 'liquidity (median bp)', 'risk (median bp)']].plot.bar(ax=ax[0], color=[C_RED, C_BLUE, C_GREEN]); ax[0].set_title('Production\'s charges by month (median bp of yield)', fontsize=10); ax[0].set_xlabel('')
+_d = _ov.loc[_ov['group'] == 'won, cover', 'd_bp']; ax[1].hist(_d.clip(0, 30), bins=60, color=C_BLUE); ax[1].axvline(_d.median(), color='k', ls='--', lw=0.8, label=f'median {_d.median():.1f} bp'); ax[1].legend(fontsize=8)
+ax[1].set_xlabel('bp left on the table against the cover (clipped at 30)'); ax[1].set_title('Cover wins: how much we won by', fontsize=10)
+_x = BT.loc[BT['winnable'], 'optimalQuantileBp']; ax[2].hist(_x.clip(-10, 40), bins=50, color=C_GREEN); ax[2].set_xlabel('optimal concession x* (bp above the model mid)'); ax[2].set_title('The concession production chose, winnable requests', fontsize=10)
+savefig('05_requests')
+record('replay', vanilla_pass=BT_VANILLA_PASS, groups=flat_records(_sum), charges_by_month=flat_records(_ch_m))
+print(f'[5-2] {time.perf_counter() - _r_t0:.0f}s')
+
+# %% [markdown]
+# ## 6. What a win is worth: the exits and the realised round trips
+#
+# A win is valued at the level it traded plus the move to an exit: `P&L = 100 (y_quote - y_trade) + M`, with the markout `M = 100 (y_trade - y_exit)`
+# a property of the request (the same for every quoting policy), so a policy's P&L differs from production's only through which requests it wins and
+# at what price. Three exits, all fixed before scoring, none of them a model fitted to the policy:
+#
+# - **the comparable-bond exit (the exit of record here)**: the bond's last evaluated close before the request is the anchor; the exit level is the
+#   median deviation from their own anchors of the P prints (customer sells to a dealer, the side the desk exits on) of the bonds in the same bucket
+#   of coupon bin x call structure x rating group x tenor bucket over the next five business days. It exists on most winnable requests and does not
+#   need the bond to print. In the lab it was the circularity guard beside the IPCA-peer exit; the two agree to within a bp of MAE against the own print;
+# - **the own other-side print**: the bond's own last print on the other side of the trade within five business days (the lab's Section 14 exit;
+#   carries the bid-offer, exists on fewer requests);
+# - **the common markout**: a new win is valued at the day's median markout over the winnable requests, not at its own, so a policy that merely
+#   picks up fills with lucky exits gets no credit.
+#
+# And the **realised round trip from WFTrade**: production's wins matched to the desk's AM60 buy lots, consumed first-in first-out by the later sales,
+# `100 (buy yield - sale yield)`. It is the one exit that is a real trade; it exists only where the desk sold, and only for production's own fills, so it
+# validates the modeled exits rather than scoring the variants.
+
+# %%
+CELL_T('6. Exits: the print tape, the other-side exit, DV01 [1]')
+_e_t0 = time.perf_counter()
+BT_H_RECORD = CFG.h_record; BT_EXIT_TYPES = {'P': 'customer sells to a dealer', 'D': 'inter-dealer', 'S': 'customer buys from a dealer'}; BT_EXIT_SIDES = {'P': ('S', 'D'), 'S': ('P', 'D'), 'D': ('P', 'S')}
+
+
+def bt_tape(raw: pd.DataFrame) -> pd.DataFrame:
+    t = pd.DataFrame({'cusip': raw['cusip'].astype(str).str.strip(), 'ts': to_ns(raw['tradetime']), 'type': raw['tradetype'].astype(str).str.upper().str[0], 'y': pd.to_numeric(raw['yield'], errors='coerce')}).dropna()
+    t = t[t['type'].isin(list(BT_EXIT_TYPES))]; day = t['ts'].dt.normalize(); med = t.groupby(day)['y'].transform('median'); mad = (t['y'] - med).abs().groupby(day).transform('median')
+    keep = (t['y'] - med).abs() <= CFG.yield_mad_k * mad
+    return t[keep].sort_values('ts').reset_index(drop=True)
+
+
+def bt_exits(frame: pd.DataFrame, tape: pd.DataFrame, horizons=(BT_H_RECORD,), types=tuple(BT_EXIT_TYPES)) -> pd.DataFrame:
+    """Per request, horizon and print type: the yield and time of the bond's last print of that type after max(request time, matched trade time) and up to the end of the h-th business day."""
+    q = pd.DataFrame({'_i': np.arange(len(frame)), 'cusip': frame['cusip'].astype(str).to_numpy(), 'start': np.maximum(to_ns(frame['rfq_received_time']).fillna(frame['date']).to_numpy(), to_ns(frame['msrb_tradetime']).fillna(pd.Timestamp(0)).to_numpy())})
+    d = pd.to_datetime(frame['date']).dt.normalize().to_numpy(); out = {}
+    for h in horizons:
+        q['cut'] = (pd.DatetimeIndex(d) + BT_BDAY * (h - 1) + pd.Timedelta(days=1)).astype('datetime64[ns]'); qs = q.sort_values('cut')
+        for tp in types:
+            j = pd.merge_asof(qs, tape.loc[tape['type'] == tp, ['cusip', 'ts', 'y']], left_on='cut', right_on='ts', by='cusip', direction='backward', allow_exact_matches=False)
+            ok = (j['ts'] > j['start']).to_numpy(); ii = j['_i'].to_numpy(); y_, t_ = np.full(len(frame), np.nan), np.full(len(frame), np.datetime64('NaT'), dtype='datetime64[ns]')
+            y_[ii[ok]] = j['y'].to_numpy(float)[ok]; t_[ii[ok]] = j['ts'].to_numpy()[ok]; out[f'yx_{h}_{tp}'] = y_; out[f'tx_{h}_{tp}'] = t_
+    return pd.DataFrame(out, index=frame.index)
+
+
+def bt_side_exit(frame: pd.DataFrame, h: int) -> tuple[np.ndarray, np.ndarray]:
+    tps = list(BT_EXIT_TYPES); tt = frame['print_type'].astype(str).to_numpy()
+    Y = np.column_stack([frame[f'yx_{h}_{tp}'].to_numpy(float) for tp in tps]); T = np.column_stack([frame[f'tx_{h}_{tp}'].to_numpy('datetime64[ns]') for tp in tps])
+    ok = ~np.isnat(T) & np.column_stack([np.isin(tt, [t for t, s in BT_EXIT_SIDES.items() if tp in s]) for tp in tps])
+    j = np.where(ok, T.astype('int64'), np.iinfo(np.int64).min).argmax(axis=1); has = ok.any(axis=1); r = np.arange(len(frame))
+    return np.where(has, Y[r, j], np.nan), np.where(has, np.array(tps)[j], 'none')
+
+
+BT_TAPE = bt_tape(msrb_raw)
+_ex = cached('rfq_exits', lambda: bt_exits(BT, BT_TAPE), deps=[frame_fingerprint(BT[['finalquoteyield', 'msrb_yield', 'date']]), len(BT_TAPE), float(BT_TAPE['y'].sum())], code=[bt_exits, bt_tape], cfg=('h_record', 'yield_mad_k'))
+BT = BT.drop(columns=[c for c in _ex.columns if c in BT.columns]).join(_ex.set_index(BT.index))
+BT['yx_X'], BT['xtype'] = bt_side_exit(BT, BT_H_RECORD); BT['M_other'] = 100.0 * (BT['y_trade'] - BT['yx_X'])
+# DV01 per 100 par at the logged final yield, one call per (bond, settle) of the winnable requests
+_dq = BT.loc[BT['winnable'], ['cusip', 'settle', 'finalquoteyield']].astype({'cusip': str}).groupby(['cusip', 'settle'], as_index=False)['finalquoteyield'].median().rename(columns={'finalquoteyield': 'value'})
+_dv = bt_pricing('yield2price', _dq); _dv = _dq.assign(value=_dq['value'].round(6)).merge(_dv[['cusip', 'value', 'settle', 'dv01']], on=['cusip', 'value', 'settle'], how='left')
+BT['dv01'] = pd.to_numeric(BT[['cusip', 'settle']].astype({'cusip': str}).merge(_dv[['cusip', 'settle', 'dv01']], on=['cusip', 'settle'], how='left')['dv01'], errors='coerce').to_numpy()
+BT['usd_per_bp'] = pd.to_numeric(BT['quantity'], errors='coerce') / 100.0 * BT['dv01']
+print(f'print tape {len(BT_TAPE):,} prints | own other-side exit within {BT_H_RECORD} business days on {BT.loc[BT["winnable"], "M_other"].notna().mean():.1%} of winnable requests | '
+      f'DV01 priced on {BT.loc[BT["winnable"], "usd_per_bp"].notna().mean():.1%}; $ per bp of a fill: median {BT.loc[BT["winnable"], "usd_per_bp"].median():.2f} | {time.perf_counter() - _e_t0:.0f}s')
+
+# %%
+CELL_T('6. Exits: the comparable-bond exit of record, the common markout [2]')
+_e2_t0 = time.perf_counter()
+EX_MIN_PRINTS, EX_DEV_CLIP = 3, 300.0; EX_BINS = np.arange(-EX_DEV_CLIP, EX_DEV_CLIP + 1.0, 1.0); EX_NBIN = len(EX_BINS) - 1
+_TEN_EDGES, _TEN_LABELS = [0, 1.5, 2.5, 3.5, 4.5, 7.5, 9.5, 15.5, 20.5, np.inf], ['1y', '2y', '3y', '4y', '5-7y', '8-9y', '10-15y', '16-20y', '21y+']
+N = len(BT); _pb_days = pd.DatetimeIndex(sorted(set(pd.bdate_range(BT_START, BT['date'].max() + pd.Timedelta(days=30), freq=BT_BDAY)) | set(BT['date'].dt.normalize().unique()))); _pb_nd = len(_pb_days)   # the desk's business days, plus any request date the calendar missed
+_pb_di = _pb_days.get_indexer(BT['date'].dt.normalize()); assert (_pb_di >= 0).all(), 'request dates outside the business-day index'
+
+
+def last_row_before(dates: np.ndarray, cusips: np.ndarray, source: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    """Per (date, cusip), the source's last row for the cusip strictly before the date (NaN where none)."""
+    cols = [c for c in cols if c in source.columns]; s = source[['cusip', 'date'] + cols].copy(); s['cusip'] = s['cusip'].astype(str); s['date'] = to_ns(s['date']).dt.normalize()
+    s = s.dropna(subset=['date']).sort_values('date', kind='stable')
+    q = pd.DataFrame({'cusip': np.asarray(cusips).astype(str), 'date': to_ns(pd.Series(dates)).to_numpy(), '_i': np.arange(len(cusips))}).sort_values('date', kind='stable')
+    j = pd.merge_asof(q, s, on='date', by='cusip', direction='backward', allow_exact_matches=False)
+    return j.sort_values('_i').drop(columns=['_i', 'cusip', 'date']).reset_index(drop=True)
+
+
+def ex_rating_group(score: np.ndarray) -> np.ndarray:
+    s = np.asarray(score, float); return np.where(s >= 21, 'AAAs', np.where(s >= 18, 'AAs', np.where(s >= 15, 'As', np.where(np.isfinite(s), 'BBBs', 'NR'))))
+
+
+def ex_coupon_bin(cpn: np.ndarray) -> np.ndarray:
+    c = np.asarray(cpn, float); return np.where(c < 4, 'cpn3', np.where(c < 5, 'cpn4', np.where(np.isfinite(c), 'cpn5', 'cpnNA')))
+
+
+def ex_call_structure(is_call: np.ndarray, call_date, mat_date, cpn: np.ndarray, yld: np.ndarray, date) -> np.ndarray:
+    ptc = np.asarray(is_call, bool) & pd.notna(call_date).to_numpy() & (pd.to_datetime(call_date) > pd.to_datetime(date)).to_numpy() & (np.nan_to_num(np.asarray(cpn, float), nan=-1.0) > np.asarray(yld, float))
+    ext = ((pd.to_datetime(mat_date) - pd.to_datetime(call_date)).dt.days / 365.25).to_numpy(float); ptc = ptc & (np.nan_to_num(ext) > 0.5)
+    return np.where(ptc, 'priced-to-call', np.where(np.asarray(is_call, bool), 'callable, to maturity', 'bullet'))
+
+
+def ex_tenor_bucket(years: np.ndarray) -> np.ndarray:
+    return pd.cut(pd.Series(np.asarray(years, float)), _TEN_EDGES, labels=_TEN_LABELS).astype(str).replace('nan', 'NA').to_numpy()
+
+
+def _chars_of(req: pd.DataFrame, dates: pd.Series, anchor: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """(coupon bin, call structure, rating group, years to maturity) of bonds from their last panel row before the date."""
+    mat = pd.to_datetime(pd.to_numeric(req['maturity'], errors='coerce'), unit='ms', errors='coerce')
+    if mat.isna().mean() > 0.5:
+        mat = pd.to_datetime(req['maturity'], errors='coerce')
+    call = pd.to_datetime(req['nxt_call_dt'], errors='coerce'); is_call = req['callable'].astype('string').str.upper().isin(['Y', 'YES', 'TRUE', '1']).fillna(False).to_numpy(bool); cpn = pd.to_numeric(req['cpn'], errors='coerce').to_numpy(float)
+    score = clean_rating(req['final_comp_rating']).fillna(clean_rating(req['comp_rating'])).map(RATING_SCALE).astype(float).to_numpy() if 'final_comp_rating' in req else np.full(len(req), np.nan)
+    return ex_coupon_bin(cpn), ex_call_structure(is_call, call, mat, cpn, anchor, dates), ex_rating_group(score), ((mat - pd.to_datetime(dates).reset_index(drop=True)).dt.days / 365.25).to_numpy(float)
+
+
+_rp_cols = ['closing_yield', 'maturity', 'cpn', 'callable', 'nxt_call_dt', 'final_comp_rating', 'comp_rating', 'modified_duration_lag1']
+_ex_req = last_row_before(BT['date'].to_numpy('datetime64[ns]'), BT['cusip'].astype(str).to_numpy(), raw_panel, _rp_cols)
+BT_ANCHOR = pd.to_numeric(_ex_req['closing_yield'], errors='coerce').to_numpy(float)
+_tape = BT_TAPE[BT_TAPE['type'].isin(['P', 'D'])].reset_index(drop=True); _tape['date'] = _tape['ts'].dt.normalize().astype('datetime64[ns]')
+_tp_req = last_row_before(_tape['date'].to_numpy('datetime64[ns]'), _tape['cusip'].astype(str).to_numpy(), raw_panel, _rp_cols)
+_tape['anchor'] = pd.to_numeric(_tp_req['closing_yield'], errors='coerce').to_numpy(float); _tape['dev'] = 100.0 * (_tape['y'].to_numpy(float) - _tape['anchor'].to_numpy(float))
+_tape['di'] = _pb_days.searchsorted(_tape['date'].to_numpy('datetime64[ns]'), side='left')
+_tp_keep = (np.isfinite(_tape['dev']) & (_tape['dev'].abs() <= EX_DEV_CLIP) & (_tape['di'] < _pb_nd)).to_numpy() & (np.asarray(_pb_days)[np.minimum(_tape['di'].to_numpy(), _pb_nd - 1)] == _tape['date'].to_numpy())
+_tape = _tape[_tp_keep].reset_index(drop=True); _tp_req = _tp_req[_tp_keep].reset_index(drop=True)
+_tp_cb, _tp_cs, _tp_rg, _tp_yrs = _chars_of(_tp_req, _tape['date'], _tape['anchor'].to_numpy())
+_tape['bucket'] = np.char.add(np.char.add(np.char.add(_tp_cb.astype(str), '|' + _tp_cs.astype(str)), '|' + _tp_rg.astype(str)), '|' + ex_tenor_bucket(_tp_yrs).astype(str))
+_rq_cb0, _rq_cs, _rq_rg0, _rq_yrs = _chars_of(_ex_req, BT['date'], BT_ANCHOR)
+_rq_cb = BT['pfill_key'].astype(str).str.extract(r'^(cpn\d)')[0].fillna(pd.Series(_rq_cb0, index=BT.index)).to_numpy(str)
+_rq_rg = np.where(clean_rating(BT['final_comp_rating']).notna(), ex_rating_group(clean_rating(BT['final_comp_rating']).map(RATING_SCALE).astype(float).to_numpy()), _rq_rg0)
+_rq_tb = np.where(BT['tenor_bucket'].notna(), BT['tenor_bucket'].astype(str).to_numpy(), ex_tenor_bucket(_rq_yrs))
+BT_BUCKET = np.char.add(np.char.add(np.char.add(_rq_cb.astype(str), '|' + _rq_cs.astype(str)), '|' + _rq_rg.astype(str)), '|' + _rq_tb.astype(str))
+BT['call_structure'] = _rq_cs; BT['mod_duration'] = pd.to_numeric(_ex_req['modified_duration_lag1'], errors='coerce').to_numpy(float)
+_bk_ids, _bk_names = pd.factorize(np.concatenate([_tape['bucket'].to_numpy(), BT_BUCKET])); _tape['bk'] = _bk_ids[:len(_tape)]; _rq_bk = _bk_ids[len(_tape):]
+
+
+def ex_bucket_levels(tape: pd.DataFrame, rq_bk: np.ndarray, rq_di: np.ndarray, h: int, side: str) -> tuple[np.ndarray, np.ndarray]:
+    """Median deviation of the bucket's prints of one side in (t, t + h business days], and the print count, by cumulative 1-bp histograms per bucket and day."""
+    t = tape[tape['type'] == side]; b = np.clip(np.digitize(t['dev'].to_numpy(float), EX_BINS) - 1, 0, EX_NBIN - 1)
+    H = np.zeros((len(_bk_names), _pb_nd + 1, EX_NBIN), dtype=np.int32); np.add.at(H, (t['bk'].to_numpy(), t['di'].to_numpy() + 1, b), 1); H = H.cumsum(1)
+    lvl, cnt = np.full(len(rq_bk), np.nan), np.zeros(len(rq_bk)); lo, hi = rq_di + 1, np.minimum(rq_di + h, _pb_nd - 1) + 1; ok = (rq_bk >= 0) & (lo <= _pb_nd - 1)
+    for s in range(0, len(rq_bk), 100_000):
+        r = np.flatnonzero(ok[s:s + 100_000]) + s
+        if not len(r):
+            continue
+        W = H[rq_bk[r], hi[r]] - H[rq_bk[r], lo[r]]; n = W.sum(1); C = W.cumsum(1); med = np.argmax(C >= np.ceil(n / 2.0)[:, None], axis=1)
+        lvl[r] = np.where(n >= EX_MIN_PRINTS, EX_BINS[med] + 0.5, np.nan); cnt[r] = n
+    return lvl, cnt
+
+
+_lvl_P, _cnt_P = ex_bucket_levels(_tape, _rq_bk, _pb_di, BT_H_RECORD, 'P')
+BT['M_rec'] = 100.0 * (BT['y_trade'].to_numpy(float) - BT_ANCHOR) - _lvl_P                      # the exit of record: comparable-bond, mark-to-P, h = 5
+_winable = BT['winnable'].to_numpy(bool)
+BT['M_common'] = pd.Series(np.where(_winable, BT['M_rec'], np.nan)).groupby(BT['date'].to_numpy()).transform('median').to_numpy(float)   # the day's common markout
+print(f'anchors on {np.isfinite(BT_ANCHOR[_winable]).mean():.1%} of winnable requests | {len(_bk_names):,} buckets | the exit of record exists on {BT.loc[_winable, "M_rec"].notna().mean():.1%} of winnable requests, '
+      f'the own other-side exit on {BT.loc[_winable, "M_other"].notna().mean():.1%}')
+_own = bt_exits(BT, BT_TAPE, horizons=(10,), types=('P',)); _own_dev = 100.0 * (_own['yx_10_P'].to_numpy(float) - BT_ANCHOR)
+_vb = _winable & np.isfinite(BT_ANCHOR) & np.isfinite(_lvl_P) & np.isfinite(_own_dev) & (np.abs(_own_dev) <= EX_DEV_CLIP)
+_e_ = _lvl_P[_vb] - _own_dev[_vb]
+print(f'validation of the exit of record against the bond\'s own P print within 10 business days ({_vb.sum():,} winnable requests): bias {_e_.mean():+.2f} bp, MAE {np.abs(_e_).mean():.2f} bp, '
+      f'slope {np.polyfit(_lvl_P[_vb], _own_dev[_vb], 1)[0]:.2f}, corr {np.corrcoef(_lvl_P[_vb], _own_dev[_vb])[0, 1]:.2f}')
+_mk = BT[_winable].groupby('month').agg(**{'exit of record coverage': ('M_rec', lambda s: s.notna().mean()), 'markout of record, mean (bp)': ('M_rec', 'mean'), 'common markout, mean (bp)': ('M_common', 'mean'), 'other-side exit, mean (bp)': ('M_other', 'mean')})
+print('Markouts by month on winnable requests, M = 100 (y_trade - y_exit), positive = the bond richened after the trade:'); display(_mk.round(3))
+record('exits', record='comparable-bond bucket, mark-to-P, h = 5', coverage_record=float(BT.loc[_winable, 'M_rec'].notna().mean()), coverage_other=float(BT.loc[_winable, 'M_other'].notna().mean()), validation_mae=float(np.abs(_e_).mean()), by_month=flat_records(_mk))
+print(f'[6-2] {time.perf_counter() - _e2_t0:.0f}s')
+
+# %%
+CELL_T('6. The realised round trips from WFTrade [3]')
+_w_t0 = time.perf_counter()
+RT_PAR_TOL = 0.25
+_wf = WF_BOOK.copy()
+for c_ in ('trade_number', 'cusip', 'side', 'amount', 'price', 'exec_date_ny'):
+    assert c_ in _wf.columns, f'WF_BOOK lacks {c_}'
+_wf['yield'] = pd.to_numeric(_wf['yield'], errors='coerce') if 'yield' in _wf else np.nan
+_wf['uncovered_par'] = pd.to_numeric(_wf['uncovered_par'], errors='coerce').fillna(0.0) if 'uncovered_par' in _wf else 0.0
+_wf['par_eff'] = np.where(_wf['side'].eq('ASK'), _wf['amount'] - _wf['uncovered_par'], _wf['amount'])
+_wf['ts'] = to_ns(_wf['execution_timestamp']) if 'execution_timestamp' in _wf else _wf['date']
+_wf = _wf.sort_values(['cusip', 'ts', 'trade_number'], kind='stable').reset_index(drop=True)
+
+
+def wf_fifo_pairs(f: pd.DataFrame) -> pd.DataFrame:
+    """(buy trade, sale trade, par) consumption pairs, first-in first-out within each CUSIP in execution order."""
+    rows = []; side = f['side'].to_numpy(); par = f['par_eff'].to_numpy(float); tn = f['trade_number'].to_numpy(); cus = f['cusip'].to_numpy()
+    start = np.r_[0, np.flatnonzero(cus[1:] != cus[:-1]) + 1, len(f)]
+    for a, b in zip(start[:-1], start[1:]):
+        q = []
+        for i in range(a, b):
+            if side[i] == 'BID':
+                if par[i] > 0:
+                    q.append([tn[i], par[i]])
+            else:
+                rem = par[i]
+                while rem > 1e-9 and q:
+                    take = min(rem, q[0][1]); rows.append((q[0][0], tn[i], take)); q[0][1] -= take; rem -= take
+                    if q[0][1] <= 1e-9:
+                        q.pop(0)
+    return pd.DataFrame(rows, columns=['buy_trade', 'sale_trade', 'par'])
+
+
+WF_PAIRS = wf_fifo_pairs(_wf); _buys = _wf[_wf['side'].eq('BID')].set_index('trade_number'); _sales = _wf[_wf['side'].eq('ASK')].set_index('trade_number')
+_pp = WF_PAIRS.join(_sales[['date', 'price', 'yield']].rename(columns={'date': 'sale_date', 'price': 'sale_price', 'yield': 'sale_yield'}), on='sale_trade').join(_buys[['date']].rename(columns={'date': 'buy_date'}), on='buy_trade')
+_pp['hold_bdays'] = np.busday_count(_pp['buy_date'].to_numpy('datetime64[D]'), _pp['sale_date'].to_numpy('datetime64[D]')); _w = _pp['par']
+_agg = _pp.assign(wp=_w * _pp['sale_price'], wy=_w * _pp['sale_yield'], wh=_w * _pp['hold_bdays'], wy_n=_w * np.isfinite(_pp['sale_yield'])).groupby('buy_trade').agg(sold_par=('par', 'sum'), wp=('wp', 'sum'), wy=('wy', 'sum'), wh=('wh', 'sum'), wy_n=('wy_n', 'sum'))
+WF_LOTS = _buys[['cusip', 'date', 'amount', 'par_eff', 'price', 'yield']].rename(columns={'date': 'buy_date', 'price': 'buy_price', 'yield': 'buy_yield'}).join(_agg, how='left')
+WF_LOTS['sold_par'] = WF_LOTS['sold_par'].fillna(0.0); _sp = WF_LOTS['sold_par'].where(WF_LOTS['sold_par'] > 0)
+WF_LOTS['exit_price'] = WF_LOTS['wp'] / _sp; WF_LOTS['exit_yield'] = WF_LOTS['wy'] / WF_LOTS['wy_n'].where(WF_LOTS['wy_n'] > 0); WF_LOTS['hold_bdays'] = WF_LOTS['wh'] / _sp
+WF_LOTS['roundtrip_bp'] = 100.0 * (WF_LOTS['buy_yield'] - WF_LOTS['exit_yield']); WF_LOTS['roundtrip_pts'] = WF_LOTS['exit_price'] - WF_LOTS['buy_price']
+WF_LOTS = WF_LOTS.drop(columns=['wp', 'wy', 'wh', 'wy_n']).reset_index().rename(columns={'trade_number': 'buy_trade'})
+
+
+def _mutual(c: pd.DataFrame, score: str, a: str, b: str) -> pd.DataFrame:
+    c = c.sort_values([score, a, b], kind='stable'); return c[c.groupby(a)[score].rank(method='first').eq(1) & c.groupby(b)[score].rank(method='first').eq(1)]
+
+
+def match_wins_to_fills(a: pd.DataFrame, b: pd.DataFrame, a_id: str, b_id: str) -> pd.DataFrame:
+    """One to one, wins a [a_id, cusip, date, par] to fills b [b_id, cusip, date, par]: same date and exact par, then the same date and the nearest par within RT_PAR_TOL, then exact par on an adjacent business day."""
+    a, b = a.dropna(subset=['par']).copy(), b.dropna(subset=['par']).copy(); a['k'] = a.groupby(['cusip', 'date', 'par']).cumcount(); b['k'] = b.groupby(['cusip', 'date', 'par']).cumcount()
+    m = [a.merge(b, on=['cusip', 'date', 'par', 'k'])[[a_id, b_id]].assign(tier='same date, exact par')]; done = pd.concat(m)
+    c = a[~a[a_id].isin(done[a_id])].drop(columns='k').merge(b[~b[b_id].isin(done[b_id])].drop(columns='k'), on=['cusip', 'date'], suffixes=('', '_wf')); c['gap'] = (c['par_wf'] / c['par'] - 1.0).abs()
+    m.append(_mutual(c[c['gap'] <= RT_PAR_TOL], 'gap', a_id, b_id)[[a_id, b_id]].assign(tier=f'same date, par within {RT_PAR_TOL:.0%}')); done = pd.concat(m)
+    c = a[~a[a_id].isin(done[a_id])].drop(columns='k').merge(b[~b[b_id].isin(done[b_id])].drop(columns='k'), on=['cusip', 'par'], suffixes=('', '_wf'))
+    c['bd'] = np.abs(np.busday_count(c['date'].to_numpy('datetime64[D]'), c['date_wf'].to_numpy('datetime64[D]')))
+    m.append(_mutual(c[c['bd'] == 1], 'bd', a_id, b_id)[[a_id, b_id]].assign(tier='adjacent business day, exact par'))
+    return pd.concat(m, ignore_index=True)
+
+
+_rq = BT.loc[BT['won_logged'], ['cusip', 'date', 'quantity', 'finalquoteyield']].reset_index(names='bt_row'); _rq['cusip'] = _rq['cusip'].astype(str); _rq['date'] = to_ns(_rq['date']).dt.normalize(); _rq['par'] = pd.to_numeric(_rq['quantity'], errors='coerce').round(0)
+_bl = WF_LOTS[['buy_trade', 'cusip', 'buy_date', 'amount']].rename(columns={'buy_date': 'date', 'amount': 'par'}); _bl['date'] = to_ns(_bl['date']).dt.normalize(); _bl['cusip'] = _bl['cusip'].astype(str); _bl['par'] = _bl['par'].round(0)
+WF_MATCH = match_wins_to_fills(_rq[['bt_row', 'cusip', 'date', 'par']], _bl, 'bt_row', 'buy_trade').merge(WF_LOTS, on='buy_trade', how='left').merge(_rq[['bt_row', 'finalquoteyield']], on='bt_row')
+_real_bp = np.full(N, np.nan); _rs = WF_MATCH[(WF_MATCH['sold_par'] > 0) & np.isfinite(WF_MATCH['roundtrip_bp'])]; _real_bp[_rs['bt_row'].to_numpy(int)] = _rs['roundtrip_bp'].to_numpy(float); BT['M_real'] = _real_bp
+_hold = _rs['hold_bdays'].to_numpy(float); _hold_wmed = float(np.interp(0.5, np.cumsum(_rs.sort_values('hold_bdays')['sold_par']) / _rs['sold_par'].sum(), _rs.sort_values('hold_bdays')['hold_bdays'])) if len(_rs) else np.nan
+print(f'AM60 buy lots {len(WF_LOTS):,}, closed in part or full {(WF_LOTS["sold_par"] > 0).mean():.1%} | won requests matched to a buy lot {len(WF_MATCH):,} of {len(_rq):,} ({WF_MATCH["tier"].value_counts().to_dict()}) | '
+      f'realised round trips on {len(_rs):,} requests: mean {_rs["roundtrip_bp"].mean():+.1f} bp, par-weighted median holding {_hold_wmed:.1f} business days (the exits use h = {BT_H_RECORD})')
+# ---- the modeled exits against the realised sale, on the same fills
+_vrows = []
+for nm, M in (('exit of record (comparable-bond, mark-to-P)', BT['M_rec'].to_numpy(float)), ('own other-side print', BT['M_other'].to_numpy(float)), ('common markout (day median)', BT['M_common'].to_numpy(float))):
+    ok = np.isfinite(M) & np.isfinite(_real_bp)
+    for seg, msk in (('all closed lots', ok), ('held <= 5 days', ok & np.isin(np.arange(N), _rs.loc[_rs['hold_bdays'] <= 5, 'bt_row'].astype(int)))):
+        if msk.sum() < 30:
+            continue
+        e = M[msk] - _real_bp[msk]
+        _vrows.append({'estimator': nm, 'fills': seg, 'n': int(msk.sum()), 'coverage of matched': float(ok[np.isfinite(_real_bp)].mean()), 'bias (bp)': float(e.mean()), 'MAE (bp)': float(np.abs(e).mean()), 'corr': float(np.corrcoef(M[msk], _real_bp[msk])[0, 1]), 'slope': float(np.polyfit(M[msk], _real_bp[msk], 1)[0])})
+EXIT_VAL = pd.DataFrame(_vrows).set_index(['estimator', 'fills'])
+print('The modeled exits against the realised round trip of production\'s own fills (target = 100 (buy yield - sale yield)); the comparable-bond exit should track the sale, not match the resale markup:'); display(EXIT_VAL.round(3))
+fig, ax = plt.subplots(1, 3, figsize=(19, 5))
+if len(_rs):
+    ax[0].hist(np.clip(_hold, 0, 120), bins=60, weights=_rs['sold_par'] / 1e6, color=C_BLUE); ax[0].axvline(BT_H_RECORD, color='k', ls='--', lw=0.8, label=f'exit horizon ({BT_H_RECORD})'); ax[0].axvline(_hold_wmed, color=C_RED, lw=1.0, label=f'par-weighted median ({_hold_wmed:.0f})')
+    ax[0].legend(fontsize=8); ax[0].set_xlabel('holding time, business days (clipped at 120)'); ax[0].set_ylabel('sold par ($mm)'); ax[0].set_title('How long the desk held production\'s fills', fontsize=10)
+    _ok = np.isfinite(BT['M_rec'].to_numpy(float)) & np.isfinite(_real_bp); _s = RNG.choice(np.flatnonzero(_ok), min(15000, int(_ok.sum())), replace=False) if _ok.any() else np.zeros(0, int)
+    ax[1].scatter(BT['M_rec'].to_numpy(float)[_s], _real_bp[_s], s=4, alpha=0.3, color=C_GREEN); ax[1].plot([-60, 60], [-60, 60], 'k--', lw=0.8); ax[1].set_xlim(-80, 80); ax[1].set_ylim(-120, 120)
+    ax[1].set_xlabel('exit of record: modeled markout (bp)'); ax[1].set_ylabel('realised round trip (bp)'); ax[1].set_title('The modeled exit against the real sale, same fills', fontsize=10)
+    _bym = _rs.assign(month=_rs['buy_date'].dt.to_period('M').astype(str)).groupby('month')['roundtrip_bp'].agg(['mean', 'median'])
+    _mrec = pd.Series(BT['M_rec'].to_numpy(float)[_rs['bt_row'].astype(int)]).groupby(_rs['buy_date'].dt.to_period('M').astype(str).to_numpy()).mean()
+    ax[2].plot(_bym.index, _bym['mean'], 'o-', color=C_BLUE, label='realised round trip, mean'); ax[2].plot(_bym.index, _bym['median'], 's--', color=C_BLUE, alpha=0.6, label='realised, median')
+    ax[2].plot(_mrec.index, _mrec.to_numpy(), 'o-', color=C_GREEN, label='exit of record on the same fills, mean'); ax[2].axhline(0, color='k', lw=0.5); ax[2].legend(fontsize=8); ax[2].set_title('By buy month (bp)', fontsize=10); ax[2].tick_params(axis='x', labelsize=8)
+savefig('06_exits')
+record('realised', lots=int(len(WF_LOTS)), matched=int(len(WF_MATCH)), closed=int(len(_rs)), hold_wmedian=_hold_wmed, validation=flat_records(EXIT_VAL), seconds=time.perf_counter() - _w_t0)
+print(f'[6-3] {time.perf_counter() - _w_t0:.0f}s')
+
+# %% [markdown]
+# ## 7. Replay against the desk: the replay's wins are the WFTrade fills; inventory and the book's P&L
+#
+# The replay is built from the RFQ log. The desk's inventory is built from WFTrade. If the two disagree, every statement about the book made from the
+# replay is suspect, so this section ties them: every replay win (the logged `algo_won` of the request frame, reproduced bit for bit in Section 5)
+# is matched one to one to the lifecycle-resolved AM60 BID fills of WFTrade, same CUSIP, New York date and par first, then the same date with the
+# nearest par within 25 percent, then exact par on an adjacent business day; read both ways, by month and by trade type; the fill's yield against the
+# replay's final quote yield on the matched pairs. Then inventory: the par the replay says the desk bought on each day and in each CUSIP against the par
+# WFTrade says it bought, and the end-of-window position each implies. Then the book's P&L since WFTrade inception, marked daily to the OneTick
+# closing marks: new position P&L = par / 100 x (closing mark - trade price) on buys and (trade price - closing mark) on sales at the first close on or
+# after the trade; position P&L = prior marked position / 100 x the change in the closing mark; carry (30/360) beside, not in the total.
+
+# %%
+CELL_T('7. Replay against the desk [1]')
+_pc_t0 = time.perf_counter()
+PC_START, PC_END = max(pd.Timestamp('2026-04-03'), BT_START), pd.Timestamp(BT['date'].max()).normalize()
+_rw = BT.loc[BT['won_logged'] & BT['date'].between(PC_START, PC_END), ['date', 'cusip', 'quantity', 'finalquoteyield']].reset_index(names='win_id')
+_rw['date'] = to_ns(_rw['date']).dt.normalize(); _rw['cusip'] = _rw['cusip'].astype(str); _rw['par'] = pd.to_numeric(_rw['quantity'], errors='coerce').round(0)
+_wb = WF_FILLS[WF_FILLS['side'].eq('BID')].copy(); _wb['date'] = to_ns(_wb['exec_date_ny']).dt.normalize(); _wb = _wb[_wb['date'].between(PC_START, PC_END)].reset_index(drop=True)
+_wb['cusip'] = _wb['cusip'].astype(str); _wb['par'] = pd.to_numeric(_wb['amount'], errors='coerce').round(0)
+for c_ in ('trade_type', 'trade_subtype'):
+    _wb[c_] = _wb[c_].astype('string').fillna('none') if c_ in _wb else 'none'
+PC_MATCH = match_wins_to_fills(_rw[['win_id', 'cusip', 'date', 'par']], _wb[['trade_number', 'cusip', 'date', 'par']], 'win_id', 'trade_number').merge(_rw[['win_id', 'finalquoteyield']], on='win_id').merge(_wb[['trade_number', 'yield', 'trade_type']], on='trade_number')
+PC_MATCH['yield diff (bp)'] = 100.0 * (pd.to_numeric(PC_MATCH['yield'], errors='coerce') - PC_MATCH['finalquoteyield'])
+_rw['matched'] = _rw['win_id'].isin(PC_MATCH['win_id']); _wb['matched'] = _wb['trade_number'].isin(PC_MATCH['trade_number'])
+
+
+def _pc_side(f: pd.DataFrame, idc: str) -> pd.DataFrame:
+    f = f.assign(month=f['date'].dt.to_period('M').astype(str), mpar=f['par'].where(f['matched'], 0.0))
+    g = f.groupby('month').agg(n=(idc, 'size'), par=('par', 'sum'), m=('matched', 'sum'), mpar=('mpar', 'sum')); g.loc['total'] = g.sum(); return g
+
+
+_gw, _gb = _pc_side(_rw, 'win_id'), _pc_side(_wb, 'trade_number')
+PC_MONTHLY = pd.DataFrame({'replay wins': _gw['n'], 'WFTrade BID fills': _gb['n'], 'wins found in WFTrade': _gw['m'] / _gw['n'], 'WFTrade bids explained by a replay win': _gb['m'] / _gb['n'],
+                           'replay win par ($mm)': _gw['par'] / 1e6, 'WFTrade BID par ($mm)': _gb['par'] / 1e6, 'win par found': _gw['mpar'] / _gw['par'], 'BID par explained': _gb['mpar'] / _gb['par']})
+PC_BY_TYPE = (_wb.groupby(['trade_type', 'trade_subtype']).agg(fills=('trade_number', 'size'), par=('par', 'sum'), explained=('matched', 'mean')).assign(par=lambda d: d['par'] / 1e6)
+              .rename(columns={'par': 'par ($mm)', 'explained': 'explained by a replay win'}).sort_values('fills', ascending=False))
+_dy = PC_MATCH['yield diff (bp)'].dropna()
+print(f'window {PC_START.date()} .. {PC_END.date()} | replay wins {len(_rw):,} (${_rw["par"].sum() / 1e6:,.1f}mm) | AM60 BID fills {len(_wb):,} (${_wb["par"].sum() / 1e6:,.1f}mm) | '
+      f'wins found in WFTrade {_rw["matched"].mean():.2%} | bids explained by a replay win {_wb["matched"].mean():.2%} | tiers {PC_MATCH["tier"].value_counts().to_dict()}')
+print(f'the traded level on matched pairs: WFTrade yield - replay final quote yield, median {_dy.median():+.3f} bp, |diff| <= 0.1 bp on {(_dy.abs() <= 0.1).mean():.1%}, <= 1 bp on {(_dy.abs() <= 1).mean():.1%}')
+print('Both directions by month:'); display(PC_MONTHLY.round(4))
+print('AM60 BID fills by WFTrade trade type (inter-dealer TRADER_TRADER fills are not RFQ wins):'); display(PC_BY_TYPE.round(4))
+# ---- inventory: what the replay implies the desk bought, by day and by CUSIP, against WFTrade
+_cust = ~_wb['trade_type'].astype(str).str.startswith('TRADER_TRADER')
+_dd = pd.concat({'replay wins': _rw.groupby('date')['par'].sum() / 1e6, 'WFTrade customer BID fills': _wb[_cust].groupby('date')['par'].sum() / 1e6}, axis=1, sort=True).fillna(0.0)
+_cc = pd.concat({'replay': _rw.groupby('cusip')['par'].sum() / 1e3, 'WFTrade': _wb[_cust].groupby('cusip')['par'].sum() / 1e3}, axis=1, sort=True).fillna(0.0)
+_cd = pd.concat({'replay': _rw.groupby(['cusip', 'date'])['par'].sum(), 'WFTrade': _wb[_cust].groupby(['cusip', 'date'])['par'].sum()}, axis=1, sort=True).fillna(0.0)
+PC_INV = pd.Series({'daily buy par, correlation': float(_dd.corr().iloc[0, 1]), 'daily buy par, replay / WFTrade': float(_dd['replay wins'].sum() / max(_dd['WFTrade customer BID fills'].sum(), 1e-9)),
+                    'CUSIP-days with a buy in both': float((_cd > 0).all(axis=1).mean()), 'CUSIP-days where the par agrees exactly': float(((_cd['replay'] == _cd['WFTrade']) & (_cd > 0).all(axis=1)).sum() / max((_cd > 0).any(axis=1).sum(), 1)),
+                    'CUSIPs bought, replay / WFTrade': float((_cc['replay'] > 0).sum() / max((_cc['WFTrade'] > 0).sum(), 1)), 'per-CUSIP cumulative buy par, correlation': float(_cc.corr().iloc[0, 1])}, name='value')
+print('Inventory agreement (customer fills; the replay\'s inventory is the sum of its wins):'); display(PC_INV.to_frame().round(4))
+# ---- the book's P&L, marked daily to the closing marks
+PC_BOOK = WF_BOOK
+_mk_raw, _ = mdp.load_closing_marks(PIPE, str((PC_START - pd.DateOffset(months=1)).date()), str(PC_END.date()))
+_mk = (_mk_raw.rename(columns={'CUSIP': 'cusip', 'DATE': 'date', 'PRICE': 'price'})[['date', 'cusip', 'price']].assign(cusip=lambda d: d['cusip'].astype(str), date=lambda d: to_ns(d['date']).dt.normalize(), price=lambda d: pd.to_numeric(d['price'], errors='coerce')).dropna(subset=['price']))
+_mk = _mk[_mk['cusip'].isin(set(PC_BOOK['cusip']))].sort_values(['cusip', 'date']).drop_duplicates(['cusip', 'date'], keep='last')
+_cpn = raw_panel.assign(cusip=raw_panel['cusip'].astype(str), cpn=pd.to_numeric(raw_panel['cpn'], errors='coerce')).dropna(subset=['cpn']).sort_values(['cusip', 'date']).drop_duplicates('cusip', keep='last').set_index('cusip')['cpn']
+_mk['cpn'] = _mk['cusip'].map(_cpn)
+_ev = PC_BOOK.groupby(['cusip', 'date'], sort=False).tail(1)[['cusip', 'date', 'pos_after']]
+_mk = pd.merge_asof(_mk.sort_values('date'), _ev.sort_values('date'), on='date', by='cusip', direction='backward').sort_values(['cusip', 'date']).reset_index(drop=True); _g = _mk.groupby('cusip', sort=False)
+_mk['pos_prev'] = _g['pos_after'].shift().fillna(0.0); _mk['position'] = (_mk['pos_prev'] / 100.0 * (_mk['price'] - _g['price'].shift())).fillna(0.0)
+
+
+def _d30360(a: pd.Series, b: pd.Series) -> np.ndarray:
+    d1 = a.dt.day.clip(upper=30).to_numpy(); d2 = b.dt.day.to_numpy(); d2 = np.where((d2 == 31) & (d1 == 30), 30, d2)
+    return 360 * (b.dt.year - a.dt.year).to_numpy() + 30 * (b.dt.month - a.dt.month).to_numpy() + (d2 - d1)
+
+
+_mk['carry'] = _mk['pos_prev'] / 100.0 * _mk['cpn'].fillna(0.0) * _d30360(_g['date'].shift().fillna(_mk['date']), _mk['date']) / 360.0
+_tr = (PC_BOOK.assign(eff_par=np.where(PC_BOOK['side'].eq('ASK'), PC_BOOK['amount'] - PC_BOOK['uncovered_par'], PC_BOOK['amount']), sgn=np.where(PC_BOOK['side'].eq('BID'), 1.0, -1.0))[['trade_number', 'cusip', 'side', 'date', 'price', 'eff_par', 'sgn']].sort_values('date').reset_index(drop=True))
+_mref = _mk[['cusip', 'date', 'price']].rename(columns={'date': 'mark_date', 'price': 'mark'}).sort_values('mark_date')
+_fw = pd.merge_asof(_tr, _mref, left_on='date', right_on='mark_date', by='cusip', direction='forward'); _bw = pd.merge_asof(_tr, _mref, left_on='date', right_on='mark_date', by='cusip', direction='backward')
+_tr['mark'] = _fw['mark'].fillna(_bw['mark']).to_numpy(); _tr['mark_date'] = _fw['mark_date'].fillna(_bw['mark_date']).to_numpy(); _tr['new position'] = _tr['sgn'] * _tr['eff_par'] / 100.0 * (_tr['mark'] - _tr['price'])
+_tr['bucket'] = np.where(_tr['side'].eq('ASK'), 'new position, sales', np.where(_tr['trade_number'].isin(PC_MATCH['trade_number']), 'new position, buys = replay wins', 'new position, other buys'))
+_new_cols = ['new position, buys = replay wins', 'new position, other buys', 'new position, sales']
+_e = _tr[_tr['date'].between(PC_START, PC_END)].groupby(['mark_date', 'bucket'])['new position'].sum().unstack(fill_value=0.0).reindex(columns=_new_cols, fill_value=0.0)
+PC_DAILY = _e.join(_mk[_mk['date'].between(PC_START, PC_END)].groupby('date')[['position', 'carry']].sum(), how='outer').fillna(0.0).sort_index(); PC_DAILY.index.name = 'date'
+PC_DAILY['new position'] = PC_DAILY[_new_cols].sum(axis=1); PC_DAILY['new position + position'] = PC_DAILY['new position'] + PC_DAILY['position']; PC_CUM = PC_DAILY.cumsum()
+_pm = PC_DAILY.groupby(PC_DAILY.index.to_period('M').astype(str)).sum() / 1e3; _pm.loc['total'] = _pm.sum(); PC_PNL_M = _pm[_new_cols + ['new position', 'position', 'new position + position', 'carry']]
+print(f'AM60 book P&L by month since {PC_START.date()} ($k; new position + position is the total, carry beside; marked to the closing marks on {len(_mk):,} CUSIP-days):'); display(PC_PNL_M.round(1))
+fig, ax = plt.subplots(2, 2, figsize=(18, 9))
+for c_, col in zip(_dd.columns, [C_BLUE, C_RED]):
+    ax[0, 0].plot(_dd.index, _dd[c_], lw=1.0, color=col, label=c_)
+ax[0, 0].set_ylabel('par ($mm)'); ax[0, 0].legend(fontsize=8); ax[0, 0].set_title(f'Daily par bought: the replay\'s wins and the desk\'s customer BID fills (correlation {PC_INV["daily buy par, correlation"]:.3f})', fontsize=10)
+_mo = PC_MONTHLY.drop(index='total'); _x = np.arange(len(_mo))
+ax[0, 1].bar(_x - 0.2, _mo['wins found in WFTrade'], 0.4, color=C_BLUE, label='replay wins found in WFTrade'); ax[0, 1].bar(_x + 0.2, _mo['WFTrade bids explained by a replay win'], 0.4, color=C_RED, label='WFTrade bids explained by a replay win')
+ax[0, 1].set_xticks(_x); ax[0, 1].set_xticklabels(_mo.index, fontsize=8); ax[0, 1].set_ylim(0, 1.05); ax[0, 1].legend(fontsize=8, loc='lower left'); ax[0, 1].set_title('Match rate by month (counts)', fontsize=10)
+_ccs = _cc[(_cc > 0).any(axis=1)]; ax[1, 0].scatter(_ccs['WFTrade'], _ccs['replay'], s=5, alpha=0.4, color=C_GREEN); _lim = float(np.nanmax(_ccs.to_numpy())) if len(_ccs) else 1.0
+ax[1, 0].plot([0, _lim], [0, _lim], 'k--', lw=0.8); ax[1, 0].set_xscale('symlog'); ax[1, 0].set_yscale('symlog'); ax[1, 0].set_xlabel('WFTrade: par bought per CUSIP ($k, symlog)'); ax[1, 0].set_ylabel('replay: par won per CUSIP ($k)')
+ax[1, 0].set_title(f'Inventory by CUSIP over the window: one point per bond (correlation {PC_INV["per-CUSIP cumulative buy par, correlation"]:.3f})', fontsize=10)
+for c_, st, lw in (('new position', '-', 1.2), ('position', '-', 1.2), ('new position + position', '-', 2.4), ('new position, buys = replay wins', '--', 1.0), ('carry', ':', 1.2)):
+    ax[1, 1].plot(PC_CUM.index, PC_CUM[c_] / 1e3, st, lw=lw, label=c_)
+ax[1, 1].axhline(0, color='k', lw=0.5); ax[1, 1].set_ylabel('$k'); ax[1, 1].legend(fontsize=8); ax[1, 1].set_title(f'AM60 book P&L cumulated since {PC_START.date()}, marked to the closing marks', fontsize=10)
+savefig('07_replay_vs_desk')
+_last = PC_CUM.iloc[-1]
+print(f'cumulated {PC_START.date()} .. {PC_CUM.index[-1].date()}: new position ${_last["new position"] / 1e3:,.0f}k (buys matched to replay wins ${_last["new position, buys = replay wins"] / 1e3:,.0f}k) + position ${_last["position"] / 1e3:,.0f}k = ${_last["new position + position"] / 1e3:,.0f}k | carry ${_last["carry"] / 1e3:,.0f}k')
+record('replay_vs_desk', window=[str(PC_START.date()), str(PC_END.date())], wins_found=float(_rw['matched'].mean()), bids_explained=float(_wb['matched'].mean()), yield_within_01bp=float((_dy.abs() <= 0.1).mean()),
+       monthly=flat_records(PC_MONTHLY), by_type=flat_records(PC_BY_TYPE), inventory={k: float(v) for k, v in PC_INV.items()}, pnl_monthly=flat_records(PC_PNL_M), cumulative={k: float(v) for k, v in _last.items()}, seconds=time.perf_counter() - _pc_t0)
+print(f'[7] {time.perf_counter() - _pc_t0:.0f}s')
+# %% [markdown]
+# ## 8. The width charge
+#
+# **From the band to the charge, in four steps.**
+#
+# 1. *The band at the request.* For the bond of each request, the conditional quantiles of Section 4 from the last close strictly before the request
+#    date (so nothing after the close enters). The markout is the mirror image of the yield move, `M = -dy`, so the quantile atoms are flipped.
+# 2. *From one day to the holding period.* The next-day band is too narrow for a fill held about a week. On production's wins in the months before the
+#    month being scored, the dispersion of the realised markout of record is compared with the model's: scale ratio `r = median |M - s med| /
+#    median width`, with `s` the slope of the markout on the model's median (the location, reported, not used by the charge). `W_i = r x` half the
+#    band from the 10th to the 90th percentile, in bp of yield. Walk-forward by month.
+# 3. *The scale.* `gamma = k / median W` on the first test month's winnable requests, so a bond of median width pays k bp; k is the one free number
+#    and the grid reads it.
+# 4. *The quote.* Production's own optimizer on production's own curve with `c - gamma W_i` in place of `c`; the requests without a band keep
+#    production's quote. The charge only adds, so the quote only widens.
+#
+# The variations: k; the lookup grid in place of the location-scale model; the total move in place of the residual (the band the hedge would remove
+# is then charged too); and the charge on every request through a walk-forward model of log width on the request's key group, size and tenor bucket,
+# manual class and the bond's trailing residual sd (the observed width kept where it exists), with gamma rescaled on that population's own median
+# (the v1.3 run scaled it on the covered bonds and over-widened).
+
+# %%
+CELL_T('8. The width charge: the band at the request, calibrated to the holding period [1]')
+_wc_t0 = time.perf_counter()
+BT_MONTHS = sorted(BT['month'].unique()); _n_first = BT.loc[BT['month'] == BT_MONTHS[0], 'date'].nunique()
+TEST_M = BT_MONTHS[2:] if _n_first < 10 and len(BT_MONTHS) > 2 else BT_MONTHS[1:]
+_month = BT['month'].to_numpy(); _winable = BT['winnable'].to_numpy(bool); _thr = BT['threshold_y'].to_numpy(float); _grp = BT['group'].astype(str).to_numpy()
+_m_sig, _adj, _ch = BT['signalyield'].to_numpy(float), BT['adj_yield'].to_numpy(float), BT['charges_level'].to_numpy(float)
+_man, _liq, _rsk = (BT[c].to_numpy(float) for c in ('manualcharges', 'liquiditycharge', 'riskcharge')); _c_base = -(_liq + _rsk)
+_y_tr = BT['y_trade'].to_numpy(float); _usd = BT['usd_per_bp'].to_numpy(float); _keys = BT['pfill_key'].astype(str).to_numpy(); _files = BT['pfill_file'].astype(str).to_numpy()
+_xlog = BT['optimalQuantileBp'].to_numpy(float); _wlog = BT['won_logged'].to_numpy(bool); _y_van = BT['y_vanilla'].to_numpy(float)
+_M_REC, _M_OTHER, _M_COMMON, _M_REAL = (BT[c].to_numpy(float) for c in ('M_rec', 'M_other', 'M_common', 'M_real'))
+_tm = np.isin(_month, TEST_M); _tmw = _tm & _winable; _tm_rows = np.flatnonzero(_tmw); _all = np.arange(N)
+_wk_code, _wk_levels = pd.factorize(pd.Series(BT['week'].to_numpy()), sort=True); _mo_code, _mo_levels = pd.factorize(pd.Series(_month), sort=True)
+_kgrp = np.array([(k.split('_')[0] if k.startswith('cpn3') else '_'.join(k.split('_')[:2])) for k in _keys], dtype=object)
+_man_r = np.round(_man * 2.0) / 2.0; _man_mode = {m: float(pd.Series(_man_r[(_month == m) & _winable]).mode().iloc[0]) for m in BT_MONTHS}; _man_modal = np.abs(_man_r - pd.Series(_month).map(_man_mode).to_numpy(float)) < 0.25
+
+
+def bt_opto(m, opt_bp) -> np.ndarray:
+    return np.asarray(m, float) + np.asarray(opt_bp, float) / 100.0
+
+
+def bt_final(opto, rows: np.ndarray | None = None) -> np.ndarray:
+    return np.asarray(opto, float) + (_adj if rows is None else _adj[rows])
+
+
+def bt_win_fast(rows: np.ndarray, y: np.ndarray) -> np.ndarray:
+    d = 100.0 * (_thr[rows] - y); return np.where(_grp[rows] == 'lost, printed', d > BT_EPS_BP, d >= -BT_EPS_BP) & np.isfinite(d)
+
+
+def requote(rows: np.ndarray, charges: np.ndarray, width: float = 0.0) -> np.ndarray:
+    """Production's optimizer on the rows' own curves with the given charge levels; optimal yields (NaN where the key is not in the file)."""
+    out = np.full(len(rows), np.nan); ch = np.asarray(charges, float)
+    for (f, k), ii in pd.DataFrame({'f': _files[rows], 'k': _keys[rows]}).groupby(['f', 'k'], sort=False).indices.items():
+        cur = BT_CURVES.get(f, {}).get(k)
+        if cur is not None:
+            out[ii] = bt_optimize(cur[0], cur[1], ch[ii], width)[0]
+    return bt_opto(_m_sig[rows], out)
+
+
+_w_van_all = bt_win_fast(_all, _y_van); assert (_w_van_all == _wlog).all()
+# ---- the band at the request: the bond-day quantiles from the last close strictly before the request date
+_qcols = [c for c in QBD.columns if c.startswith('q_')] if len(QBD) else []
+_qb = QBD[['cusip', 'date'] + _qcols].assign(cusip=lambda d: d['cusip'].astype(str), date=lambda d: to_ns(d['date'])).sort_values('date', kind='stable')
+_qr = pd.DataFrame({'bt_row': np.arange(N), 'cusip': BT['cusip'].astype(str).to_numpy(), 'date': to_ns(BT['date']).dt.normalize().to_numpy()}).sort_values('date', kind='stable')
+QREQ = pd.merge_asof(_qr, _qb, on='date', by='cusip', direction='backward', allow_exact_matches=False).sort_values('bt_row')[_qcols].reset_index(drop=True)
+_rsd = resid[['cusip', 'date', 'resid_sd']].assign(cusip=lambda d: d['cusip'].astype(str), date=lambda d: to_ns(d['date'])).sort_values('date', kind='stable')
+IDV = pd.merge_asof(_qr, _rsd, on='date', by='cusip', direction='backward', allow_exact_matches=False).sort_values('bt_row')['resid_sd'].to_numpy(float)
+print(f'test months {TEST_M[0]}..{TEST_M[-1]} ({len(TEST_M)}): {_tm.sum():,} requests, {_tmw.sum():,} winnable | a band exists on {np.isfinite(QREQ["q_residual_ls_50"].to_numpy(float))[_tmw].mean():.1%} of test winnable requests, '
+      f'the trailing residual sd on {np.isfinite(IDV[_tmw]).mean():.1%}')
+_lo_j, _hi_j = {0.80: (1, 5), 0.90: (0, 6)}[CFG.wc_band]; QG_TAUS = (5, 10, 25, 50, 75, 90, 95)
+
+
+def wf_slope(sig: np.ndarray, m: str) -> float:
+    tr = (_month < m) & _w_van_all & np.isfinite(_M_REC) & np.isfinite(sig)
+    if tr.sum() < CFG.min_fit_rows:
+        return np.nan
+    x = sig[tr] - sig[tr].mean(); y = _M_REC[tr] - _M_REC[tr].mean(); d = float((x * x).sum()); return float((x * y).sum() / d) if d > 1e-12 else np.nan
+
+
+def band_width(target: str, model: str) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+    """W_i (bp, calibrated to the holding horizon) and the model median per request for one (target, model), with the calibration by test month."""
+    cols = [f'q_{target}_{model}_{t:02d}' for t in QG_TAUS]
+    if any(c not in QREQ for c in cols):
+        return np.full(N, np.nan), np.full(N, np.nan), pd.DataFrame()
+    Q = QREQ[cols].to_numpy(float); Mq = -Q[:, ::-1]; med = Mq[:, 3]; width = (Mq[:, _hi_j] - Mq[:, _lo_j]) / 2.0; W = np.full(N, np.nan); rows = []
+    for m in TEST_M:
+        s_ = wf_slope(med, m); s_ = s_ if np.isfinite(s_) else 0.0; tr = (_month < m) & _w_van_all & np.isfinite(_M_REC) & np.isfinite(med) & np.isfinite(width) & (width > 0)
+        r_ = float(np.median(np.abs(_M_REC[tr] - s_ * med[tr])) / np.median(width[tr])) if tr.sum() >= CFG.min_fit_rows else 1.0
+        te = _month == m; W[te] = r_ * width[te]; rows.append({'target': target, 'model': model, 'test month': m, 'location slope': s_, 'scale ratio': r_, 'calibration wins': int(tr.sum())})
+    return W, med, pd.DataFrame(rows)
+
+
+WIDTH, CAL = {}, []
+for tgt in CFG.wc_targets:
+    for mdl in CFG.wc_models:
+        W, med, cal = band_width(tgt, mdl); WIDTH[(tgt, mdl)] = W; CAL.append(cal)
+CAL = pd.concat(CAL, ignore_index=True) if CAL else pd.DataFrame()
+print('Calibration of the next-day band to the holding period, by test month (scale ratio = realised dispersion of the markout of record / the model\'s; the location slope is reported, not used):')
+display(CAL.pivot_table(index='test month', columns=['target', 'model'], values=['scale ratio', 'location slope']).round(3))
+_W0 = WIDTH[('residual', 'ls')]
+_wm = pd.DataFrame({'median W (bp)': pd.Series(_W0[_tmw]).groupby(_month[_tmw]).median(), 'p10': pd.Series(_W0[_tmw]).groupby(_month[_tmw]).quantile(0.1), 'p90': pd.Series(_W0[_tmw]).groupby(_month[_tmw]).quantile(0.9), 'covered share': pd.Series(np.isfinite(_W0[_tmw])).groupby(_month[_tmw]).mean()})
+print('The candidate\'s width W (residual, location-scale) on test winnable requests, by month:'); display(_wm.round(3))
+# does the width measure what it claims? the dispersion of the realised markout of record of production's wins by decile of W
+_okw = _w_van_all & _tm & np.isfinite(_W0) & np.isfinite(_M_REC); _dec = pd.qcut(pd.Series(_W0[_okw]).rank(method='first'), 10, labels=False).to_numpy()
+WVAL = pd.DataFrame({'W decile': _dec, 'W (bp)': _W0[_okw], 'markout of record': _M_REC[_okw], 'realised round trip': _M_REAL[_okw]}).groupby('W decile').agg(**{'wins': ('W (bp)', 'size'), 'W, median (bp)': ('W (bp)', 'median'), 'markout sd (bp)': ('markout of record', 'std'),
+                                                                                                                                                        'markout mean (bp)': ('markout of record', 'mean'), 'realised round trip mean (bp)': ('realised round trip', 'mean')})
+print('Does W measure dispersion? Production\'s wins in the test months by decile of W: the sd of the realised markout of record should rise with W:'); display(WVAL.round(2))
+record('width', test_months=TEST_M, coverage=float(np.isfinite(_W0[_tmw]).mean()), calibration=flat_records(CAL), by_month=flat_records(_wm), validation=flat_records(WVAL), seconds=time.perf_counter() - _wc_t0)
+print(f'[8-1] {time.perf_counter() - _wc_t0:.0f}s')
+
+# %%
+CELL_T('8. The width charge: the charge, the variations, a worked example [2]')
+_wq_t0 = time.perf_counter()
+VARIANTS: dict[str, dict] = {}
+_WIDTH_CATS = [(sorted(set(_kgrp)), np.asarray(_kgrp, dtype=object))] + [(sorted(set(BT[c].astype(str))), BT[c].astype(str).to_numpy(dtype=object)) for c in ('qty_bucket', 'tenor_bucket') if c in BT]
+_LOGVOL = np.log(np.where(IDV > 0, IDV, np.nan)); _LOGVOL_MED = float(np.nanmedian(_LOGVOL)) if np.isfinite(_LOGVOL).any() else 0.0
+
+
+def _width_design(rows: np.ndarray) -> np.ndarray:
+    cols = [np.ones(len(rows))]
+    for lev, vals in _WIDTH_CATS:
+        for lv in lev[1:]:
+            cols.append((vals[rows] == lv).astype(float))
+    cols.append(_man_modal[rows].astype(float)); lv_ = _LOGVOL[rows]; cols.append(np.where(np.isfinite(lv_), lv_, _LOGVOL_MED)); return np.column_stack(cols)
+
+
+def requote_const(b: np.ndarray, label: str, fam: str, setting: str, gamma: float) -> dict:
+    """A per-request charge b_i (<= 0), quoted as argmax (x + c + b_i) p(x) with the manual charge kept (yM) and removed (y0) on the test winnable rows; b = 0 where missing."""
+    bb = np.nan_to_num(b); yM, y0 = np.full(N, np.nan), np.full(N, np.nan)
+    yM[_tm_rows] = requote(_tm_rows, _ch[_tm_rows] + bb[_tm_rows]); y0[_tm_rows] = requote(_tm_rows, _c_base[_tm_rows] + bb[_tm_rows])
+    return {'family': fam, 'setting': setting, 'yM': bt_final(yM), 'y0': bt_final(y0), 'b': b, 'gamma': gamma, 'coverage': float(np.isfinite(b[_tmw]).mean())}
+
+
+def _charge_family() -> dict:
+    out, ext_rows = {}, []
+    for tgt in CFG.wc_targets:
+        for mdl in CFG.wc_models:
+            W = WIDTH[(tgt, mdl)]
+            if not np.isfinite(W).any():
+                continue
+            w_med = float(np.nanmedian(W[(_month == TEST_M[0]) & _tmw]))
+            for k in (CFG.wc_k_grid if tgt == 'residual' else CFG.wc_k_total):
+                t0 = time.perf_counter(); g_ = k / w_med if w_med > 0 else 0.0; nm = f'width k={k:g} | {tgt} | {mdl}'
+                out[nm] = requote_const(-g_ * W, nm, 'width charge' if tgt == 'residual' else 'width charge, total move', f'k={k:g}, {mdl}', g_); print(f'  {nm}: gamma {g_:.3f} per bp of width, covered {out[nm]["coverage"]:.1%} | {time.perf_counter() - t0:.0f}s')
+            if tgt != 'residual' or not CFG.wc_k_extended:
+                continue
+            W_ext = W.copy()
+            for m in TEST_M:
+                tr = (_month < m) & np.isfinite(W) & (W > 0); te = _month == m
+                if tr.sum() < CFG.min_fit_rows:
+                    continue
+                Xa, Xb = _width_design(np.flatnonzero(tr)), _width_design(np.flatnonzero(te)); beta = np.linalg.lstsq(Xa, np.log(W[tr]), rcond=None)[0]; pred = np.exp(Xb @ beta)
+                need = te & ~(np.isfinite(W) & (W > 0)); W_ext[need] = pred[need[te]]
+                ext_rows.append({'model': mdl, 'test month': m, 'width model R2': 1.0 - float(np.var(np.log(W[tr]) - Xa @ beta) / max(np.var(np.log(W[tr])), 1e-12)), 'observed share': float(np.isfinite(W[te & _winable]).mean()),
+                                 'median W observed (bp)': float(np.nanmedian(W[te & _tmw])), 'median W modelled (bp)': float(np.nanmedian(pred[(need & _winable)[te]])) if (need & _winable).any() else np.nan})
+            w_med_x = float(np.nanmedian(W_ext[(_month == TEST_M[0]) & _tmw]))
+            for k in CFG.wc_k_extended:
+                t0 = time.perf_counter(); g_ = k / w_med_x if w_med_x > 0 else 0.0; nm = f'width k={k:g} | residual | {mdl} | every request'
+                out[nm] = requote_const(-g_ * W_ext, nm, 'width charge, every request', f'k={k:g}, {mdl}, extended', g_); print(f'  {nm}: gamma {g_:.3f} per bp of width (rescaled on the extended population), covered {out[nm]["coverage"]:.1%} | {time.perf_counter() - t0:.0f}s')
+    return {'variants': out, 'extension': pd.DataFrame(ext_rows)}
+
+
+_cf = cached('width_charge_quotes', _charge_family, deps=[frame_fingerprint(BT, ['charges_level', 'threshold_y', 'signalyield']), TEST_M, {f'{k[0]}|{k[1]}': float(np.nansum(v)) for k, v in WIDTH.items()}, float(np.nansum(_LOGVOL[np.isfinite(_LOGVOL)]))],
+             code=[requote, requote_const, bt_optimize, _width_design], cfg=('wc_targets', 'wc_models', 'wc_k_grid', 'wc_k_total', 'wc_k_extended', 'min_fit_rows'))
+VARIANTS.update(_cf['variants']); WC_EXT = _cf['extension']
+CANDIDATE = f'width k=2 | residual | ls'
+assert CANDIDATE in VARIANTS, 'the candidate setting was not quoted'
+if len(WC_EXT):
+    print('The width model for the requests without a band (walk-forward least squares of log W on key group, size and tenor buckets, manual class, trailing residual sd):'); display(WC_EXT.pivot_table(index='test month', columns='model', values=['width model R2', 'observed share', 'median W observed (bp)', 'median W modelled (bp)']).round(3))
+_chg = pd.DataFrame({nm: pd.Series(-v['b'][_tmw]).describe(percentiles=[0.1, 0.5, 0.9]) for nm, v in VARIANTS.items()}).T[['50%', '10%', '90%', 'max']].rename(columns={'50%': 'median charge (bp)', '10%': 'p10', '90%': 'p90'})
+_chg['gamma'] = [VARIANTS[n]['gamma'] for n in _chg.index]; _chg['covered'] = [VARIANTS[n]['coverage'] for n in _chg.index]
+_chg['raw win rate, manual kept'] = [float(bt_win_fast(_tm_rows, VARIANTS[n]['yM'][_tm_rows]).mean()) for n in _chg.index]; _chg['production win rate'] = float(_w_van_all[_tm_rows].mean())
+print('Every setting: the charge on covered requests and the raw win rate it produces with the manual charge kept (the charge only widens, so the win rate only falls):'); display(_chg.round(3))
+# ---- a worked example: two real requests of the same key and month, a tight band and a wide one, through the objective with and without the charge
+_cand = VARIANTS[CANDIDATE]; _bq = _cand['b']; _exr = np.flatnonzero(_tmw & np.isfinite(_bq) & np.isfinite(_cand['yM']))
+_ex_key = pd.Series(_keys[_exr]).value_counts().index[0]; _kk = _exr[_keys[_exr] == _ex_key]; _o = np.argsort(_W0[_kk]); _i_tight, _i_wide = _kk[_o[len(_o) // 10]], _kk[_o[-len(_o) // 10]]
+_q, _p = BT_CURVES[_files[_i_tight]][_ex_key]
+fig, ax = plt.subplots(1, 3, figsize=(20, 5))
+for a_, i_, lab in ((ax[0], _i_tight, 'a tight band'), (ax[1], _i_wide, 'a wide band')):
+    u0 = (_q + _ch[i_]) * _p; u1 = (_q + _ch[i_] + _bq[i_]) * _p
+    a_.plot(_q, u0, color=C_GREY, lw=1.6, label=f'production: (x + c) p(x), c = {_ch[i_]:+.1f} bp'); a_.plot(_q, u1, color=C_RED, lw=1.6, label=f'with the charge: c + b = {_ch[i_] + _bq[i_]:+.1f} bp')
+    a_.axvline(_q[np.argmax(u0)], color=C_GREY, ls='--', lw=0.9); a_.axvline(_q[np.argmax(u1)], color=C_RED, ls='--', lw=0.9); a_.set_xlabel('concession x (bp above the model mid)'); a_.set_ylabel('expected value of the bid, bp x p')
+    a_.set_title(f'{lab}: W = {_W0[i_]:.1f} bp, charge {-_bq[i_]:.1f} bp; x* {_q[np.argmax(u0)]:.0f} -> {_q[np.argmax(u1)]:.0f} bp (key {_ex_key}, {BT.loc[i_, "month"]})', fontsize=9); a_.legend(fontsize=8)
+_ok0 = _tmw & np.isfinite(_W0)
+ax[2].hist(np.clip(_W0[_ok0], 0, 20), bins=60, color=C_BLUE, alpha=0.8); ax[2].axvline(np.nanmedian(_W0[_ok0]), color='k', ls='--', lw=0.8, label=f'median {np.nanmedian(_W0[_ok0]):.1f} bp (charge {-np.nanmedian(_bq[_ok0]):.1f} bp at k = 2)')
+ax[2].set_xlabel('W: half-width of the 80% band over the holding period (bp, clipped at 20)'); ax[2].set_title('The width across the covered test requests', fontsize=10); ax[2].legend(fontsize=8)
+savefig('08_width_charge')
+record('width_charge', settings=list(VARIANTS), table=flat_records(_chg), extension=flat_records(WC_EXT) if len(WC_EXT) else [], candidate=CANDIDATE, seconds=time.perf_counter() - _wq_t0)
+print(f'[8-2] {len(VARIANTS)} settings quoted | {time.perf_counter() - _wq_t0:.0f}s')
+
+# %% [markdown]
+# ## 9. The backtest
+#
+# Every setting is quoted twice, with the manual charge in `c` and with it removed, and so is production. The four pairs:
+#
+# | Pair | Variant quoted with | Production quoted with | Question |
+# |---|---|---|---|
+# | A | manual kept | manual kept | does the charge add to what the traders charge (the deployable question) |
+# | B | manual removed | manual kept | can the charge replace the manual charge |
+# | C | manual removed | manual removed | what the charge is worth on its own |
+# | D | production, manual removed | production, manual kept | the reference: what the manual charge itself is worth |
+#
+# **The comparator of record is production at the variant's win rate**: the charge only widens, so the variant wins less, and a raw comparison mixes
+# the price effect with a volume effect. Production is therefore widened or tightened through its own optimizer by a constant width per month
+# until its win rate on the same requests matches the variant's (the width frontier), and the variant is read against that point: at equal wins,
+# does it keep better ones. The raw reading and the levelled reading (the variant brought to production's win rate instead) are kept beside it.
+#
+# **The scorecard**, per pair and comparator, pooled over the test months and month by month: win rate and wins kept; bp left on the table against the
+# cover and its change; the P&L delta per request under the exit of record, the common markout and the own other-side print, each with a
+# week-clustered t; the smallest of the three (the sceptical delta); the realised round trip delta where matched; DV01-trimmed dollars per month; the
+# book's gross DV01 against the comparator's. No threshold: a sign-only reading says on which axes the variant is better.
+
+# %%
+CELL_T('9. The backtest: references, the frontier comparator, the scorecard [1]')
+_b_t0 = time.perf_counter()
+Y_PM = _y_van.copy(); Y_P0 = np.full(N, np.nan); Y_P0[_tm_rows] = bt_final(requote(_tm_rows, _c_base[_tm_rows]), _tm_rows)
+
+
+def _width_grid_x(c: np.ndarray) -> pd.DataFrame:
+    out = {}
+    for w in CFG.frontier_widths:
+        out[f'{w:+.1f}'] = 100.0 * (requote(_tm_rows, c[_tm_rows], float(w)) - _m_sig[_tm_rows])
+    return pd.DataFrame(out, index=_tm_rows)
+
+
+FRONT_X = {'M': cached('front_x_M', lambda: _width_grid_x(_ch), deps=[frame_fingerprint(BT, ['charges_level', 'threshold_y', 'signalyield']), TEST_M], code=[requote, bt_optimize], cfg=('frontier_widths',)),
+           '0': cached('front_x_0', lambda: _width_grid_x(_c_base), deps=[frame_fingerprint(BT, ['liquiditycharge', 'riskcharge', 'threshold_y', 'signalyield']), TEST_M], code=[requote, bt_optimize], cfg=('frontier_widths',))}
+assert np.allclose(bt_opto(_m_sig[_tm_rows], FRONT_X['M']['+0.0'].to_numpy(float)) + _adj[_tm_rows], Y_PM[_tm_rows], atol=1e-9, equal_nan=True), 'width 0 must reproduce production'
+
+
+def frontier_quote(regime: str, width_by_month: dict) -> np.ndarray:
+    y = np.full(N, np.nan); X = FRONT_X[regime]
+    for m, w in width_by_month.items():
+        col = f'{w:+.1f}'
+        if col not in X.columns:
+            continue
+        r = X.index.to_numpy()[(_month[X.index.to_numpy()] == m)]; y[r] = bt_opto(_m_sig[r], X.loc[r, col].to_numpy(float)) + _adj[r]
+    return y
+
+
+def match_frontier(y_v: np.ndarray, regime: str, rows: np.ndarray) -> tuple[np.ndarray, dict, dict]:
+    """The width per month whose win rate on the month's rows is nearest the variant's: the comparator at equal win rate; the residual mismatch beside."""
+    widths, mism = {}, {}; X = FRONT_X[regime]
+    for m in TEST_M:
+        r = rows[_month[rows] == m]
+        if not len(r):
+            continue
+        target = float(bt_win_fast(r, y_v[r]).mean()); best, bw, bm = None, None, np.inf
+        for col in X.columns:
+            yw = bt_opto(_m_sig[r], X.loc[r, col].to_numpy(float)) + _adj[r]; wr = float(bt_win_fast(r, yw).mean())
+            if abs(wr - target) < bm:
+                best, bw, bm = col, float(col), abs(wr - target)
+        widths[m] = bw; mism[m] = float(bt_win_fast(r, bt_opto(_m_sig[r], X.loc[r, best].to_numpy(float)) + _adj[r]).mean()) - target
+    return frontier_quote(regime, widths), widths, mism
+
+
+def level_to(y_v: np.ndarray, y_b: np.ndarray, rows: np.ndarray) -> tuple[np.ndarray, dict]:
+    """A constant width per month added to y_v so its win rate equals y_b's on the month's rows (bisection)."""
+    y = y_v.copy(); widths = {}
+    for m in TEST_M:
+        r = rows[_month[rows] == m]
+        if not len(r):
+            continue
+        target = float(bt_win_fast(r, y_b[r]).mean())
+
+        def wr(w: float) -> float:
+            return float(bt_win_fast(r, y_v[r] + w / 100.0).mean())
+
+        w0 = wr(0.0)
+        if abs(w0 - target) <= 1e-12:
+            w = 0.0
+        elif w0 > target:
+            lo, hi = 0.0, CFG.level_range_bp
+            if wr(hi) > target:
+                w = hi
+            else:
+                for _ in range(CFG.level_iters):
+                    mid = 0.5 * (lo + hi); lo, hi = (mid, hi) if wr(mid) > target else (lo, mid)
+                w = hi
+        else:
+            lo, hi = -CFG.level_range_bp, 0.0
+            if wr(lo) < target:
+                w = lo
+            else:
+                for _ in range(CFG.level_iters):
+                    mid = 0.5 * (lo + hi); lo, hi = (lo, mid) if wr(mid) < target else (mid, hi)
+                w = lo
+        y[r] = y_v[r] + w / 100.0; widths[m] = w
+    return y, widths
+
+
+_pb_u = np.where(_winable, np.nan_to_num(_usd), 0.0); _pb_month = np.array(_pb_days.strftime('%Y-%m')); _tdays = np.isin(_pb_month, TEST_M)
+
+
+def book_dv01(win: np.ndarray, months: list[str] | None = None) -> float:
+    """Mean gross DV01 ($ per bp) of the policy's own fills held over the last h_record business days, over the test days (the risk axis; no covariance here)."""
+    w = win & (_pb_u > 0); U = np.bincount(_pb_di[w] + 1, weights=_pb_u[w], minlength=_pb_nd + 1).cumsum(); j = np.arange(_pb_nd); lo = np.maximum(0, j - (BT_H_RECORD - 1)); Uv = U[j] - U[lo]
+    td = _tdays & (np.isin(_pb_month, months) if months is not None else True); return float(np.mean(Uv[td])) if td.any() else np.nan
+
+
+def _group_mean(d: np.ndarray, codes: np.ndarray, n_levels: int) -> np.ndarray:
+    ok = np.isfinite(d); num = np.bincount(codes[ok], weights=d[ok], minlength=n_levels); den = np.bincount(codes[ok], minlength=n_levels); return np.where(den > 0, num / np.where(den > 0, den, 1), np.nan)
+
+
+_usd_cap = float(np.nanquantile(_usd[_tmw], CFG.dv01_trim_q)); _usd_trim = np.minimum(np.nan_to_num(_usd), _usd_cap)
+SCEPTICAL = ('record', 'common markout', 'other side')
+
+
+def score_pair(name: str, y_v: np.ndarray, y_b: np.ndarray, family: str = '', setting: str = '', pair: str = '', mode: str = 'raw', widths: dict | None = None, mismatch: dict | None = None, months: list[str] | None = None, period: str = 'all') -> dict:
+    """The paired scorecard: variant quote y_v against comparator y_b on the test-month rows where both exist."""
+    rows = np.flatnonzero(_tmw & np.isfinite(y_v) & np.isfinite(y_b) & (np.isin(_month, months) if months is not None else True)); yv, yb = y_v[rows], y_b[rows]
+    if months is not None:
+        widths = {m: w for m, w in (widths or {}).items() if m in months} or None; mismatch = {m: w for m, w in (mismatch or {}).items() if m in months} or None
+    wv, wb = bt_win_fast(rows, yv), bt_win_fast(rows, yb); g = _grp[rows]; dv, db = 100.0 * (_thr[rows] - yv), 100.0 * (_thr[rows] - yb)
+    px_v, px_b = 100.0 * (yv - _y_tr[rows]), 100.0 * (yb - _y_tr[rows]); kept = wv & wb; new = wv & ~wb; gone = wb & ~wv; keptc = kept & (g == 'won, cover'); cv, cb = wv & (g == 'won, cover'), wb & (g == 'won, cover')
+    res = {'variant': name, 'family': family, 'setting': setting, 'pair': pair, 'mode': mode, 'period': period, 'months': len(set(_month[rows])), 'requests': len(rows),
+           'win rate': float(wv.mean()), 'win rate, base': float(wb.mean()), 'wins kept': float(kept.sum() / max(wb.sum(), 1)), 'new wins': int(new.sum()), 'wins given up': int(gone.sum()),
+           'bp left on table (won, cover)': float(dv[cv].mean()) if cv.any() else np.nan, 'bp left on table, base': float(db[cb].mean()) if cb.any() else np.nan,
+           'bp saved on kept cover wins': float((db - dv)[keptc].mean()) if keptc.any() else np.nan, 'crossing on new wins (bp)': float(-dv[new & (g == 'lost, printed')].mean()) if (new & (g == 'lost, printed')).any() else np.nan,
+           'comparator shift (bp, + = more aggressive)': float(np.mean(list(widths.values()))) if widths else 0.0, 'win rate mismatch': float(np.mean(np.abs(list(mismatch.values())))) if mismatch else 0.0}
+    res['cover change (bp)'] = res['bp left on table (won, cover)'] - res['bp left on table, base']
+    vals = {'record': (_M_REC[rows], _M_REC[rows]), 'common markout': (np.where(new, _M_COMMON[rows], _M_REC[rows]), _M_REC[rows]), 'other side': (_M_OTHER[rows], _M_OTHER[rows]), 'realised': (_M_REAL[rows], _M_REAL[rows])}
+    for key, (Mv, Mb) in vals.items():
+        pv = np.where(wv, px_v + Mv, 0.0); pb = np.where(wb, px_b + Mb, 0.0); S = np.isfinite(pv) & np.isfinite(pb) & ~((wv & ~np.isfinite(Mv)) | (wb & ~np.isfinite(Mb)))
+        if key == 'realised':
+            S &= np.isfinite(Mv) & np.isfinite(Mb)          # only requests the desk actually bought and sold: a reading on production's own fills
+        d = np.where(S, pv - pb, np.nan); mm = _group_mean(d, _mo_code[rows], len(_mo_levels))
+        res[f'delta | {key} (bp)'] = float(np.nanmean(d)) if S.any() else np.nan; res[f'NW t | {key}'] = cluster_t(d, _wk_code[rows], len(_wk_levels)); res[f'months > 0 | {key}'] = int(np.nansum(mm > 0))
+        if key == 'record':
+            u, ut = _usd[rows], _usd_trim[rows]; dd = np.where(S, pv - pb, 0.0)
+            res['delta $ per month | record ($k)'] = float(np.nansum(dd * u) / 1e3 / max(res['months'], 1)); res['delta $ per month, trimmed | record ($k)'] = float(np.nansum(dd * ut) / 1e3 / max(res['months'], 1))
+            res['P&L sample share'] = float(S.mean()); res['P&L per request (bp)'] = float(np.nanmean(pv[S])) if S.any() else np.nan; res['P&L per request, base (bp)'] = float(np.nanmean(pb[S])) if S.any() else np.nan
+            res['delta: common fills price'] = float(np.sum((px_v - px_b)[kept & S]) / max(S.sum(), 1)); res['delta: new wins'] = float(np.sum(pv[new & S]) / max(S.sum(), 1)); res['delta: wins given up'] = float(-np.sum(pb[gone & S]) / max(S.sum(), 1))
+            for cls, msk in (('manual modal', _man_modal[rows]), ('manual specific', ~_man_modal[rows])):
+                dm = np.where(S & msk, pv - pb, np.nan); res[f'delta | record, {cls} (bp)'] = float(np.nanmean(dm)) if (S & msk).any() else np.nan
+    full_v = np.zeros(N, bool); full_v[rows] = wv; full_b = np.zeros(N, bool); full_b[rows] = wb; dv_v, dv_b = book_dv01(full_v, months), book_dv01(full_b, months)
+    res['gross DV01 ($k/bp)'] = dv_v / 1e3; res['gross DV01, base ($k/bp)'] = dv_b / 1e3; res['gross DV01 vs base'] = dv_v / dv_b - 1.0 if dv_b else np.nan
+    res['min delta, sceptical (bp)'] = float(np.nanmin([res[f'delta | {k} (bp)'] for k in SCEPTICAL])); return res
+
+
+def dominance(r: dict) -> str:
+    cov = r['cover change (bp)'] < 0; pnl_all = r['min delta, sceptical (bp)'] > 0; pnl_rec = r['delta | record (bp)'] > 0; rsk = (r['gross DV01 vs base'] <= 0) if pd.notna(r['gross DV01 vs base']) else False
+    usd = r['delta $ per month, trimmed | record ($k)'] > 0 if pd.notna(r['delta $ per month, trimmed | record ($k)']) else False
+    parts = [n for n, ok in (('cover', cov), ('P&L under all three valuations', pnl_all), ('P&L under the record exit only', pnl_rec and not pnl_all), ('dollars', usd), ('risk', rsk)) if ok]
+    out = 'better on ' + ', '.join(parts) if parts else 'worse on every axis'; mism = r.get('win rate mismatch', 0.0)
+    return out + (f' (frontier short by {100 * mism:.1f} pp)' if pd.notna(mism) and mism > 0.001 else '')
+
+
+_wbM, _wb0 = np.zeros(N, bool), np.zeros(N, bool); _wbM[_tm_rows] = bt_win_fast(_tm_rows, Y_PM[_tm_rows]); _wb0[_tm_rows] = bt_win_fast(_tm_rows, Y_P0[_tm_rows])
+_fr_rows = []
+for reg in ('M', '0'):
+    for col in FRONT_X[reg].columns:
+        yw = bt_opto(_m_sig[_tm_rows], FRONT_X[reg][col].to_numpy(float)) + _adj[_tm_rows]; ww = bt_win_fast(_tm_rows, yw)
+        for m in TEST_M:
+            r = _month[_tm_rows] == m; cvr = ww & r & (_grp[_tm_rows] == 'won, cover'); pv = np.where(ww & r, 100.0 * (yw - _y_tr[_tm_rows]) + _M_REC[_tm_rows], np.nan)
+            _fr_rows.append({'regime': reg, 'width': float(col), 'month': m, 'win rate': float(ww[r].mean()), 'bp left on cover wins': float((100.0 * (_thr[_tm_rows] - yw))[cvr].mean()) if cvr.any() else np.nan, 'P&L per request, record (bp)': float(np.nanmean(np.where(r, np.where(ww, pv, 0.0), np.nan)))})
+FRONTIER = pd.DataFrame(_fr_rows)
+_d_rows = [score_pair('production, manual removed', Y_P0, Y_PM, family='reference', setting='manual removed', pair='D', mode='vs production')]
+_yf, _wf_, _mm_ = match_frontier(Y_P0, 'M', _tm_rows); _d_rows.append(score_pair('production, manual removed', Y_P0, _yf, family='reference', setting='manual removed', pair='D', mode='vs frontier at equal win rate', widths=_wf_, mismatch=_mm_))
+_yl, _wd = level_to(Y_P0, Y_PM, _tm_rows); _d_rows.append(score_pair('production, manual removed', _yl, Y_PM, family='reference', setting='manual removed', pair='D', mode='levelled to production', widths={m: -w for m, w in _wd.items()}))
+PAIR_D = pd.DataFrame(_d_rows).set_index('mode'); PAIR_D['reading'] = [dominance(r) for _, r in PAIR_D.iterrows()]
+SHOW = ['win rate', 'win rate, base', 'wins kept', 'new wins', 'wins given up', 'bp left on table (won, cover)', 'bp left on table, base', 'cover change (bp)', 'bp saved on kept cover wins', 'crossing on new wins (bp)', 'comparator shift (bp, + = more aggressive)', 'win rate mismatch',
+        'delta | record (bp)', 'NW t | record', 'months > 0 | record', 'delta | common markout (bp)', 'NW t | common markout', 'delta | other side (bp)', 'NW t | other side', 'min delta, sceptical (bp)', 'delta | realised (bp)', 'NW t | realised',
+        'delta $ per month | record ($k)', 'delta $ per month, trimmed | record ($k)', 'delta | record, manual modal (bp)', 'delta | record, manual specific (bp)', 'P&L sample share', 'gross DV01 ($k/bp)', 'gross DV01 vs base', 'reading']
+SHOW_M = ['win rate', 'win rate, base', 'wins kept', 'cover change (bp)', 'comparator shift (bp, + = more aggressive)', 'min delta, sceptical (bp)', 'delta | record (bp)', 'NW t | record', 'delta | common markout (bp)', 'delta | other side (bp)', 'delta | realised (bp)', 'delta $ per month, trimmed | record ($k)', 'gross DV01 vs base', 'reading']
+_man_m = pd.DataFrame({'manual charge, median (bp)': pd.Series(_man[_tmw]).groupby(_month[_tmw]).median(), 'win rate, manual kept': pd.Series(_wbM[_tm_rows]).groupby(_month[_tm_rows]).mean(), 'win rate, manual removed': pd.Series(_wb0[_tm_rows]).groupby(_month[_tm_rows]).mean()})
+print('The manual charge by test month and production\'s win rate with and without it:'); display(_man_m.round(4))
+print('PAIR D (reference): production without the manual charge, read three ways:'); display(PAIR_D[SHOW].T)
+record('backtest_references', frontier=flat_records(FRONTIER), pair_D=flat_records(PAIR_D.drop(columns=['reading'])), manual_by_month=flat_records(_man_m), seconds=time.perf_counter() - _b_t0)
+print(f'[9-1] {time.perf_counter() - _b_t0:.0f}s')
+
+# %%
+CELL_T('9. The backtest: pairs A, B, C pooled and by month [2]')
+_x_t0 = time.perf_counter()
+
+
+def quote_fp(y: np.ndarray) -> str:
+    return hashlib.sha1(np.nan_to_num(np.asarray(y, float)[_tm_rows], nan=-1e9).astype(np.float32).tobytes()).hexdigest()[:16]
+
+
+def _score_variant(nm: str, v_: dict) -> list[dict]:
+    rows_out = []
+    for pair, yv, yb, reg in (('A', v_['yM'], Y_PM, 'M'), ('B', v_['y0'], Y_PM, 'M'), ('C', v_['y0'], Y_P0, '0')):
+        rows = np.flatnonzero(_tmw & np.isfinite(yv) & np.isfinite(yb))
+        rows_out.append(score_pair(nm, yv, yb, family=v_['family'], setting=v_['setting'], pair=pair, mode='vs production'))
+        yf, wf_, mm_ = match_frontier(yv, reg, rows); rows_out.append(score_pair(nm, yv, yf, family=v_['family'], setting=v_['setting'], pair=pair, mode='vs frontier at equal win rate', widths=wf_, mismatch=mm_))
+        yl, wd = level_to(yv, yb, rows); rows_out.append(score_pair(nm, yl, yb, family=v_['family'], setting=v_['setting'], pair=pair, mode='levelled to production', widths={m: -w for m, w in wd.items()}))
+        for m in TEST_M:
+            rows_out.append(score_pair(nm, yv, yf, family=v_['family'], setting=v_['setting'], pair=pair, mode='vs frontier at equal win rate', widths=wf_, mismatch=mm_, months=[m], period=m))
+    return rows_out
+
+
+_SCORE_DEPS = [STAGE_KEYS.get('front_x_M'), STAGE_KEYS.get('front_x_0'), quote_fp(Y_PM), quote_fp(Y_P0), TEST_M, float(np.nansum(_M_REC[_tmw])), float(np.nansum(_M_OTHER[_tmw])), float(np.nansum(_M_COMMON[_tmw])), float(np.nansum(_M_REAL[_tmw])), float(np.nansum(_usd_trim[_tmw]))]
+_rows_vm = []
+for nm, v_ in VARIANTS.items():
+    _rows_vm.extend(cached(f'score_{hashlib.sha1(nm.encode()).hexdigest()[:12]}', (lambda nm=nm, v_=v_: _score_variant(nm, v_)), deps=_SCORE_DEPS + [nm, quote_fp(v_['yM']), quote_fp(v_['y0'])],
+                           code=[score_pair, match_frontier, level_to, book_dv01, cluster_t, frontier_quote, bt_win_fast, _score_variant], cfg=('dv01_trim_q', 'level_range_bp', 'level_iters')))
+VM = pd.DataFrame(_rows_vm); VM['reading'] = [dominance(r) for _, r in VM.iterrows()]
+PAIR_Q = {'A': 'the charge with the manual charge, against production: does it add to what the traders charge', 'B': 'the charge without the manual charge, against production with it: can it replace the manual charge', 'C': 'both without the manual charge: what the charge is worth on its own'}
+VERDICTS = {}
+for pair in ('A', 'B', 'C'):
+    for mode in ('vs frontier at equal win rate', 'vs production', 'levelled to production'):
+        t = VM[(VM['pair'] == pair) & (VM['mode'] == mode) & (VM['period'] == 'all')].set_index('variant').sort_values('min delta, sceptical (bp)', ascending=False)
+        better = t.index[t['reading'].str.contains('all three') & t['reading'].str.contains('cover') & t['reading'].str.contains('dollars')].tolist()
+        VERDICTS[f'{pair} | {mode}'] = f'{len(better)} of {len(t)} better than the comparator on cover, on P&L under all three valuations and on dollars' + (f': {better}' if better else '')
+        print(f'\nPAIR {pair}, {mode.upper()} ({PAIR_Q[pair]}; ranked by the smallest sceptical delta):'); display(t[SHOW].round(4)); print(f'READING (pair {pair}, {mode}): {VERDICTS[f"{pair} | {mode}"]}')
+VMM = VM[VM['period'] != 'all']
+for pair in ('A', 'C'):
+    print(f'\nPAIR {pair} by month at equal win rate, the smallest sceptical delta (bp per request):'); display(VMM[VMM['pair'] == pair].pivot(index='period', columns='variant', values='min delta, sceptical (bp)').round(3))
+    print(f'PAIR {pair} by month, cover change (bp):'); display(VMM[VMM['pair'] == pair].pivot(index='period', columns='variant', values='cover change (bp)').round(3))
+    print(f'PAIR {pair} by month, $k per month trimmed:'); display(VMM[VMM['pair'] == pair].pivot(index='period', columns='variant', values='delta $ per month, trimmed | record ($k)').round(1))
+VM.to_parquet(ARTIFACTS / 'width_charge_matrix.parquet')
+record('backtest', table=flat_records(VM.set_index(['variant', 'pair', 'mode', 'period'])), verdicts=VERDICTS, seconds=time.perf_counter() - _x_t0)
+print(f'[9-2] {len(VM)} scorecard rows | {time.perf_counter() - _x_t0:.0f}s')
+
+# %%
+CELL_T('9. The backtest: the pictures [3]')
+_p_t0 = time.perf_counter()
+_fam_c = {'width charge': C_BLUE, 'width charge, total move': C_ORANGE, 'width charge, every request': C_PURPLE}
+_short = {nm: nm.replace('width ', '').replace(' | residual', '').replace(' | every request', ', ext') for nm in VARIANTS}
+# (1) the variant points on production's own width frontier, pair A, one panel per test month
+fig, axes = plt.subplots(2, int(np.ceil(len(TEST_M) / 2)), figsize=(6 * int(np.ceil(len(TEST_M) / 2)), 9)); axes = np.atleast_1d(axes).ravel()
+for a_, m in zip(axes, TEST_M):
+    f_ = FRONTIER[(FRONTIER['regime'] == 'M') & (FRONTIER['month'] == m)].sort_values('width'); a_.plot(f_['win rate'], f_['P&L per request, record (bp)'], '-', color=C_GREY, lw=1.4, label='production, widened and tightened (the frontier)')
+    p0 = f_[f_['width'] == 0.0]; a_.scatter(p0['win rate'], p0['P&L per request, record (bp)'], s=70, color='k', zorder=5, label='production as is')
+    for nm, v_ in VARIANTS.items():
+        r = VMM[(VMM['variant'] == nm) & (VMM['pair'] == 'A') & (VMM['period'] == m)]
+        if len(r):
+            a_.scatter(r['win rate'], r['P&L per request (bp)'], s=48 if nm == CANDIDATE else 22, color=_fam_c.get(v_['family'], C_GREY), edgecolors='k' if nm == CANDIDATE else 'none', zorder=6, label=_short[nm] if m == TEST_M[0] else None)
+    a_.set_title(f'{m}: P&L per request (record exit) against win rate, manual charge kept', fontsize=9); a_.set_xlabel('win rate'); a_.set_ylabel('bp per request')
+axes[0].legend(fontsize=6)
+for a_ in axes[len(TEST_M):]:
+    a_.axis('off')
+savefig('09_frontier_points')
+# (2) the headline per setting, pairs A and C at equal win rate
+_cols = [('min delta, sceptical (bp)', 'smallest sceptical delta (bp per request)'), ('cover change (bp)', 'cover change (bp, negative = less left on the table)'), ('wins kept', 'share of the comparator\'s wins kept'), ('delta $ per month, trimmed | record ($k)', '$k per month, DV01-trimmed')]
+fig, ax = plt.subplots(2, 4, figsize=(24, 9))
+for i_, pair in enumerate(('A', 'C')):
+    t = VM[(VM['pair'] == pair) & (VM['mode'] == 'vs frontier at equal win rate') & (VM['period'] == 'all')].set_index('variant').sort_values('min delta, sceptical (bp)')
+    for j_, (col, lab) in enumerate(_cols):
+        a_ = ax[i_, j_]; vals = t[col].to_numpy(float); cols_ = [_fam_c.get(VARIANTS[n]['family'], C_GREY) for n in t.index]
+        a_.barh([_short[n] for n in t.index], vals, color=cols_, edgecolor=['k' if n == CANDIDATE else 'none' for n in t.index]); a_.axvline(0, color='k', lw=0.6); a_.set_title(f'Pair {pair}: {lab}', fontsize=9); a_.tick_params(axis='y', labelsize=7)
+savefig('09_headline_bars')
+# (3) heatmaps: month x setting, the sceptical delta and the cover change, pairs A and C
+fig, ax = plt.subplots(2, 2, figsize=(20, 10))
+for i_, pair in enumerate(('A', 'C')):
+    for j_, (col, lab, cm) in enumerate((('min delta, sceptical (bp)', 'smallest sceptical delta (bp)', 'RdYlGn'), ('cover change (bp)', 'cover change (bp, green = less left on the table)', 'RdYlGn_r'))):
+        tp = VMM[VMM['pair'] == pair].pivot(index='variant', columns='period', values=col).reindex(list(VARIANTS)); a_ = ax[i_, j_]; v = tp.to_numpy(float); lim = np.nanmax(np.abs(v)) if np.isfinite(v).any() else 1.0
+        im = a_.imshow(v, cmap=cm, vmin=-lim, vmax=lim, aspect='auto'); a_.set_xticks(range(tp.shape[1])); a_.set_xticklabels(tp.columns, fontsize=8); a_.set_yticks(range(tp.shape[0])); a_.set_yticklabels([_short[n] for n in tp.index], fontsize=7); a_.grid(False)
+        for r_ in range(v.shape[0]):
+            for c_ in range(v.shape[1]):
+                if np.isfinite(v[r_, c_]):
+                    a_.text(c_, r_, f'{v[r_, c_]:+.2f}', ha='center', va='center', fontsize=7)
+        a_.set_title(f'Pair {pair} by month at equal win rate: {lab}', fontsize=9); plt.colorbar(im, ax=a_, fraction=0.03)
+savefig('09_heatmaps')
+# (4) the candidate's cumulative dollars against its comparator, by day, pairs A and C
+fig, ax = plt.subplots(1, 2, figsize=(18, 4.8))
+for a_, (pair, yb, reg, yk) in zip(ax, (('A', Y_PM, 'M', 'yM'), ('C', Y_P0, '0', 'y0'))):
+    yv = VARIANTS[CANDIDATE][yk]; rows = np.flatnonzero(_tmw & np.isfinite(yv) & np.isfinite(yb)); yf, _, _ = match_frontier(yv, reg, rows); yfr = yf[rows]; ok = np.isfinite(yfr)
+    wv, wb = bt_win_fast(rows, yv[rows]), bt_win_fast(rows, np.where(ok, yfr, np.nan)); Mv = _M_REC[rows]
+    pv = np.where(wv, 100.0 * (yv[rows] - _y_tr[rows]) + Mv, 0.0); pb = np.where(wb, 100.0 * (yfr - _y_tr[rows]) + Mv, 0.0); S = np.isfinite(pv) & np.isfinite(pb) & ok
+    dd = pd.Series(np.where(S, (pv - pb) * _usd_trim[rows], 0.0)).groupby(BT['date'].to_numpy()[rows]).sum().sort_index().cumsum() / 1e3
+    a_.plot(dd.index, dd.to_numpy(), color=C_BLUE, lw=1.8); a_.axhline(0, color='k', lw=0.6); a_.set_ylabel('$k, cumulative'); a_.set_title(f'Pair {pair}: the candidate\'s dollars against production at the same win rate, cumulated by day (record exit, DV01-trimmed)', fontsize=9)
+savefig('09_cumulative')
+print(f'[9-3] {time.perf_counter() - _p_t0:.0f}s')
+# %% [markdown]
+# ## 10. Where the edge comes from
+#
+# A charge that only widens can earn only two ways: it gives up wins that were worth less than nothing, and it keeps the others at the same price
+# (the kept wins' price moves only through the comparator's width). So the question is which wins it gives up. Three cuts of the candidate against
+# its comparator at equal win rate, with the manual charge kept: by quintile of the width `W` (the charge is a function of `W` alone, so this is the
+# mechanism itself), by key group (coupon bin x call group, the desk's own axis), and the attribution of the delta into the three parts every paired
+# comparison has (the price on common fills, the new wins, the wins given up). The last table is the adverse-selection reading the charge rests on:
+# production's own wins by quintile of `W`, with the markout of record, the realised round trip from WFTrade and the bp left on the table against the cover.
+
+# %%
+CELL_T('10. Where the edge comes from [1]')
+_dc_t0 = time.perf_counter()
+
+
+def _cut_table(yv: np.ndarray, yb: np.ndarray, labels: np.ndarray, label_name: str) -> pd.DataFrame:
+    rows = np.flatnonzero(_tmw & np.isfinite(yv) & np.isfinite(yb)); wv, wb = bt_win_fast(rows, yv[rows]), bt_win_fast(rows, yb[rows]); g = _grp[rows]
+    pv = np.where(wv, 100.0 * (yv[rows] - _y_tr[rows]) + _M_REC[rows], 0.0); pb = np.where(wb, 100.0 * (yb[rows] - _y_tr[rows]) + _M_REC[rows], 0.0); S = np.isfinite(pv) & np.isfinite(pb)
+    dv, db = 100.0 * (_thr[rows] - yv[rows]), 100.0 * (_thr[rows] - yb[rows]); cv, cb = wv & (g == 'won, cover'), wb & (g == 'won, cover')
+    f = pd.DataFrame({label_name: labels[rows], 'requests': 1, 'win rate': wv, 'win rate, base': wb, 'kept': wv & wb, 'given up': wb & ~wv, 'new': wv & ~wb, 'd': np.where(S, pv - pb, np.nan), 'usd': np.where(S, (pv - pb) * _usd_trim[rows], np.nan),
+                      'cover_v': np.where(cv, dv, np.nan), 'cover_b': np.where(cb, db, np.nan)})
+    t = f.groupby(label_name).agg(requests=('requests', 'sum'), **{'win rate': ('win rate', 'mean'), 'win rate, base': ('win rate, base', 'mean'), 'wins kept': ('kept', 'sum'), 'wins given up': ('given up', 'sum'), 'new wins': ('new', 'sum'),
+                                                                    'delta per request (bp)': ('d', 'mean'), '$k over the window': ('usd', lambda s: s.sum() / 1e3), 'bp left on cover wins': ('cover_v', 'mean'), 'bp left, base': ('cover_b', 'mean')})
+    t['cover change (bp)'] = t['bp left on cover wins'] - t['bp left, base']; return t
+
+
+_cand = VARIANTS[CANDIDATE]; _rowsA = np.flatnonzero(_tmw & np.isfinite(_cand['yM'])); _yfA, _, _ = match_frontier(_cand['yM'], 'M', _rowsA)
+_wq = np.full(N, 'no band', dtype=object); _hasw = np.isfinite(_W0) & _tmw
+_wq[_hasw] = pd.qcut(pd.Series(_W0[_hasw]).rank(method='first'), 5, labels=[f'Q{i} ' + s for i, s in enumerate(['tightest', '', '', '', 'widest'], start=1)]).astype(str).to_numpy()
+BY_W = _cut_table(_cand['yM'], _yfA, _wq, 'W quintile'); print(f'{CANDIDATE} with the manual charge, against production at equal win rate, by quintile of W (the no-band rows quote production and differ only through the comparator):'); display(BY_W.round(3))
+BY_KEY = _cut_table(_cand['yM'], _yfA, _kgrp.astype(str), 'key group'); print('... by key group (coupon bin x call group):'); display(BY_KEY.round(3))
+_att = VM[(VM['mode'] == 'vs frontier at equal win rate') & (VM['period'] == 'all') & (VM['pair'] == 'A')].set_index('variant')[['delta: common fills price', 'delta: new wins', 'delta: wins given up', 'delta | record (bp)']]
+print('Attribution of the record delta, pair A at equal win rate: the price on common fills + the new wins + the wins given up = the delta (bp per request):'); display(_att.round(4))
+_pw = _w_van_all & _tm & np.isfinite(_W0); _d5 = pd.qcut(pd.Series(_W0[_pw]).rank(method='first'), 5, labels=False).to_numpy(); _ov0 = bt_outcomes(BT, BT['y_vanilla'])
+ADV = pd.DataFrame({'W quintile': _d5, 'W (bp)': _W0[_pw], 'markout of record (bp)': _M_REC[_pw], 'realised round trip (bp)': _M_REAL[_pw], 'bp left on the table': np.where(_grp[_pw] == 'won, cover', _ov0['d_bp'].to_numpy(float)[_pw], np.nan), 'usd': _usd_trim[_pw]})
+ADV = ADV.groupby('W quintile').agg(**{'wins': ('W (bp)', 'size'), 'W median (bp)': ('W (bp)', 'median'), 'markout of record, mean (bp)': ('markout of record (bp)', 'mean'), 'markout sd (bp)': ('markout of record (bp)', 'std'),
+                                       'realised round trip, mean (bp)': ('realised round trip (bp)', 'mean'), 'realised lots': ('realised round trip (bp)', lambda s: int(s.notna().sum())), 'bp left on the table, mean': ('bp left on the table', 'mean'), '$ per bp, mean': ('usd', 'mean')})
+print('The adverse-selection reading: production\'s own wins in the test months by quintile of W (0 = tightest band, 4 = widest):'); display(ADV.round(2))
+fig, ax = plt.subplots(1, 3, figsize=(20, 5))
+_bw = BY_W.drop(index='no band', errors='ignore'); _x = np.arange(len(_bw))
+ax[0].bar(_x - 0.2, _bw['wins given up'], 0.4, color=C_RED, label='wins given up'); ax[0].bar(_x + 0.2, _bw['new wins'], 0.4, color=C_GREEN, label='new wins'); ax[0].set_xticks(_x); ax[0].set_xticklabels(_bw.index, fontsize=8); ax[0].legend(fontsize=8)
+ax[0].set_title('The candidate against production at equal win rate: which wins change hands, by W quintile', fontsize=9)
+ax[1].bar(_x, _bw['delta per request (bp)'], color=np.where(_bw['delta per request (bp)'] >= 0, C_GREEN, C_RED)); ax[1].axhline(0, color='k', lw=0.6); ax[1].set_xticks(_x); ax[1].set_xticklabels(_bw.index, fontsize=8); ax[1].set_title('Delta per request by W quintile (bp, record exit)', fontsize=9)
+ax[2].bar(np.arange(len(ADV)) - 0.2, ADV['markout of record, mean (bp)'], 0.4, color=C_BLUE, label='markout of record, mean'); ax[2].bar(np.arange(len(ADV)) + 0.2, ADV['realised round trip, mean (bp)'], 0.4, color=C_BROWN, label='realised round trip, mean')
+ax[2].axhline(0, color='k', lw=0.6); ax[2].set_xticks(np.arange(len(ADV))); ax[2].set_xticklabels([f'Q{i + 1}' for i in range(len(ADV))]); ax[2].legend(fontsize=8); ax[2].set_title('What production\'s wins were worth, by W quintile (bp): the dispersed ones are the bad ones', fontsize=9)
+savefig('10_edge')
+record('edge', by_width=flat_records(BY_W), by_key=flat_records(BY_KEY), attribution=flat_records(_att), adverse_selection=flat_records(ADV), seconds=time.perf_counter() - _dc_t0)
+print(f'[10] {time.perf_counter() - _dc_t0:.0f}s')
+
+# %% [markdown]
+# ## 11. Summary
+#
+# The candidate in one table, read every way; then what the variations say; then the registry and the runtimes.
+
+# %%
+CELL_T('11. Summary and registry [1]')
+_keep = ['win rate', 'win rate, base', 'wins kept', 'cover change (bp)', 'min delta, sceptical (bp)', 'delta | record (bp)', 'NW t | record', 'delta | common markout (bp)', 'NW t | common markout', 'delta | other side (bp)', 'delta | realised (bp)', 'delta $ per month, trimmed | record ($k)', 'gross DV01 vs base', 'reading']
+_sc = VM[(VM['variant'] == CANDIDATE) & (VM['period'] == 'all')].set_index(['pair', 'mode'])[_keep]
+print(f'THE CANDIDATE: {CANDIDATE}, every pair and comparator, pooled over {TEST_M[0]}..{TEST_M[-1]}:'); display(_sc.round(4))
+_vs = VM[(VM['mode'] == 'vs frontier at equal win rate') & (VM['period'] == 'all') & (VM['pair'].isin(['A', 'C']))].pivot(index='variant', columns='pair', values=['min delta, sceptical (bp)', 'cover change (bp)', 'wins kept', 'delta $ per month, trimmed | record ($k)']).reindex(list(VARIANTS))
+print('The variations at equal win rate, pairs A and C:'); display(_vs.round(3))
+_mA = VMM[(VMM['variant'] == CANDIDATE) & (VMM['pair'] == 'A')].set_index('period')[['win rate', 'wins kept', 'cover change (bp)', 'min delta, sceptical (bp)', 'delta | record (bp)', 'NW t | record', 'delta $ per month, trimmed | record ($k)']]
+print('The candidate with the manual charge, month by month against production at equal win rate:'); display(_mA.round(3))
+_rA = _sc.loc[('A', 'vs frontier at equal win rate')]; _rC = _sc.loc[('C', 'vs frontier at equal win rate')]
+SUMMARY = (f'{CANDIDATE} with the manual charge kept, against production at the same win rate over {len(TEST_M)} months: wins kept {_rA["wins kept"]:.0%}, cover change {_rA["cover change (bp)"]:+.2f} bp, '
+           f'smallest sceptical delta {_rA["min delta, sceptical (bp)"]:+.3f} bp per request (record-exit t {_rA["NW t | record"]:.1f}), {_rA["delta $ per month, trimmed | record ($k)"]:+,.0f} thousand dollars a month, '
+           f'gross DV01 {_rA["gross DV01 vs base"]:+.1%}; months with a positive sceptical delta {int((_mA["min delta, sceptical (bp)"] > 0).sum())} of {len(_mA)}. Without the manual charge on either side (pair C): '
+           f'{_rC["min delta, sceptical (bp)"]:+.3f} bp, cover {_rC["cover change (bp)"]:+.2f} bp, {_rC["delta $ per month, trimmed | record ($k)"]:+,.0f} thousand a month. Readings: A {_rA["reading"]}; C {_rC["reading"]}. '
+           f'Replay reproduced production on every request; the replay\'s wins are {REGISTRY["replay_vs_desk"]["wins_found"]:.1%} found in WFTrade and explain {REGISTRY["replay_vs_desk"]["bids_explained"]:.1%} of the desk\'s customer bids.')
+print('\nSUMMARY:', SUMMARY)
+record('summary', text=SUMMARY, candidate=flat_records(_sc.reset_index()), variations=flat_records(_vs), candidate_monthly=flat_records(_mA))
+CELL_T('end')
+ct = pd.DataFrame(CELL_LOG); ct['share'] = ct['seconds'] / ct['seconds'].sum()
+if CACHE_LOG:
+    _cl = pd.DataFrame(CACHE_LOG); ct['cached stages'] = ct['cell'].map(_cl.groupby('cell').apply(lambda g: ', '.join(f'{r.stage} ({r.status}, {r.seconds:.0f}s)' for r in g.itertuples()), include_groups=False)).fillna('')
+print(f'Runtime: {ct["seconds"].sum() / 60:.1f} min over {len(ct)} cells'); display(ct.set_index('cell').round(1))
+record('runtime', total_seconds=float(ct['seconds'].sum()), cells=ct.round(2).to_dict(orient='records'))
+(ARTIFACTS / 'results_registry_width_charge.json').write_text(json.dumps(REGISTRY, indent=2, default=str), encoding='utf-8')
+print('registry written:', ARTIFACTS / 'results_registry_width_charge.json')
