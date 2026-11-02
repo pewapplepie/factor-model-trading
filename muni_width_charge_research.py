@@ -443,14 +443,19 @@ def resolve_column(columns: list[str], wanted: tuple[str, ...], contains: str | 
     return next((c for c in columns if contains and contains in c.lower()), None)
 
 
-_tr_cols = store_columns(PIPE.store('track_rfq'))
-SETTLE_COL, CARRY_COL = resolve_column(_tr_cols, BT_SETTLE_NAMES), resolve_column(_tr_cols, BT_CARRY_NAMES, contains='carry')
-print(f'track_rfq columns: {len(_tr_cols)} | settle date column: {SETTLE_COL or "NONE (every request priced at T+2)"} | carry finance charge column: {CARRY_COL or "NONE (the logged loading is carried as is)"}')
-_so = PIPE.store('strategy_output').read(columns=BT_SO_COLS, categorical=False)
-_tr = PIPE.store('track_rfq').read(columns=BT_TR_COLS + [c for c in (SETTLE_COL, CARRY_COL) if c and c not in BT_TR_COLS], categorical=False)
+_tr_cols, _so_cols = store_columns(PIPE.store('track_rfq')), store_columns(PIPE.store('strategy_output'))
+SETTLE_COL = resolve_column(_tr_cols, BT_SETTLE_NAMES)
+# the carry is logged with the quote on strategy_output (carryfinancecharges, with carryadjustedyield beside it); the RFQ log is the fallback
+CARRY_SO = resolve_column(_so_cols, ('carryfinancecharges', 'carryfinancecharge') + BT_CARRY_NAMES, contains='carryfinance'); CARRY_TR = None if CARRY_SO else resolve_column(_tr_cols, BT_CARRY_NAMES, contains='carry')
+CARRY_ADJ_SO = resolve_column(_so_cols, ('carryadjustedyield', 'carry_adjusted_yield'))
+print(f'track_rfq columns: {len(_tr_cols)} | settle date column: {SETTLE_COL or "NONE (every request priced at T+2)"} | carry finance charge column: '
+      f'{("strategy_output." + CARRY_SO) if CARRY_SO else ("track_rfq." + CARRY_TR) if CARRY_TR else "NONE (the logged loading is carried as is)"}')
+_so = PIPE.store('strategy_output').read(columns=BT_SO_COLS + [c for c in (CARRY_SO, CARRY_ADJ_SO) if c], categorical=False)
+_tr = PIPE.store('track_rfq').read(columns=BT_TR_COLS + [c for c in (SETTLE_COL, CARRY_TR) if c and c not in BT_TR_COLS], categorical=False)
 if _so is None or _tr is None:
     raise RuntimeError('strategy_output or track_rfq is not pulled under the pipeline root')
-_tr = _tr.rename(columns={c: n for c, n in ((SETTLE_COL, 'settle_date'), (CARRY_COL, 'carry_finance_charge')) if c and c != n})
+_so = _so.rename(columns={c: n for c, n in ((CARRY_SO, 'carry_finance_charge'), (CARRY_ADJ_SO, 'carry_adjusted_yield')) if c and c != n})
+_tr = _tr.rename(columns={c: n for c, n in ((SETTLE_COL, 'settle_date'), (CARRY_TR, 'carry_finance_charge')) if c and c != n})
 for _f in (_so, _tr):
     _f['date'] = pd.to_datetime(_f['date']).dt.normalize()
 _so['ecnreqid'] = _so['ecnreqid'].astype('string'); _tr['ecnreqid'] = _tr['strategy_ecn_req_id'].astype('string')
@@ -1010,6 +1015,8 @@ def bt_carry_check(frame: pd.DataFrame) -> tuple[pd.Series, dict]:
     fits = {'yield': float((np.abs(adj - cr)[has] <= BT_ADJ_TOL).mean()) if has.any() else np.nan, 'bp': float((np.abs(adj - cr / 100.0)[has] <= BT_ADJ_TOL).mean()) if has.any() else np.nan}
     unit = 'bp' if (fits['bp'] > fits['yield']) else 'yield'; cy = cr / 100.0 if unit == 'bp' else cr; other = adj - cy
     aud = {'present': True, 'logged on': float(np.isfinite(cr).mean()), 'unit': unit, 'share of requests where the loading equals the carry': fits[unit], 'fit if read as yield': fits['yield'], 'fit if read as bp': fits['bp'],
+           **({'carry-adjusted yield = signal yield + carry': float((np.abs(pd.to_numeric(frame['carry_adjusted_yield'], errors='coerce').to_numpy(float) - frame['signalyield'].to_numpy(float) - cy)[has] <= BT_ADJ_TOL).mean()),
+               'carry-adjusted yield = optimal yield + carry': float((np.abs(pd.to_numeric(frame['carry_adjusted_yield'], errors='coerce').to_numpy(float) - frame['optimalyield'].to_numpy(float) - cy)[has] <= BT_ADJ_TOL).mean())} if 'carry_adjusted_yield' in frame else {}),
            'carry median (bp)': float(np.nanmedian(cy) * 100.0), 'carry p90 (bp)': float(np.nanpercentile(cy[np.isfinite(cy)], 90) * 100.0) if np.isfinite(cy).any() else np.nan,
            'loading beyond the carry: share nonzero': float((np.abs(other[has]) > BT_ADJ_TOL).mean()) if has.any() else np.nan, 'loading beyond the carry, median |bp|': float(np.nanmedian(np.abs(other[has])) * 100.0) if has.any() else np.nan}
     return pd.Series(cy, index=frame.index), aud
