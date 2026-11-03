@@ -1733,6 +1733,7 @@ _month = BT['month'].to_numpy(); _winable = BT['winnable'].to_numpy(bool); _thr 
 _m_sig, _adj, _ch = BT['signalyield'].to_numpy(float), BT['adj_yield'].to_numpy(float), BT['charges_level'].to_numpy(float)
 _man, _liq, _rsk = (BT[c].to_numpy(float) for c in ('manualcharges', 'liquiditycharge', 'riskcharge')); _c_base = -(_liq + _rsk)
 _y_tr = BT['y_trade_px'].to_numpy(float); _usd = BT['usd_per_bp'].to_numpy(float); _keys = BT['pfill_key'].astype(str).to_numpy(); _files = BT['pfill_file'].astype(str).to_numpy()   # the price term of a win is against the traded level in our quote's convention (v1.0.2)
+_dvp = BT['dv01'].to_numpy(float)   # price points per bp per 100 par at the quote: a bp against the cover or the print is _dvp points of price, _usd dollars on the fill
 _xlog = BT['optimalQuantileBp'].to_numpy(float); _wlog = BT['won_logged'].to_numpy(bool); _y_van = BT['y_vanilla'].to_numpy(float)
 _M_REC, _M_OTHER, _M_COMMON, _M_REAL = (BT[c].to_numpy(float) for c in ('M_rec', 'M_other', 'M_common', 'M_real'))
 _all = np.arange(N)
@@ -2087,6 +2088,17 @@ def score_pair(name: str, y_v: np.ndarray, y_b: np.ndarray, family: str = '', se
            'bp saved on kept cover wins': float((db - dv)[keptc].mean()) if keptc.any() else np.nan, 'crossing on new wins (bp)': float(-dv[new & (g == 'lost, printed')].mean()) if (new & (g == 'lost, printed')).any() else np.nan,
            'comparator shift (bp, + = more aggressive)': float(np.mean(list(widths.values()))) if widths else 0.0, 'win rate mismatch': float(np.mean(np.abs(list(mismatch.values())))) if mismatch else 0.0}
     res['cover change (bp)'] = res['bp left on table (won, cover)'] - res['bp left on table, base']
+    # the same in price: the margin over the cover is d x DV01 (points per 100 par), d x $ per bp on the fill; the saving on kept wins and the price paid over the print on new wins
+    # (on a lost request the threshold is the print, so d > 0 on a new win is how much richer than the print we bid)
+    pxm_v, pxm_b = dv * _dvp[rows], db * _dvp[rows]; u_, ut_ = _usd[rows], _usd_trim[rows]; newp = new & (g == 'lost, printed'); n_mo = max(res['months'], 1)
+    res['cover margin, won (cents per 100 par)'] = float(100.0 * np.nanmean(pxm_v[cv])) if cv.any() else np.nan; res['cover margin, base (cents per 100 par)'] = float(100.0 * np.nanmean(pxm_b[cb])) if cb.any() else np.nan
+    res['cover change (cents per 100 par)'] = res['cover margin, won (cents per 100 par)'] - res['cover margin, base (cents per 100 par)']
+    res['cover saved on kept wins (cents per 100 par)'] = float(100.0 * np.nanmean((pxm_b - pxm_v)[keptc])) if keptc.any() else np.nan
+    res['cover saved on kept wins ($ per fill)'] = float(np.nanmean(((db - dv) * u_)[keptc])) if keptc.any() else np.nan
+    res['cover saved on kept wins ($k per month)'] = float(np.nansum(((db - dv) * ut_)[keptc]) / 1e3 / n_mo)
+    res['paid over the print on new wins (cents per 100 par)'] = float(100.0 * np.nanmean(pxm_v[newp])) if newp.any() else np.nan
+    res['paid over the print on new wins ($ per fill)'] = float(np.nanmean((dv * u_)[newp])) if newp.any() else np.nan
+    res['paid over the print on new wins ($k per month)'] = float(np.nansum((dv * ut_)[newp]) / 1e3 / n_mo)
     vals = {'record': (_M_REC[rows], _M_REC[rows]), 'common markout': (np.where(new, _M_COMMON[rows], _M_REC[rows]), _M_REC[rows]), 'other side': (_M_OTHER[rows], _M_OTHER[rows]), 'realised': (_M_REAL[rows], _M_REAL[rows])}
     for key, (Mv, Mb) in vals.items():
         pv = np.where(wv, px_v + Mv, 0.0); pb = np.where(wb, px_b + Mb, 0.0); S = np.isfinite(pv) & np.isfinite(pb) & ~((wv & ~np.isfinite(Mv)) | (wb & ~np.isfinite(Mb)))
@@ -2127,10 +2139,11 @@ _d_rows = [score_pair('production, manual removed', Y_P0, Y_PM, family='referenc
 _yf, _wf_, _mm_ = match_frontier(Y_P0, 'M', _tm_rows); _d_rows.append(score_pair('production, manual removed', Y_P0, _yf, family='reference', setting='manual removed', pair='D', mode='vs frontier at equal win rate', widths=_wf_, mismatch=_mm_))
 _yl, _wd = level_to(Y_P0, Y_PM, _tm_rows); _d_rows.append(score_pair('production, manual removed', _yl, Y_PM, family='reference', setting='manual removed', pair='D', mode='levelled to production', widths={m: -w for m, w in _wd.items()}))
 PAIR_D = pd.DataFrame(_d_rows).set_index('mode'); PAIR_D['reading'] = [dominance(r) for _, r in PAIR_D.iterrows()]
-SHOW = ['win rate', 'win rate, base', 'wins kept', 'new wins', 'wins given up', 'bp left on table (won, cover)', 'bp left on table, base', 'cover change (bp)', 'bp saved on kept cover wins', 'crossing on new wins (bp)', 'comparator shift (bp, + = more aggressive)', 'win rate mismatch',
+SHOW = ['win rate', 'win rate, base', 'wins kept', 'new wins', 'wins given up', 'cover margin, won (cents per 100 par)', 'cover margin, base (cents per 100 par)', 'cover change (cents per 100 par)', 'cover saved on kept wins (cents per 100 par)', 'cover saved on kept wins ($ per fill)', 'cover saved on kept wins ($k per month)',
+        'paid over the print on new wins (cents per 100 par)', 'paid over the print on new wins ($ per fill)', 'paid over the print on new wins ($k per month)', 'cover change (bp)', 'bp saved on kept cover wins', 'crossing on new wins (bp)', 'comparator shift (bp, + = more aggressive)', 'win rate mismatch',
         'delta | record (bp)', 'NW t | record', 'months > 0 | record', 'delta | common markout (bp)', 'NW t | common markout', 'delta | other side (bp)', 'NW t | other side', 'min delta, sceptical (bp)', 'delta | realised (bp)', 'NW t | realised',
         'delta $ per month | record ($k)', 'delta $ per month, trimmed | record ($k)', 'delta | record, manual modal (bp)', 'delta | record, manual specific (bp)', 'P&L sample share', 'gross DV01 ($k/bp)', 'gross DV01 vs base', 'reading']
-SHOW_M = ['win rate', 'win rate, base', 'wins kept', 'cover change (bp)', 'comparator shift (bp, + = more aggressive)', 'min delta, sceptical (bp)', 'delta | record (bp)', 'NW t | record', 'delta | common markout (bp)', 'delta | other side (bp)', 'delta | realised (bp)', 'delta $ per month, trimmed | record ($k)', 'gross DV01 vs base', 'reading']
+SHOW_M = ['win rate', 'win rate, base', 'wins kept', 'cover change (cents per 100 par)', 'cover saved on kept wins (cents per 100 par)', 'cover saved on kept wins ($k per month)', 'paid over the print on new wins ($k per month)', 'cover change (bp)', 'comparator shift (bp, + = more aggressive)', 'min delta, sceptical (bp)', 'delta | record (bp)', 'NW t | record', 'delta | common markout (bp)', 'delta | other side (bp)', 'delta | realised (bp)', 'delta $ per month, trimmed | record ($k)', 'gross DV01 vs base', 'reading']
 _man_m = pd.DataFrame({'manual charge, median (bp)': pd.Series(_man[_tmw]).groupby(_month[_tmw]).median(), 'win rate, manual kept': pd.Series(_wbM[_tm_rows]).groupby(_month[_tm_rows]).mean(), 'win rate, manual removed': pd.Series(_wb0[_tm_rows]).groupby(_month[_tm_rows]).mean()})
 print('The manual charge by test month and production\'s win rate with and without it:'); display(_man_m.round(4))
 print('PAIR D (reference): production without the manual charge, read three ways:'); display(PAIR_D[SHOW].T)
@@ -2175,7 +2188,8 @@ for pair in ('A', 'B', 'C'):
 VMM = VM[VM['period'] != 'all']
 for pair in ('A', 'C'):
     print(f'\nPAIR {pair} by month at equal win rate, the smallest sceptical delta (bp per request):'); display(VMM[VMM['pair'] == pair].pivot(index='period', columns='variant', values='min delta, sceptical (bp)').round(3))
-    print(f'PAIR {pair} by month, cover change (bp):'); display(VMM[VMM['pair'] == pair].pivot(index='period', columns='variant', values='cover change (bp)').round(3))
+    print(f'PAIR {pair} by month, cover saved on kept wins (cents per 100 par):'); display(VMM[VMM['pair'] == pair].pivot(index='period', columns='variant', values='cover saved on kept wins (cents per 100 par)').round(2))
+    print(f'PAIR {pair} by month, cover saved on kept wins ($k per month):'); display(VMM[VMM['pair'] == pair].pivot(index='period', columns='variant', values='cover saved on kept wins ($k per month)').round(1))
     print(f'PAIR {pair} by month, $k per month trimmed:'); display(VMM[VMM['pair'] == pair].pivot(index='period', columns='variant', values='delta $ per month, trimmed | record ($k)').round(1))
 VM.to_parquet(ARTIFACTS / 'width_charge_matrix.parquet')
 record('backtest', table=flat_records(VM.set_index(['variant', 'pair', 'mode', 'period'])), verdicts=VERDICTS, seconds=time.perf_counter() - _x_t0)
@@ -2201,7 +2215,7 @@ for a_ in axes[len(TEST_M):]:
     a_.axis('off')
 savefig('09_frontier_points')
 # (2) the headline per setting, pairs A and C at equal win rate
-_cols = [('min delta, sceptical (bp)', 'smallest sceptical delta (bp per request)'), ('cover change (bp)', 'cover change (bp, negative = less left on the table)'), ('wins kept', 'share of the comparator\'s wins kept'), ('delta $ per month, trimmed | record ($k)', '$k per month, DV01-trimmed')]
+_cols = [('min delta, sceptical (bp)', 'smallest sceptical delta (bp per request)'), ('cover change (cents per 100 par)', 'cover change (cents per 100 par, negative = less left on the table)'), ('wins kept', 'share of the comparator\'s wins kept'), ('delta $ per month, trimmed | record ($k)', '$k per month, DV01-trimmed')]
 fig, ax = plt.subplots(2, 4, figsize=(24, 9))
 for i_, pair in enumerate(('A', 'C')):
     t = VM[(VM['pair'] == pair) & (VM['mode'] == 'vs frontier at equal win rate') & (VM['period'] == 'all')].set_index('variant').sort_values('min delta, sceptical (bp)')
@@ -2212,7 +2226,7 @@ savefig('09_headline_bars')
 # (3) heatmaps: month x setting, the sceptical delta and the cover change, pairs A and C
 fig, ax = plt.subplots(2, 2, figsize=(20, 10))
 for i_, pair in enumerate(('A', 'C')):
-    for j_, (col, lab, cm) in enumerate((('min delta, sceptical (bp)', 'smallest sceptical delta (bp)', 'RdYlGn'), ('cover change (bp)', 'cover change (bp, green = less left on the table)', 'RdYlGn_r'))):
+    for j_, (col, lab, cm) in enumerate((('min delta, sceptical (bp)', 'smallest sceptical delta (bp)', 'RdYlGn'), ('cover change (cents per 100 par)', 'cover change (cents per 100 par, green = less left on the table)', 'RdYlGn_r'))):
         tp = VMM[VMM['pair'] == pair].pivot(index='variant', columns='period', values=col).reindex(list(VARIANTS)); a_ = ax[i_, j_]; v = tp.to_numpy(float); lim = np.nanmax(np.abs(v)) if np.isfinite(v).any() else 1.0
         im = a_.imshow(v, cmap=cm, vmin=-lim, vmax=lim, aspect='auto'); a_.set_xticks(range(tp.shape[1])); a_.set_xticklabels(tp.columns, fontsize=8); a_.set_yticks(range(tp.shape[0])); a_.set_yticklabels([_short[n] for n in tp.index], fontsize=7); a_.grid(False)
         for r_ in range(v.shape[0]):
@@ -2250,10 +2264,12 @@ def _cut_table(yv: np.ndarray, yb: np.ndarray, labels: np.ndarray, label_name: s
     rows = np.flatnonzero(_tmw & np.isfinite(yv) & np.isfinite(yb)); wv, wb = bt_win_fast(rows, yv[rows]), bt_win_fast(rows, yb[rows]); g = _grp[rows]
     pv = np.where(wv, 100.0 * (yv[rows] - _y_tr[rows]) + _M_REC[rows], 0.0); pb = np.where(wb, 100.0 * (yb[rows] - _y_tr[rows]) + _M_REC[rows], 0.0); S = np.isfinite(pv) & np.isfinite(pb)
     dv, db = 100.0 * (_thr[rows] - yv[rows]), 100.0 * (_thr[rows] - yb[rows]); cv, cb = wv & (g == 'won, cover'), wb & (g == 'won, cover')
+    keptc = wv & wb & (g == 'won, cover')
     f = pd.DataFrame({label_name: labels[rows], 'requests': 1, 'win rate': wv, 'win rate, base': wb, 'kept': wv & wb, 'given up': wb & ~wv, 'new': wv & ~wb, 'd': np.where(S, pv - pb, np.nan), 'usd': np.where(S, (pv - pb) * _usd_trim[rows], np.nan),
-                      'cover_v': np.where(cv, dv, np.nan), 'cover_b': np.where(cb, db, np.nan)})
+                      'cover_v': np.where(cv, dv, np.nan), 'cover_b': np.where(cb, db, np.nan), 'saved_c': np.where(keptc, 100.0 * (db - dv) * _dvp[rows], np.nan), 'saved_usd': np.where(keptc, (db - dv) * _usd_trim[rows], 0.0)})
     t = f.groupby(label_name).agg(requests=('requests', 'sum'), **{'win rate': ('win rate', 'mean'), 'win rate, base': ('win rate, base', 'mean'), 'wins kept': ('kept', 'sum'), 'wins given up': ('given up', 'sum'), 'new wins': ('new', 'sum'),
-                                                                    'delta per request (bp)': ('d', 'mean'), '$k over the window': ('usd', lambda s: s.sum() / 1e3), 'bp left on cover wins': ('cover_v', 'mean'), 'bp left, base': ('cover_b', 'mean')})
+                                                                    'delta per request (bp)': ('d', 'mean'), '$k over the window': ('usd', lambda s: s.sum() / 1e3), 'bp left on cover wins': ('cover_v', 'mean'), 'bp left, base': ('cover_b', 'mean'),
+                                                                    'cover saved on kept wins (cents per 100 par)': ('saved_c', 'mean'), 'cover saved on kept wins ($k over the window)': ('saved_usd', lambda s: s.sum() / 1e3)})
     t['cover change (bp)'] = t['bp left on cover wins'] - t['bp left, base']; return t
 
 
@@ -2322,12 +2338,23 @@ def score_terms(nm: str, yv: np.ndarray) -> list[dict]:
         r = {'variant': nm, 'term': term, 'requests': int(t.sum()), 'comparator shift (bp, + = more aggressive)': float(np.mean(list(wd.values()))) if wd else 0.0,
              'win rate mismatch (pp)': 100.0 * float(np.mean(np.abs(list(mm.values())))) if mm else 0.0,
              'comparator wins': int((t & wb).sum()), 'variant wins': int((t & wv).sum()), 'kept': int(kept.sum()), 'given up': int(gone.sum()), 'new wins': int(new.sum())}
+        pxv_m, pxb_m, u_, ut_ = dv * _dvp[rows], db * _dvp[rows], _usd[rows], _usd_trim[rows]
         if gname == 'won, cover':
+            r['cover margin, variant (cents per 100 par)'] = float(100.0 * np.nanmean(pxv_m[t & wv])) if (t & wv).any() else np.nan
+            r['cover margin, comparator (cents per 100 par)'] = float(100.0 * np.nanmean(pxb_m[t & wb])) if (t & wb).any() else np.nan
+            r['cover change (cents per 100 par)'] = r['cover margin, variant (cents per 100 par)'] - r['cover margin, comparator (cents per 100 par)']
+            r['cover saved on kept wins (cents per 100 par)'] = float(100.0 * np.nanmean((pxb_m - pxv_m)[kept])) if kept.any() else np.nan
+            r['cover saved on kept wins ($ per fill)'] = float(np.nanmean(((db - dv) * u_)[kept])) if kept.any() else np.nan
+            r['cover saved on kept wins ($k per month)'] = float(np.nansum(((db - dv) * ut_)[kept]) / 1e3 / n_mo)
             r['bp left on the cover, variant'] = float(dv[t & wv].mean()) if (t & wv).any() else np.nan
             r['bp left on the cover, comparator'] = float(db[t & wb].mean()) if (t & wb).any() else np.nan
             r['cover change (bp)'] = r['bp left on the cover, variant'] - r['bp left on the cover, comparator']
         if gname == 'lost, printed':
             r['production behind the print, median (bp)'] = float(np.median(-_D_PROD[rows][t])) if t.any() else np.nan
+            r['production behind the print, median (cents per 100 par)'] = float(100.0 * np.nanmedian((-_D_PROD[rows] * _dvp[rows])[t])) if t.any() else np.nan
+            r['paid over the print on new wins (cents per 100 par)'] = float(100.0 * np.nanmean(pxv_m[new])) if new.any() else np.nan
+            r['paid over the print on new wins ($ per fill)'] = float(np.nanmean((dv * u_)[new])) if new.any() else np.nan
+            r['paid over the print on new wins ($k per month)'] = float(np.nansum((dv * ut_)[new]) / 1e3 / n_mo)
             r['variant richer than the print on its wins (bp)'] = float(dv[t & wv].mean()) if (t & wv).any() else np.nan
             r['comparator richer than the print on its wins (bp)'] = float(db[t & wb].mean()) if (t & wb).any() else np.nan
             r["street winner's markout, record (bp)"] = float(np.nanmean(_M_REC[rows][t])) if np.isfinite(_M_REC[rows][t]).any() else np.nan
@@ -2358,9 +2385,9 @@ assert np.allclose(_tt_check['sum of the terms (bp)'], _tt_check['pooled, Sectio
 # ---- what crossing would have taken: the lost printed requests of the test months by decile of how far production was behind the print
 _lpm = _tmw & (_grp == 'lost, printed'); _wnm = _tmw & _w_van_all
 _behind = -_D_PROD; _mid_gap = 100.0 * (_m_sig - BT['msrb_yield'].to_numpy(float))   # the print's yield below our model mid: how far above our mid the street paid
-_lx = pd.DataFrame({'behind (bp)': _behind[_lpm], 'print above our mid (bp)': _mid_gap[_lpm], 'rec': _M_REC[_lpm], 'cm': _M_COMMON[_lpm], 'oth': _M_OTHER[_lpm], 'usd': _usd_trim[_lpm], 'W quintile': _wq[_lpm], 'key group': _kgrp[_lpm].astype(str)})
+_lx = pd.DataFrame({'behind (bp)': _behind[_lpm], 'behind (cents)': 100.0 * _behind[_lpm] * _dvp[_lpm], 'behind ($)': _behind[_lpm] * _usd[_lpm], 'print above our mid (bp)': _mid_gap[_lpm], 'rec': _M_REC[_lpm], 'cm': _M_COMMON[_lpm], 'oth': _M_OTHER[_lpm], 'usd': _usd_trim[_lpm], 'W quintile': _wq[_lpm], 'key group': _kgrp[_lpm].astype(str)})
 _lx['behind decile'] = pd.qcut(_lx['behind (bp)'].rank(method='first'), 10, labels=False)
-_cross_agg = {'lost printed requests': ('behind (bp)', 'size'), 'behind the print, median (bp)': ('behind (bp)', 'median'), 'behind, max (bp)': ('behind (bp)', 'max'), 'print above our mid, median (bp)': ('print above our mid (bp)', 'median'),
+_cross_agg = {'lost printed requests': ('behind (bp)', 'size'), 'behind the print, median (bp)': ('behind (bp)', 'median'), 'behind the print, median (cents per 100 par)': ('behind (cents)', 'median'), 'behind the print, median ($ on the fill)': ('behind ($)', 'median'), 'behind, max (bp)': ('behind (bp)', 'max'), 'print above our mid, median (bp)': ('print above our mid (bp)', 'median'),
               "street winner's markout, record (bp)": ('rec', 'mean'), 'common markout (bp)': ('cm', 'mean'), "street winner's markout, other side (bp)": ('oth', 'mean'), 'other-side exit exists': ('oth', lambda s: s.notna().mean()),
               'record markout > 0': ('rec', lambda s: (s.dropna() > 0).mean()), '$k at the record markout, over the window': ('rec', lambda s: float(np.nansum(s * _lx.loc[s.index, 'usd']) / 1e3))}
 CROSS_BY_BEHIND = _lx.groupby('behind decile').agg(**_cross_agg)
@@ -2408,15 +2435,20 @@ print(f'[10-2] {time.perf_counter() - _tt_t0:.0f}s')
 
 # %%
 CELL_T('11. Summary and registry [1]')
-_keep = ['win rate', 'win rate, base', 'wins kept', 'cover change (bp)', 'min delta, sceptical (bp)', 'delta | record (bp)', 'NW t | record', 'delta | common markout (bp)', 'NW t | common markout', 'delta | other side (bp)', 'delta | realised (bp)', 'delta $ per month, trimmed | record ($k)', 'gross DV01 vs base', 'reading']
+_keep = ['win rate', 'win rate, base', 'wins kept', 'new wins', 'cover change (cents per 100 par)', 'cover saved on kept wins (cents per 100 par)', 'cover saved on kept wins ($ per fill)', 'cover saved on kept wins ($k per month)', 'paid over the print on new wins (cents per 100 par)', 'paid over the print on new wins ($k per month)',
+         'cover change (bp)', 'min delta, sceptical (bp)', 'delta | record (bp)', 'NW t | record', 'delta | common markout (bp)', 'NW t | common markout', 'delta | other side (bp)', 'delta | realised (bp)', 'delta $ per month, trimmed | record ($k)', 'gross DV01 vs base', 'reading']
 _sc = VM[(VM['variant'] == CANDIDATE) & (VM['period'] == 'all')].set_index(['pair', 'mode'])[_keep]
 print(f'THE CANDIDATE: {CANDIDATE}, every pair and comparator, pooled over {TEST_M[0]}..{TEST_M[-1]}:'); display(_sc.round(4))
-_vs = VM[(VM['mode'] == 'vs frontier at equal win rate') & (VM['period'] == 'all') & (VM['pair'].isin(['A', 'C']))].pivot(index='variant', columns='pair', values=['min delta, sceptical (bp)', 'cover change (bp)', 'wins kept', 'delta $ per month, trimmed | record ($k)']).reindex(list(VARIANTS))
+_vs = VM[(VM['mode'] == 'vs frontier at equal win rate') & (VM['period'] == 'all') & (VM['pair'].isin(['A', 'C']))].pivot(index='variant', columns='pair', values=['min delta, sceptical (bp)', 'cover change (cents per 100 par)', 'cover saved on kept wins ($k per month)', 'wins kept', 'delta $ per month, trimmed | record ($k)']).reindex(list(VARIANTS))
 print('The variations at equal win rate, pairs A and C:'); display(_vs.round(3))
-_mA = VMM[(VMM['variant'] == CANDIDATE) & (VMM['pair'] == 'A')].set_index('period')[['win rate', 'wins kept', 'cover change (bp)', 'min delta, sceptical (bp)', 'delta | record (bp)', 'NW t | record', 'delta $ per month, trimmed | record ($k)']]
+_raw_cols = ['win rate', 'win rate, base', 'wins kept', 'new wins', 'wins given up', 'cover saved on kept wins (cents per 100 par)', 'cover saved on kept wins ($ per fill)', 'cover saved on kept wins ($k per month)', 'paid over the print on new wins (cents per 100 par)', 'paid over the print on new wins ($ per fill)', 'paid over the print on new wins ($k per month)', 'gross DV01 vs base']
+SCOREBOARD = VM[(VM['mode'] == 'vs production') & (VM['period'] == 'all') & (VM['pair'] == 'A')].set_index('variant')[_raw_cols].reindex(list(VARIANTS))
+print('SCOREBOARD, every setting against production as is (pair A): wins kept and new, the cover saved on the kept wins and the price paid over the print on the new wins, in price, and the book\'s DV01:'); display(SCOREBOARD.round(3))
+_mA = VMM[(VMM['variant'] == CANDIDATE) & (VMM['pair'] == 'A')].set_index('period')[['win rate', 'wins kept', 'cover change (cents per 100 par)', 'cover saved on kept wins ($k per month)', 'cover change (bp)', 'min delta, sceptical (bp)', 'delta | record (bp)', 'NW t | record', 'delta $ per month, trimmed | record ($k)']]
 print('The candidate with the manual charge, month by month against production at equal win rate:'); display(_mA.round(3))
 _rA = _sc.loc[('A', 'vs frontier at equal win rate')]; _rC = _sc.loc[('C', 'vs frontier at equal win rate')]
-SUMMARY = (f'{CANDIDATE} with the manual charge kept, against production at the same win rate over {len(TEST_M)} months: wins kept {_rA["wins kept"]:.0%}, cover change {_rA["cover change (bp)"]:+.2f} bp, '
+SUMMARY = (f'{CANDIDATE} with the manual charge kept, against production at the same win rate over {len(TEST_M)} months: wins kept {_rA["wins kept"]:.0%}, cover change {_rA["cover change (cents per 100 par)"]:+.2f} cents per 100 par '
+           f'({_rA["cover saved on kept wins ($k per month)"]:+,.0f} thousand dollars a month saved on the kept wins; {_rA["cover change (bp)"]:+.2f} bp), '
            f'smallest sceptical delta {_rA["min delta, sceptical (bp)"]:+.3f} bp per request (record-exit t {_rA["NW t | record"]:.1f}), {_rA["delta $ per month, trimmed | record ($k)"]:+,.0f} thousand dollars a month, '
            f'gross DV01 {_rA["gross DV01 vs base"]:+.1%}; months with a positive sceptical delta {int((_mA["min delta, sceptical (bp)"] > 0).sum())} of {len(_mA)}. Without the manual charge on either side (pair C): '
            f'{_rC["min delta, sceptical (bp)"]:+.3f} bp, cover {_rC["cover change (bp)"]:+.2f} bp, {_rC["delta $ per month, trimmed | record ($k)"]:+,.0f} thousand a month. Readings: A {_rA["reading"]}; C {_rC["reading"]}. '
@@ -2426,6 +2458,7 @@ if _ts_names:
     _t3 = TERM_SCORES[TERM_SCORES['term'].str.startswith('3.')].set_index('variant').reindex(_ts_names)
     _tA = VM[(VM['mode'] == 'vs frontier at equal win rate') & (VM['period'] == 'all') & (VM['pair'] == 'A')].set_index('variant').reindex(_ts_names)
     CROSSING = pd.DataFrame({'raw win rate': TWO_SIDED['raw win rate'].reindex(_ts_names), 'new wins on lost requests': TWO_SIDED['new wins on lost requests'].reindex(_ts_names), 'median tightening (bp)': TWO_SIDED['median tightening (bp)'].reindex(_ts_names),
+                             'paid over the print on new wins (cents per 100 par)': _t3['paid over the print on new wins (cents per 100 par)'], 'paid over the print on new wins ($ per fill)': _t3['paid over the print on new wins ($ per fill)'], 'paid over the print on new wins ($k per month)': _t3['paid over the print on new wins ($k per month)'],
                              'richer than the print on new wins (bp)': _t3['variant richer than the print on its wins (bp)'], 'lost-term delta, record (bp)': _t3['delta per request in the term | record (bp)'],
                              'lost-term delta, other side (bp)': _t3['delta per request in the term | other side (bp)'], 'pooled min sceptical delta (bp)': _tA['min delta, sceptical (bp)'], 'pooled $k per month': _tA['delta $ per month, trimmed | record ($k)']})
     print('\nThe two-sided settings: what crossing the print bought (pair A at equal win rate; the lost term on its own):'); display(CROSSING.round(4))
@@ -2434,7 +2467,7 @@ if _ts_names:
                 f'for {CROSSING.loc[_best, "pooled min sceptical delta (bp)"]:+.3f} bp per request pooled; production was {np.median(-_D_PROD[_tmw & (_grp == "lost, printed")]):.1f} bp behind the print at the median of the lost requests.')
 print('\nSUMMARY:', SUMMARY)
 _aud = {'settle': REGISTRY['replay'].get('settle'), 'cover': REGISTRY['replay'].get('cover'), 'print_rule': REGISTRY['replay'].get('print_rule'), 'carry': REGISTRY.get('carry'), 'price_checks': REGISTRY.get('replay_checks', {}).get('price')}
-record('summary', text=SUMMARY, candidate=flat_records(_sc.reset_index()), variations=flat_records(_vs), candidate_monthly=flat_records(_mA), crossing=flat_records(CROSSING) if _ts_names else [], audits=_aud)
+record('summary', text=SUMMARY, candidate=flat_records(_sc.reset_index()), variations=flat_records(_vs), scoreboard=flat_records(SCOREBOARD), candidate_monthly=flat_records(_mA), crossing=flat_records(CROSSING) if _ts_names else [], audits=_aud)
 CELL_T('end')
 ct = pd.DataFrame(CELL_LOG); ct['share'] = ct['seconds'] / ct['seconds'].sum()
 if CACHE_LOG:
