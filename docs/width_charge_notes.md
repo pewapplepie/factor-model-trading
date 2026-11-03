@@ -1,4 +1,4 @@
-# The width charge notebook (width charge v1.0.2)
+# The width charge notebook (width charge v1.0.3)
 
 `muni_width_charge_research.py` is one notebook from the data to the backtest for the quoting change the variant programme (`muni_rfq_factor_variants`, v1.1 to v1.3) found worth putting live: a per-bond risk charge sized to the dispersion of the bond's own residual move, the "quantile width charge". It is written to be read by people who have not followed the lab and variant notebooks: every section says what it builds, why, and which plot to look at. It is self-contained: it reads the data pipeline directly and needs neither the lab's cache nor its handoff.
 
@@ -17,6 +17,18 @@
 | 9 | The backtest: pairs A (manual kept), B (manual removed vs production with it), C (both removed), D (the manual charge itself); comparators raw, at equal win rate (production through its own optimizer on the width grid, month by month) and levelled; the paired scorecard with three sceptical valuations and the realised round trip beside, week-clustered t, DV01-trimmed dollars, gross DV01 as the risk axis; pooled and month by month, scoring cached per setting | `09_frontier_points` (the settings as points on production's own frontier, one panel per month), `09_headline_bars`, `09_heatmaps` (month x setting), `09_cumulative` (the candidate's dollars by day) |
 | 10 | Where the edge comes from: by quintile of W, by key group, the attribution into common fills / new wins / wins given up, the adverse-selection table of production's own wins by W quintile | `10_edge` |
 | 11 | The candidate in one table; the variations; the monthly table; the summary line; registry and runtimes | `results_registry_width_charge.json` |
+
+## v1.0.3: the crossing grid (2026-11-03)
+
+The v1.0.2 run (data to October 30, the October 28 pfill in the schedule from the 29th) said the two-sided charge tightens 0.3 bp against a 17.6 bp median gap, so it pays cover on kept wins for a few hundred new wins, and that the street's winning trades richen most on wide bands. v1.0.3 unties what the two-sided charge tied together and sizes the credit from the data. Pre-registered as `width_charge_v103`; 25 settings in one cached stage (Section 8 [4]), scored like every other setting.
+
+- **Asymmetric**: credit `k_t / median W` per bp of band above the trailing median, charge `k_w / median W` per bp below it (credit on wide bands); `k_w` in {1, 2}, `k_t` in {2, 4, 8, 16}. Eight settings.
+- **Centre as a quantile**: the reversed two-sided charge at k = 2 with the centre at the trailing 65th and 80th percentile of `W`. Two settings.
+- **Expected-markout credit**: `h` times the mean other-side markout of the street's winning trade on the requests we lost, by `W` quintile x key group, fitted on the earlier test months with the quintile edges from those months, the quintile mean where a cell has fewer than `min_fit_rows`, zero where the expectation is not positive; the first test month has no history and gets no credit. `h` in {0.25, 0.5, 1}. Three settings.
+- **Expected-margin charge**: `f` times the margin over the cover, a walk-forward least squares of the bp production left on the table on its cover wins (clipped at the training 99th percentile) on the width model's design (key group, size and tenor buckets, manual class, trailing residual sd) plus the log next-day half-width and its presence flag; applied to every winnable request of the month. `f` in {0.25, 0.5, 0.75}. Three settings, and the nine combinations with the markout credit.
+- **Select and confirm (Section 10 [3])**: every setting scored against production as is on the first `select_months` test months and on the rest; a setting whose cover saving or win-rate change changes sign between the two windows is noise. The scatter of select against confirm is the picture.
+
+Runtime on the desk: about 16 minutes to quote the 25 settings, an hour to score them, ten minutes for the split and the terms; everything before Section 8 [4] reuses its cache.
 
 ## v1.0.2: the win rule in price space, the settle date and the carry charge, crossing the print (2026-11-02)
 
